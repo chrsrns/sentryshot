@@ -479,9 +479,8 @@ pub async fn enumerate(
     if let Some(media) = &services.media_xaddr {
         let media = media.clone();
         for p in client.profiles(&media, creds).await? {
-            match client.stream_uri(&media, &p.token, creds).await {
-                Ok(uri) => streams.push((p, uri)),
-                Err(_) => {}
+            if let Ok(uri) = client.stream_uri(&media, &p.token, creds).await {
+                streams.push((p, uri));
             }
         }
     }

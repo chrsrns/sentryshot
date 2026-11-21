@@ -121,7 +121,7 @@ pub async fn probe_paths(
         match status {
             200 => hits.push(PathHit {
                 path: (*path).to_owned(),
-                role: role.clone(),
+                role: *role,
                 auth: None,
             }),
             401 => {
@@ -135,7 +135,7 @@ pub async fn probe_paths(
                 if creds.is_empty() {
                     hits.push(PathHit {
                         path: (*path).to_owned(),
-                        role: role.clone(),
+                        role: *role,
                         auth: scheme,
                     });
                     continue;
@@ -170,12 +170,12 @@ pub async fn probe_paths(
                 match request(&mut s, &req2).await {
                     Ok((200, _)) => hits.push(PathHit {
                         path: (*path).to_owned(),
-                        role: role.clone(),
+                        role: *role,
                         auth: None,
                     }),
                     Ok((401, _)) => hits.push(PathHit {
                         path: (*path).to_owned(),
-                        role: role.clone(),
+                        role: *role,
                         auth: scheme,
                     }),
                     _ => {}

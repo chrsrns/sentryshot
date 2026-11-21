@@ -127,9 +127,8 @@ async fn run(req: &ScanRequest) -> Result<ScanResult, ScanError> {
         if truncated {
             break;
         }
-        match set.join_next().await {
-            Some(Ok(cam)) => cams.push(cam),
-            Some(Err(_)) | None => {}
+        if let Some(Ok(cam)) = set.join_next().await {
+            cams.push(cam);
         }
         if remaining(deadline).is_zero() && (!devices.is_empty() || !set.is_empty()) {
             truncated = true;
