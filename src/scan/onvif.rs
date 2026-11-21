@@ -325,10 +325,8 @@ impl crate::seam::OnvifClient for OnvifHttp {
             if n.is_element() && n.tag_name().name() == "PTZ" {
                 out.ptz = true;
             }
-            if n.is_element() && n.tag_name().name() == "Backchannel" {
-                if n.text() == Some("true") {
-                    out.backchannel = true;
-                }
+            if n.is_element() && n.tag_name().name() == "Backchannel" && n.text() == Some("true") {
+                out.backchannel = true;
             }
         }
         // Fallback: GetServices when capabilities lacked media XAddr.
