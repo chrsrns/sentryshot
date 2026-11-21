@@ -5,6 +5,8 @@
 import {
 	fetchGet,
 	fetchPost,
+	fetchPostJson,
+	sanitizeMonitorName,
 	fetchPut,
 	fetchDelete,
 	sortByName,
@@ -284,6 +286,138 @@ function newCategory(title, icon, form, onNav) {
  */
 
 /**
+ * Camera-scan modal: runs POST /api/scan, renders results with
+ * textContent only (camera strings are untrusted), and prefills the
+ * monitor form on pick. A 409 response is reported as an in-progress
+ * scan rather than a failure.
+ *
+ * @param {string} token
+ * @returns {{elem: Element, open: () => void, onPick: (p: object) => void}}
+ */
+function newScanModal(token) {
+	const hostInput = document.createElement("input");
+	hostInput.placeholder = "camera IP (optional)";
+	const userInput = document.createElement("input");
+	userInput.placeholder = "username (optional)";
+	const passInput = document.createElement("input");
+	passInput.placeholder = "password (optional)";
+	passInput.type = "password";
+	const statusElem = document.createElement("div");
+	const listElem = document.createElement("ul");
+
+	const modal = newModal("Camera scan", [
+		hostInput,
+		userInput,
+		passInput,
+		statusElem,
+		listElem,
+	]);
+
+	/** @type {(p: object) => void} */
+	let onPick = () => {};
+
+	/** @param {HTMLElement} parent @param {string} text */
+	const row = (parent, text) => {
+		const el = document.createElement("span");
+		el.textContent = text;
+		parent.append(el);
+	};
+
+	const renderResults = (result) => {
+		listElem.replaceChildren();
+		statusElem.textContent = result.truncated
+			? "scan timed out — partial results"
+			: `${result.cameras.length} camera(s) found`;
+		for (const cam of result.cameras) {
+			const item = document.createElement("li");
+			row(item, cam.ip);
+			if (cam.name) {
+				row(item, ` — ${cam.name}`);
+			}
+			if (cam.hardware) {
+				row(item, ` (${cam.hardware})`);
+			}
+			const badges = [];
+			if (cam.needsAuth) {
+				badges.push("auth");
+			}
+			if (cam.ptz) {
+				badges.push("ptz");
+			}
+			if (cam.backchannel) {
+				badges.push("audio");
+			}
+			if (badges.length > 0) {
+				row(item, ` [${badges.join(" ")}]`);
+			}
+			for (const stream of cam.streams) {
+				const s = document.createElement("div");
+				s.textContent = `${stream.role}: ${stream.rtspUrl}${
+					stream.profileName ? ` (${stream.profileName})` : ""
+				}`;
+				item.append(s);
+			}
+			if (cam.streams.length > 0) {
+				const pickBtn = document.createElement("button");
+				pickBtn.textContent = "use";
+				pickBtn.onclick = () => {
+					const main = cam.streams.find((st) => st.role === "main");
+					const sub = cam.streams.find((st) => st.role === "sub");
+					onPick({
+						source: "rtsp",
+						sourcertsp: {
+							protocol: "tcp",
+							mainStream: main === undefined ? "" : main.rtspUrl,
+							subStream: sub === undefined ? "" : sub.rtspUrl,
+						},
+						name: sanitizeMonitorName(cam.name, cam.ip),
+					});
+					modal.close();
+				};
+				item.append(pickBtn);
+			}
+			listElem.append(item);
+		}
+	};
+
+	const scanBtn = document.createElement("button");
+	scanBtn.textContent = "scan";
+	scanBtn.onclick = async () => {
+		statusElem.textContent = "scanning…";
+		listElem.replaceChildren();
+		const { status, body } = await fetchPostJson(
+			"/api/scan",
+			{
+				host: hostInput.value,
+				username: userInput.value,
+				password: passInput.value,
+			},
+			token,
+		);
+		if (status === 409) {
+			statusElem.textContent = "a scan is already in progress — retry shortly";
+			return;
+		}
+		if (status !== 200 || body === null) {
+			statusElem.textContent = `scan failed (${status})`;
+			return;
+		}
+		renderResults(body);
+	};
+	modal.$content.prepend(scanBtn);
+
+	return {
+		elem: modal.elem,
+		open() {
+			modal.open();
+		},
+		set onPick(f) {
+			onPick = f;
+		},
+	};
+}
+
+/**
  * @param {string} token
  * @param {Fields<any>} fields
  * @param {() => string} getMonitorId
@@ -306,6 +440,14 @@ function newMonitor(token, fields, getMonitorId, monitors) {
 		}
 	};
 	form.addButton("delete", onDelete);
+
+	const scanModal = newScanModal(token);
+	form.addButton("scan", () => {
+		scanModal.open();
+	});
+	scanModal.onPick = (prefill) => {
+		form.set(prefill);
+	};
 
 	/** @param {HTMLElement} subNavElem */
 	const onNav = (subNavElem) => {

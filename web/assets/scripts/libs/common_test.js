@@ -12,6 +12,7 @@ import {
 	normalize,
 	denormalize,
 	htmlToElem,
+	sanitizeMonitorName,
 } from "./common.js";
 
 async function testFetchError(fetch) {
@@ -307,5 +308,26 @@ describe("htmlToElem", () => {
 				
 </li>
 `);
+	});
+});
+
+describe("sanitizeMonitorName", () => {
+	test("keeps unicode alnum plus dash and underscore", () => {
+		expect(sanitizeMonitorName("Cam-Hall_2", "1.2.3.4")).toBe("Cam-Hall_2");
+		expect(sanitizeMonitorName("Kamera-Überwachung1", "1.2.3.4")).toBe(
+			"Kamera-Überwachung1",
+		);
+	});
+	test("strips spaces and punctuation", () => {
+		expect(sanitizeMonitorName("My Cam (front)!", "1.2.3.4")).toBe("MyCamfront");
+	});
+	test("caps at 24 utf-8 bytes without splitting a code point", () => {
+		const name = sanitizeMonitorName("aaaaaaaaaaaaaaaaaaaaaaaé", "1.2.3.4");
+		expect(name.length).toBeLessThanOrEqual(24);
+		expect(name).toBe("aaaaaaaaaaaaaaaaaaaaaaa");
+	});
+	test("falls back to dashed-ip camera name", () => {
+		expect(sanitizeMonitorName("...", "192.168.1.5")).toBe("Camera-192-168-1-5");
+		expect(sanitizeMonitorName(undefined, "10.0.0.2")).toBe("Camera-10-0-0-2");
 	});
 });

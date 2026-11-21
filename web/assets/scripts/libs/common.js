@@ -323,9 +323,73 @@ function htmlToElem(html, children = []) {
 	return elem;
 }
 
+/**
+ * POST returning the parsed body and status — for callers that need
+ * the response payload (e.g. the camera scan) rather than a boolean.
+ *
+ * @param {URL | string} url
+ * @param {any} data
+ * @param {string} token
+ * @returns {Promise<{status: number, body: any}>}
+ */
+async function fetchPostJson(url, data, token) {
+	const response = await fetch(url, {
+		body: JSON.stringify(data),
+		headers: {
+			"Content-Type": "application/json",
+			"X-CSRF-TOKEN": token,
+		},
+		method: "post",
+	});
+	const body = await response.json().catch(() => {});
+	return { status: response.status, body };
+}
+
+/**
+ * Reduce a camera-supplied name to the backend `MonitorName` charset:
+ * unicode alphanumerics plus `_` and `-`, capped at 24 UTF-8 bytes.
+ *
+ * @param {string | undefined | null} name
+ * @param {string} ip Fallback source when `name` sanitizes to empty.
+ * @returns {string}
+ */
+function sanitizeMonitorName(name, ip) {
+	// ASCII punct/whitespace strip; keeps unicode letters (backend
+	// `MonitorName` revalidates the harder cases on save).
+	const clean = (name === undefined || name === null ? "" : name).replaceAll(
+		/[\s!-,./:-@[-^`{-~]/g,
+		"",
+	);
+	// 24-byte UTF-8 boundary, no mid-character cuts.
+	let out = "";
+	let bytes = 0;
+	for (const c of clean) {
+		const cp = c.codePointAt(0);
+		let n = 4;
+		if (cp < 0x80) {
+			n = 1;
+		} else if (cp < 0x800) {
+			n = 2;
+		} else if (cp < 0x10000) {
+			n = 3;
+		}
+		if (bytes + n > 24) {
+			break;
+		}
+		out += c;
+		bytes += n;
+	}
+	if (out !== "") {
+		return out;
+	}
+	return `Camera-${ip.replaceAll(".", "-")}`;
+}
+
 export {
 	fetchGet,
 	fetchPost,
+	fetchPostJson,
+	sanitizeMonitorName,
 	fetchPut,
 	fetchDelete,
 	sortByName,
