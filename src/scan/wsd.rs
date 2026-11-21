@@ -167,6 +167,24 @@ pub async fn probe_and_collect(window: Duration) -> Result<Vec<DiscoveredDevice>
     collect(&socket, window).await
 }
 
+/// Directed probe to one host on port 3702. Multicast-dead cameras
+/// still answer unicast probes. Short window: directed replies are
+/// immediate; stragglers are accepted loss.
+///
+/// # Errors
+/// [`ScanError::Io`] on socket bind/send failure.
+pub async fn probe_unicast(
+    target: Ipv4Addr,
+    window: Duration,
+) -> Result<Vec<DiscoveredDevice>, ScanError> {
+    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await?;
+    let probe = build_probe(&new_message_id());
+    let _ = socket
+        .send_to(probe.as_bytes(), SocketAddrV4::new(target, 3702))
+        .await;
+    collect(&socket, window).await
+}
+
 /// Collect `ProbeMatches` for `window`, dedupe by EPR then by IP.
 pub async fn collect(
     socket: &UdpSocket,

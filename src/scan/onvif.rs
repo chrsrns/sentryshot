@@ -78,14 +78,14 @@ fn rewrite_host(uri: &str, responder: IpAddr) -> Option<String> {
     Some(url.to_string())
 }
 
-struct DigestChallenge {
+pub(crate) struct DigestChallenge {
     realm: String,
     nonce: String,
     qop: Option<String>,
     algorithm: Option<String>,
 }
 
-fn parse_digest_challenge(header: &str) -> Option<DigestChallenge> {
+pub(crate) fn parse_digest_challenge(header: &str) -> Option<DigestChallenge> {
     let rest = header.strip_prefix("Digest")?;
     let mut c = DigestChallenge {
         realm: String::new(),
@@ -111,7 +111,12 @@ fn parse_digest_challenge(header: &str) -> Option<DigestChallenge> {
     Some(c)
 }
 
-fn digest_authorization(challenge: &DigestChallenge, user: &str, pass: &str, uri: &str) -> String {
+pub(crate) fn digest_authorization(
+    challenge: &DigestChallenge,
+    user: &str,
+    pass: &str,
+    uri: &str,
+) -> String {
     let ha1 = format!(
         "{:x}",
         md5::compute(format!("{user}:{}:{pass}", challenge.realm))
