@@ -409,6 +409,9 @@ function newScanModal(token) {
 	return {
 		elem: modal.elem,
 		open() {
+			if (!modal.elem.isConnected) {
+				document.body.append(modal.elem);
+			}
 			modal.open();
 		},
 		set onPick(f) {
@@ -1173,4 +1176,4 @@ function init(uiData) {
 		.replaceChildren(...rendererCategories([monitor, group, account]));
 }
 
-export { init };
+export { init, newScanModal };
