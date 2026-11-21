@@ -10,3 +10,4 @@ pub mod types;
 pub use error::ScanError;
 pub use seam::*;
 pub use types::*;
+pub mod wsd;
