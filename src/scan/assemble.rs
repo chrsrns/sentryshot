@@ -22,6 +22,9 @@ pub struct Input {
     pub paths: Vec<PathHit>,
     /// User-supplied credentials (request-scoped).
     pub creds: Creds,
+    /// Any enumerated surface answered 401/NotAuthorized (including
+    /// unauthed scans that could not enumerate).
+    pub needs_auth: bool,
 }
 
 struct Cand {
@@ -33,13 +36,21 @@ struct Cand {
 }
 
 fn vendor_role(path: &str) -> ScanRole {
-    if path.ends_with("101") || path.contains("subtype=0") {
-        ScanRole::Main
-    } else if path.ends_with("102") || path.contains("subtype=1") {
-        ScanRole::Sub
-    } else {
-        ScanRole::Extra
+    if path.contains("subtype=0") {
+        return ScanRole::Main;
     }
+    if path.contains("subtype=1") {
+        return ScanRole::Sub;
+    }
+    // Hikvision ids are {channel}0{subtype}: x01 main, x02 sub.
+    if let Some(id) = path.rsplit('/').next().and_then(|t| t.parse::<u32>().ok()) {
+        match id % 100 {
+            1 => return ScanRole::Main,
+            2 => return ScanRole::Sub,
+            _ => {}
+        }
+    }
+    ScanRole::Extra
 }
 
 /// Normalize for dedupe: creds-free, explicit default port.
@@ -72,7 +83,7 @@ pub fn assemble(
     input: Input,
 ) -> DiscoveredCamera {
     let mut cands: Vec<Cand> = Vec::new();
-    let mut needs_auth = false;
+    let mut needs_auth = input.needs_auth;
 
     for (profile, uri) in input.onvif {
         cands.push(Cand {
@@ -205,6 +216,7 @@ mod tests {
             vendor: Vec::new(),
             paths: Vec::new(),
             creds: Creds::default(),
+            needs_auth: false,
         }
     }
 

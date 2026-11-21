@@ -1690,27 +1690,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3fdb12b2476b595f9358c5161aa467c2438859caa136dec86c26fdd2efe17b92"
 
 [[package]]
-name = "onvif-device-rs"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d106f4e1027ae41a43339bf613623da51c2372f417be23cdc44cba1916caa33f"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "futures-util",
- "hex",
- "log 0.4.21",
- "md-5",
- "quick-xml",
- "rand 0.8.5",
- "serde",
- "sha1",
- "sha2",
- "socket2 0.5.10",
- "tokio",
-]
-
-[[package]]
 name = "oorandom"
 version = "11.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1905,15 +1884,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52c2c1bf36ddb1a1c396b3601a3cec27c2462e45f07c386894ec3ccf5332bd16"
 dependencies = [
  "prost",
-]
-
-[[package]]
-name = "quick-xml"
-version = "0.41.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
-dependencies = [
- "memchr",
 ]
 
 [[package]]
@@ -2283,7 +2253,6 @@ dependencies = [
  "if-addrs",
  "jiff",
  "md5",
- "onvif-device-rs",
  "pretty_assertions",
  "rand 0.9.0",
  "retina",

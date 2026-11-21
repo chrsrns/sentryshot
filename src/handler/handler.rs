@@ -643,9 +643,9 @@ pub async fn recording_video_handler(
 
 /// `POST /api/scan` — admin-gated camera discovery.
 ///
-/// Error bodies carry static strings only: `ScanError::InvalidHost`
-/// echoes back the user-supplied host and nothing else must leak
-/// (in particular not credential-bearing stream URLs).
+/// Error bodies are static strings only — nothing user- or
+/// device-supplied echoes back (in particular not
+/// credential-bearing stream URLs).
 pub async fn scan_handler(
     State(scanner): State<Arc<scan::scanner::Scanner>>,
     Json(req): Json<scan::types::ScanRequest>,

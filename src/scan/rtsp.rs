@@ -56,15 +56,19 @@ async fn request(
     stream: &mut tokio::net::TcpStream,
     req: &str,
 ) -> Result<(u16, String), ScanError> {
+    let deadline = std::time::Instant::now() + OP_TIMEOUT;
     tokio::time::timeout(OP_TIMEOUT, stream.write_all(req.as_bytes()))
         .await
         .map_err(|_| ScanError::Timeout)?
         .map_err(ScanError::Io)?;
     let mut buf = vec![0_u8; MAX_RESP];
-    let n = tokio::time::timeout(OP_TIMEOUT, stream.read(&mut buf))
-        .await
-        .map_err(|_| ScanError::Timeout)?
-        .map_err(ScanError::Io)?;
+    let n = tokio::time::timeout(
+        deadline.saturating_duration_since(std::time::Instant::now()),
+        stream.read(&mut buf),
+    )
+    .await
+    .map_err(|_| ScanError::Timeout)?
+    .map_err(ScanError::Io)?;
     let text = String::from_utf8_lossy(&buf[..n]);
     let status: u16 = text
         .split_whitespace()
@@ -89,6 +93,30 @@ async fn connect(ip: Ipv4Addr) -> Result<tokio::net::TcpStream, ScanError> {
         .map_err(ScanError::Io)
 }
 
+/// Reorder the shortlist when the `Server:` fingerprint matches a
+/// known vendor — matching paths probe first.
+#[must_use]
+pub fn shortlist_for(server: Option<&str>) -> Vec<(&'static str, ScanRole)> {
+    let mut v: Vec<(&'static str, ScanRole)> = SHORTLIST.to_vec();
+    if let Some(s) = server.map(str::to_ascii_lowercase) {
+        let tag = if s.contains("hikvision") || s.contains("hipcam") {
+            "Streaming/Channels"
+        } else if s.contains("dahua") || s.contains("amcrest") || s.contains("lorex") {
+            "cam/realmonitor"
+        } else if s.contains("reolink") {
+            "h264Preview"
+        } else if s.contains("axis") {
+            "axis-media"
+        } else {
+            ""
+        };
+        if !tag.is_empty() {
+            v.sort_by_key(|(p, _)| !p.starts_with(tag));
+        }
+    }
+    v
+}
+
 /// `OPTIONS` once → `Server:` header fingerprint.
 pub async fn fingerprint(ip: Ipv4Addr) -> Option<String> {
     let mut s = connect(ip).await.ok()?;
@@ -104,9 +132,10 @@ pub async fn probe_paths(
     deadline: std::time::Instant,
     ip: Ipv4Addr,
     creds: &Creds,
+    server: Option<&str>,
 ) -> Vec<PathHit> {
     let mut hits = Vec::new();
-    for (path, role) in SHORTLIST {
+    for (path, role) in shortlist_for(server) {
         if deadline <= std::time::Instant::now() {
             break;
         }
@@ -121,7 +150,7 @@ pub async fn probe_paths(
         match status {
             200 => hits.push(PathHit {
                 path: (*path).to_owned(),
-                role: *role,
+                role,
                 auth: None,
             }),
             401 => {
@@ -135,7 +164,7 @@ pub async fn probe_paths(
                 if creds.is_empty() {
                     hits.push(PathHit {
                         path: (*path).to_owned(),
-                        role: *role,
+                        role,
                         auth: scheme,
                     });
                     continue;
@@ -168,14 +197,16 @@ pub async fn probe_paths(
                     "DESCRIBE {url} RTSP/1.0\r\nCSeq: 3\r\nAccept: application/sdp\r\nAuthorization: {auth_hdr}\r\n\r\n"
                 );
                 match request(&mut s, &req2).await {
+                    // Verified-but-auth-required: keep the scheme tag so
+                    // creds embed in the emitted URL (assemble).
                     Ok((200, _)) => hits.push(PathHit {
                         path: (*path).to_owned(),
-                        role: *role,
-                        auth: None,
+                        role,
+                        auth: scheme,
                     }),
                     Ok((401, _)) => hits.push(PathHit {
                         path: (*path).to_owned(),
-                        role: *role,
+                        role,
                         auth: scheme,
                     }),
                     _ => {}

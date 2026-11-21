@@ -74,6 +74,20 @@ async fn authed_get(url: &str, creds: &Creds) -> Result<(u16, Option<String>, St
     if status != 401 || creds.is_empty() {
         return Ok((status, www_auth, body));
     }
+    // Digest challenge → digest retry; Basic challenge → Basic retry.
+    if www_auth
+        .as_deref()
+        .is_some_and(|v| v.to_ascii_lowercase().starts_with("basic"))
+    {
+        let auth = format!(
+            "Basic {}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                format!("{}:{}", creds.username, creds.password),
+            )
+        );
+        return http_get(&client, url, Some(auth)).await;
+    }
     let Some(challenge) = www_auth.as_deref().and_then(parse_digest_challenge) else {
         return Ok((status, www_auth, body));
     };

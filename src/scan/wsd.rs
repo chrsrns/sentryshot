@@ -209,7 +209,14 @@ pub async fn collect(
                     std::net::IpAddr::V4(ip) => ip,
                     std::net::IpAddr::V6(_) => continue,
                 };
-                for m in parse_probe_matches(&buf[..n]) {
+                for mut m in parse_probe_matches(&buf[..n]) {
+                    // Reported hosts are unreliable — rewrite to the
+                    // responder IP, keeping each URI's port and path.
+                    m.xaddrs = m
+                        .xaddrs
+                        .iter()
+                        .map(|x| crate::types::rewrite_ip_host(x, from.ip()))
+                        .collect();
                     if !m.epr.is_empty() && !seen_epr.insert(m.epr.clone()) {
                         continue;
                     }

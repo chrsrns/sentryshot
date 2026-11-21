@@ -39,6 +39,7 @@ impl Scanner {
     /// [`ScanError::InvalidHost`] on a bad literal, or the inner scan
     /// error.
     pub async fn scan(&self, req: ScanRequest) -> Result<ScanResult, ScanError> {
+        req.target()?; // validate before join: identical errors for all callers
         enum Act {
             Leader(watch::Sender<Option<Outcome>>),
             Join(watch::Receiver<Option<Outcome>>),
@@ -122,7 +123,7 @@ async fn run(req: &ScanRequest) -> Result<ScanResult, ScanError> {
             }
             let dev = devices.remove(0);
             let creds = creds.clone();
-            set.spawn(async move { scan_one(dev, creds, per_ip.is_some(), deadline).await });
+            set.spawn(async move { scan_one(dev, creds, per_ip, deadline).await });
         }
         if truncated {
             break;
@@ -147,7 +148,7 @@ async fn run(req: &ScanRequest) -> Result<ScanResult, ScanError> {
 async fn scan_one(
     dev: DiscoveredDevice,
     creds: Creds,
-    per_ip: bool,
+    per_ip: Option<std::net::Ipv4Addr>,
     deadline: Instant,
 ) -> DiscoveredCamera {
     let mut input = assemble::Input {
@@ -156,6 +157,7 @@ async fn scan_one(
         vendor: Vec::new(),
         paths: Vec::new(),
         creds: creds.clone(),
+        needs_auth: false,
     };
     let mut ptz = false;
     let mut backchannel = false;
@@ -163,40 +165,57 @@ async fn scan_one(
     if let Some(xaddr) = dev.xaddrs.first() {
         let mut client = OnvifHttp::new(dev.ip.into());
         let budget = remaining(deadline).min(ENUM_BUDGET);
-        if let Ok(Ok((services, streams))) =
-            tokio::time::timeout(budget, enumerate(&mut client, xaddr, &creds)).await
-        {
-            ptz = services.ptz;
-            backchannel = services.backchannel;
-            input.onvif = streams;
-            input.onvif_auth = client.auth_used();
+        match tokio::time::timeout(budget, enumerate(&mut client, xaddr, &creds)).await {
+            Ok(Ok((services, streams))) => {
+                ptz = services.ptz;
+                backchannel = services.backchannel;
+                input.onvif = streams;
+                input.onvif_auth = client.auth_used();
+            }
+            _ => input.needs_auth = client.auth_used(),
         }
     }
 
-    if per_ip && !remaining(deadline).is_zero() {
+    // Per-IP probes target the REQUESTED host — a stray or spoofed
+    // unicast reply must never retarget probing or creds.
+    let Some(probe_ip) = per_ip else {
+        return assemble::assemble(
+            dev.ip,
+            dev.name,
+            dev.hardware,
+            dev.xaddrs,
+            ptz,
+            backchannel,
+            input,
+        );
+    };
+    if !remaining(deadline).is_zero() {
         if remaining(deadline) > vendor_timeout() {
             input
                 .vendor
-                .extend(vendor::isapi_channels(dev.ip, &creds).await);
+                .extend(vendor::isapi_channels(probe_ip, &creds).await);
         }
         if remaining(deadline) > vendor_timeout() {
             input
                 .vendor
-                .extend(vendor::dahua_channels(dev.ip, &creds).await);
+                .extend(vendor::dahua_channels(probe_ip, &creds).await);
         }
-        let _server = rtsp::fingerprint(dev.ip).await;
-        let hits = rtsp::probe_paths(deadline, dev.ip, &creds).await;
-        // Retina-verify answered candidates; hits that fail are dropped
-        // as false positives. Auth-pending hits stay unverified.
-        for hit in hits {
-            if hit.auth.is_none()
-                && !remaining(deadline).is_zero()
-                && let Ok(u) = url::Url::parse(&format!("rtsp://{}:554/{}", dev.ip, hit.path))
-                && rtsp::verify(u, &creds, remaining(deadline)).await.is_err()
-            {
-                continue;
+        // Shortlist skipped once enumeration already yielded streams.
+        if input.onvif.is_empty() && input.vendor.iter().all(|h| h.path.is_empty()) {
+            let server = rtsp::fingerprint(probe_ip).await;
+            let hits = rtsp::probe_paths(deadline, probe_ip, &creds, server.as_deref()).await;
+            // Retina-verify answered candidates; hits that fail are
+            // dropped as false positives. Auth-flagged hits stay.
+            for hit in hits {
+                if hit.auth.is_none()
+                    && !remaining(deadline).is_zero()
+                    && let Ok(u) = url::Url::parse(&format!("rtsp://{}:554/{}", probe_ip, hit.path))
+                    && rtsp::verify(u, &creds, remaining(deadline)).await.is_err()
+                {
+                    continue;
+                }
+                input.paths.push(hit);
             }
-            input.paths.push(hit);
         }
     }
 

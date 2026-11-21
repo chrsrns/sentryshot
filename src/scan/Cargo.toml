@@ -22,7 +22,6 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
 if-addrs = "0.13"
-onvif-device-rs = "0.13"
 rand.workspace = true
 retina.workspace = true
 roxmltree = "0.20"

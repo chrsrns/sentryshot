@@ -92,6 +92,8 @@ fn rewrite_host(uri: &str, responder: IpAddr) -> Option<String> {
     Some(url.to_string())
 }
 
+fn _unused() {}
+
 pub(crate) struct DigestChallenge {
     realm: String,
     nonce: String,
@@ -188,6 +190,7 @@ impl OnvifHttp {
             req.body(Full::new(Bytes::from(body)))
         };
 
+        let deadline = std::time::Instant::now() + timeout;
         // bare attempt
         let res = tokio::time::timeout(
             timeout,
@@ -205,7 +208,7 @@ impl OnvifHttp {
             .get("www-authenticate")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let text = self.collect_body(res, timeout).await?;
+        let text = self.collect_body(res, deadline).await?;
 
         if status != 401 {
             if text.contains("NotAuthorized") && !creds.is_empty() {
@@ -220,6 +223,8 @@ impl OnvifHttp {
             return Ok((text, status));
         }
         if creds.is_empty() {
+            self.auth_used
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             return Ok((text, status));
         }
         // 401 → HTTP Digest when the server offers it, else WSSE once.
@@ -255,6 +260,7 @@ impl OnvifHttp {
         auth: Option<String>,
         timeout: Duration,
     ) -> Result<(String, u16), ScanError> {
+        let deadline = std::time::Instant::now() + timeout;
         let res = tokio::time::timeout(
             timeout,
             self.client.request(
@@ -265,20 +271,24 @@ impl OnvifHttp {
         .map_err(|_| ScanError::Timeout)?
         .map_err(|e| ScanError::Http(e.into()))?;
         let status = res.status().as_u16();
-        let text = self.collect_body(res, timeout).await?;
+        let text = self.collect_body(res, deadline).await?;
         Ok((text, status))
     }
 
     async fn collect_body(
         &self,
         res: hyper::Response<hyper::body::Incoming>,
-        timeout: Duration,
+        deadline: std::time::Instant,
     ) -> Result<String, ScanError> {
-        let body = tokio::time::timeout(timeout, res.into_body().collect())
-            .await
-            .map_err(|_| ScanError::Timeout)?
-            .map_err(|e| ScanError::Http(e.into()))?
-            .to_bytes();
+        let bounded = http_body_util::Limited::new(res.into_body(), MAX_BODY + 1);
+        let body = tokio::time::timeout(
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            bounded.collect(),
+        )
+        .await
+        .map_err(|_| ScanError::Timeout)?
+        .map_err(ScanError::Http)?
+        .to_bytes();
         Ok(String::from_utf8_lossy(&body[..body.len().min(MAX_BODY)]).into_owned())
     }
 

@@ -273,3 +273,19 @@ mod tests {
         );
     }
 }
+
+/// Rewrite a URI's host to `ip`, preserving port and path. Unparseable
+/// input returns unchanged.
+#[must_use]
+pub fn rewrite_ip_host(uri: &str, ip: std::net::IpAddr) -> String {
+    url::Url::parse(uri).map_or_else(
+        |_| uri.to_owned(),
+        |mut u| {
+            if u.set_ip_host(ip).is_ok() {
+                u.to_string()
+            } else {
+                uri.to_owned()
+            }
+        },
+    )
+}
