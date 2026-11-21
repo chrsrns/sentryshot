@@ -184,7 +184,20 @@ async fn scan_one(
                 .vendor
                 .extend(vendor::dahua_channels(dev.ip, &creds).await);
         }
-        input.paths = rtsp::probe_paths(deadline, dev.ip, &creds).await;
+        let _server = rtsp::fingerprint(dev.ip).await;
+        let hits = rtsp::probe_paths(deadline, dev.ip, &creds).await;
+        // Retina-verify answered candidates; hits that fail are dropped
+        // as false positives. Auth-pending hits stay unverified.
+        for hit in hits {
+            if hit.auth.is_none()
+                && !remaining(deadline).is_zero()
+                && let Ok(u) = url::Url::parse(&format!("rtsp://{}:554/{}", dev.ip, hit.path))
+                && rtsp::verify(u, &creds, remaining(deadline)).await.is_err()
+            {
+                continue;
+            }
+            input.paths.push(hit);
+        }
     }
 
     assemble::assemble(

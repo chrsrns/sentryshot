@@ -48,6 +48,16 @@ impl OnvifHttp {
     }
 }
 
+/// XML-escape a string interpolated into an envelope — device-supplied
+/// tokens and user creds must not break the document.
+fn xml_escape(v: &str) -> String {
+    v.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 fn soap_envelope(action_body: &str, creds: Option<(&str, &str, i64)>) -> String {
     let security = match creds {
         None => String::new(),
@@ -63,7 +73,8 @@ fn soap_envelope(action_body: &str, creds: Option<(&str, &str, i64)>) -> String 
             sha.update(pass.as_bytes());
             let digest = B64.encode(sha.finalize());
             format!(
-                r#"<wsse:Security s:mustUnderstand="1" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"><wsse:UsernameToken><wsse:Username>{user}</wsse:Username><wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{}</wsse:Nonce><wsu:Created>{created_iso}</wsu:Created><wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{digest}</wsse:Password></wsse:UsernameToken></wsse:Security>"#,
+                r#"<wsse:Security s:mustUnderstand="1" xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd"><wsse:UsernameToken><wsse:Username>{}</wsse:Username><wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{}</wsse:Nonce><wsu:Created>{created_iso}</wsu:Created><wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{digest}</wsse:Password></wsse:UsernameToken></wsse:Security>"#,
+                xml_escape(user),
                 B64.encode(nonce),
             )
         }
@@ -447,7 +458,8 @@ impl crate::seam::OnvifClient for OnvifHttp {
         creds: &Creds,
     ) -> Result<String, ScanError> {
         let action = format!(
-            r#"<trt:GetStreamUri xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><trt:StreamSetup><tt:Stream xmlns:tt="http://www.onvif.org/ver10/schema">RTP-Unicast</tt:Stream><tt:Transport xmlns:tt="http://www.onvif.org/ver10/schema"><tt:Protocol>RTSP</tt:Protocol></tt:Transport></trt:StreamSetup><trt:ProfileToken>{token}</trt:ProfileToken></trt:GetStreamUri>"#
+            r#"<trt:GetStreamUri xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><trt:StreamSetup><tt:Stream xmlns:tt="http://www.onvif.org/ver10/schema">RTP-Unicast</tt:Stream><tt:Transport xmlns:tt="http://www.onvif.org/ver10/schema"><tt:Protocol>RTSP</tt:Protocol></tt:Transport></trt:StreamSetup><trt:ProfileToken>{}</trt:ProfileToken></trt:GetStreamUri>"#,
+            xml_escape(token),
         );
         let (text, status) = self
             .soap_call(media_xaddr, &action, creds, Duration::from_secs(2))
@@ -649,5 +661,28 @@ mod tests {
         };
         client.device_time(&xaddr, &creds).await.unwrap();
         assert_eq!(vec!["false", "true"], *attempts.lock().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn envelope_escapes_creds_and_token() {
+        let env = soap_envelope("<x/>", Some(("ad<min", "p&w", 0)));
+        assert!(env.contains("ad&lt;min"));
+        assert!(!env.contains("<min"));
+        // Password is never sent in clear — digest only — but the raw
+        // value must not appear in the envelope.
+        assert!(!env.contains("p&w"));
+        assert_eq!("a&lt;b&gt;&amp;&quot;c&quot;", xml_escape("a<b>&\"c\""));
+    }
+
+    #[test]
+    fn malformed_soap_response_is_error_not_panic() {
+        assert!(OnvifHttp::parse_doc("<broken").is_err());
+        assert!(OnvifHttp::parse_doc("not xml at all").is_err());
     }
 }
