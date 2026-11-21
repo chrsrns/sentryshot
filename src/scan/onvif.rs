@@ -116,12 +116,13 @@ pub(crate) fn digest_authorization(
     user: &str,
     pass: &str,
     uri: &str,
+    method: &str,
 ) -> String {
     let ha1 = format!(
         "{:x}",
         md5::compute(format!("{user}:{}:{pass}", challenge.realm))
     );
-    let ha2 = format!("{:x}", md5::compute(format!("POST:{uri}")));
+    let ha2 = format!("{:x}", md5::compute(format!("{method}:{uri}")));
     let (cnonce, nc) = (
         format!("{:x}", md5::compute(rand::random::<u64>().to_string())),
         "00000001",
@@ -215,7 +216,8 @@ impl OnvifHttp {
             return self.round_trip(&do_post, body2, None, timeout).await;
         };
         let path = url::Url::parse(xaddr).map_or_else(|_| "/".to_owned(), |u| u.path().to_owned());
-        let auth = digest_authorization(&challenge, &creds.username, &creds.password, &path);
+        let auth =
+            digest_authorization(&challenge, &creds.username, &creds.password, &path, "POST");
         self.round_trip(
             &do_post,
             soap_envelope(action_body, None),
@@ -575,7 +577,7 @@ mod tests {
     fn digest_roundtrip() {
         let c =
             parse_digest_challenge(r#"Digest realm="cam", nonce="abc123", qop="auth""#).unwrap();
-        let auth = digest_authorization(&c, "admin", "pass", "/x");
+        let auth = digest_authorization(&c, "admin", "pass", "/x", "POST");
         assert!(auth.contains("username=\"admin\""));
         assert!(auth.contains("realm=\"cam\""));
         assert!(auth.contains("response=\""));

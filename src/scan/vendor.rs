@@ -78,7 +78,7 @@ async fn authed_get(url: &str, creds: &Creds) -> Result<(u16, Option<String>, St
         return Ok((status, www_auth, body));
     };
     let path = url::Url::parse(url).map_or_else(|_| "/".to_owned(), |u| u.path().to_owned());
-    let auth = digest_authorization(&challenge, &creds.username, &creds.password, &path);
+    let auth = digest_authorization(&challenge, &creds.username, &creds.password, &path, "GET");
     http_get(&client, url, Some(auth)).await
 }
 
