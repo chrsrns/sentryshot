@@ -13,5 +13,6 @@ pub use types::*;
 pub mod assemble;
 pub mod onvif;
 pub mod rtsp;
+pub mod scanner;
 pub mod vendor;
 pub mod wsd;

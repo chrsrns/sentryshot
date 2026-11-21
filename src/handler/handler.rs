@@ -640,3 +640,28 @@ pub async fn recording_video_handler(
     )
     .await
 }
+
+/// `POST /api/scan` — admin-gated camera discovery.
+///
+/// Error bodies carry static strings only: `ScanError::InvalidHost`
+/// echoes back the user-supplied host and nothing else must leak
+/// (in particular not credential-bearing stream URLs).
+pub async fn scan_handler(
+    State(scanner): State<Arc<scan::scanner::Scanner>>,
+    Json(req): Json<scan::types::ScanRequest>,
+) -> Response {
+    match scanner.scan(req).await {
+        Ok(result) => Json(result).into_response(),
+        Err(e) => scan_error_response(&e),
+    }
+}
+
+fn scan_error_response(e: &scan::ScanError) -> Response {
+    match e {
+        scan::ScanError::InvalidHost(_) => {
+            (StatusCode::BAD_REQUEST, "invalid host").into_response()
+        }
+        scan::ScanError::Busy => (StatusCode::CONFLICT, "scan already in progress").into_response(),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "scan failed").into_response(),
+    }
+}

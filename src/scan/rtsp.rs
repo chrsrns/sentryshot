@@ -100,9 +100,16 @@ pub async fn fingerprint(ip: Ipv4Addr) -> Option<String> {
 /// Probe the shortlist: `DESCRIBE` each path on its own connection,
 /// classify 200/401/other; 401 retries once with user creds when a
 /// challenge is offered (`digest` or `basic`).
-pub async fn probe_paths(ip: Ipv4Addr, creds: &Creds) -> Vec<PathHit> {
+pub async fn probe_paths(
+    deadline: std::time::Instant,
+    ip: Ipv4Addr,
+    creds: &Creds,
+) -> Vec<PathHit> {
     let mut hits = Vec::new();
     for (path, role) in SHORTLIST {
+        if deadline <= std::time::Instant::now() {
+            break;
+        }
         let url = format!("rtsp://{ip}:554/{path}");
         let Ok(mut s) = connect(ip).await else {
             continue;

@@ -31,6 +31,8 @@ pub struct OnvifHttp {
     responder: IpAddr,
     /// Device-minus-local clock offset applied to WSSE `Created`.
     clock_offset: i64,
+    /// Any call required a credential retry (401/NotAuthorized).
+    auth_used: std::sync::atomic::AtomicBool,
 }
 
 impl OnvifHttp {
@@ -41,6 +43,7 @@ impl OnvifHttp {
             client,
             responder,
             clock_offset: 0,
+            auth_used: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -195,6 +198,8 @@ impl OnvifHttp {
 
         if status != 401 {
             if text.contains("NotAuthorized") && !creds.is_empty() {
+                self.auth_used
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 let body2 = soap_envelope(
                     action_body,
                     Some((&creds.username, &creds.password, self.clock_offset)),
@@ -209,6 +214,8 @@ impl OnvifHttp {
         // 401 → HTTP Digest when the server offers it, else WSSE once.
         let challenge = www_auth.as_deref().and_then(parse_digest_challenge);
         let Some(challenge) = challenge else {
+            self.auth_used
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             let body2 = soap_envelope(
                 action_body,
                 Some((&creds.username, &creds.password, self.clock_offset)),
@@ -262,6 +269,12 @@ impl OnvifHttp {
             .map_err(|e| ScanError::Http(e.into()))?
             .to_bytes();
         Ok(String::from_utf8_lossy(&body[..body.len().min(MAX_BODY)]).into_owned())
+    }
+
+    /// Whether any call required a credential retry.
+    #[must_use]
+    pub fn auth_used(&self) -> bool {
+        self.auth_used.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn parse_doc(text: &str) -> Result<Document<'_>, ScanError> {

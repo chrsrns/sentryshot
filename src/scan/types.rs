@@ -41,7 +41,7 @@ impl ScanRequest {
 }
 
 /// `POST /api/scan` response body.
-#[derive(Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanResult {
     /// Discovered devices, including zero-stream devices.
@@ -53,7 +53,7 @@ pub struct ScanResult {
 }
 
 /// A discovered camera as returned to the FE.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveredCamera {
     /// Responder IPv4 address.
@@ -84,7 +84,7 @@ pub struct DiscoveredCamera {
 }
 
 /// A candidate RTSP stream.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanStream {
     /// ONVIF profile name, when profile-sourced.
