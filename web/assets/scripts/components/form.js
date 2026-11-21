@@ -60,6 +60,10 @@ function newForm(fields) {
 					buttons["delete"] = newDeleteBtn(onClick);
 					break;
 				}
+				case "scan": {
+					buttons["scan"] = newScanBtn(onClick);
+					break;
+				}
 				default: {
 					console.error("unknown button type:", type);
 				}
@@ -220,6 +224,19 @@ function newSaveBtn(onClick) {
 	const elem = htmlToElem(/* HTML */ `
 		<button class="m-2 px-2 rounded-lg bg-green hover:bg-green2">
 			<span class="text-2 text-color">Save</span>
+		</button>
+	`);
+	elem.onclick = onClick;
+	return elem;
+}
+
+/** @param {() => void} onClick */
+function newScanBtn(onClick) {
+	/** @type {HTMLButtonElement} */
+	// @ts-ignore
+	const elem = htmlToElem(/* HTML */ `
+		<button class="m-2 px-2 rounded-lg bg-color2 hover:bg-color3">
+			<span class="text-2 text-color">Scan</span>
 		</button>
 	`);
 	elem.onclick = onClick;

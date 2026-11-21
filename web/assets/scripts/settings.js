@@ -439,8 +439,6 @@ function newMonitor(token, fields, getMonitorId, monitors) {
 			deleteMonitor(form.fields.id.value());
 		}
 	};
-	form.addButton("delete", onDelete);
-
 	const scanModal = newScanModal(token);
 	form.addButton("scan", () => {
 		scanModal.open();
@@ -448,6 +446,8 @@ function newMonitor(token, fields, getMonitorId, monitors) {
 	scanModal.onPick = (prefill) => {
 		form.set(prefill);
 	};
+
+	form.addButton("delete", onDelete);
 
 	/** @param {HTMLElement} subNavElem */
 	const onNav = (subNavElem) => {
