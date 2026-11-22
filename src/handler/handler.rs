@@ -671,11 +671,64 @@ fn scan_error_response(e: &scan::ScanError) -> Response {
     }
 }
 
-/// Route state for `POST /api/monitor/ptz` — the client factory is a
-/// seam so tests can inject a stub camera.
+/// Per-monitor PTZ dispatch entry: a cached client plus a lock that
+/// serializes commands in request order — `stop` cannot leapfrog `move`
+/// on slow links. Rebuilt when the endpoint+creds key changes (config
+/// edit).
+struct PtzEntry {
+    key: String,
+    client: ptz::ArcPtzClient,
+    lock: tokio::sync::Mutex<()>,
+}
+
+/// Builds and caches `PtzEntry`s per monitor.
+pub struct PtzService {
+    factory: Arc<dyn Fn(String, (String, String)) -> ptz::ArcPtzClient + Send + Sync>,
+    entries: std::sync::Mutex<std::collections::HashMap<String, Arc<PtzEntry>>>,
+}
+
+impl PtzService {
+    pub fn new(
+        factory: Arc<dyn Fn(String, (String, String)) -> ptz::ArcPtzClient + Send + Sync>,
+    ) -> Self {
+        Self {
+            factory,
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Entry for `id`, rebuilt when `key` (endpoint+creds) differs from
+    /// the cached one.
+    fn entry(
+        &self,
+        id: &str,
+        key: String,
+        endpoint: String,
+        creds: (String, String),
+    ) -> Arc<PtzEntry> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match entries.get(id) {
+            Some(entry) if entry.key == key => entry.clone(),
+            _ => {
+                let entry = Arc::new(PtzEntry {
+                    key,
+                    client: (self.factory)(endpoint, creds),
+                    lock: tokio::sync::Mutex::new(()),
+                });
+                entries.insert(id.to_owned(), entry.clone());
+                entry
+            }
+        }
+    }
+}
+
+/// Route state for `POST /api/monitor/ptz`.
 pub struct PtzRouteState {
     pub monitors: ArcMonitorManager,
-    pub factory: Arc<dyn Fn(String, (String, String)) -> ptz::ArcPtzClient + Send + Sync>,
+    pub service: PtzService,
 }
 
 /// `POST /api/monitor/ptz?id=` — relay one PTZ command to the
@@ -728,7 +781,11 @@ pub async fn ptz_handler(
             Ok(e) => e,
             Err(e) => return ptz_error_response(&e),
         };
-    let client = (state.factory)(endpoint, creds);
+    let key = format!("{endpoint}\u{0}{}\u{0}{}", creds.0, creds.1);
+    let entry = state.service.entry(&query.id, key, endpoint, creds);
+    // Serialized per monitor — move lands before stop, in request order.
+    let _guard = entry.lock.lock().await;
+    let client = &entry.client;
 
     let result = match cmd.command.as_str() {
         "move" => client.move_cam(cmd.pan, cmd.tilt, cmd.zoom).await,
