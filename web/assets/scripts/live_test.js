@@ -306,7 +306,7 @@ describe("live ptz overlay", () => {
 		).click(); // open rail
 		const rail = document.querySelector(".js-ptz-live-pad");
 		const up = rail.querySelector('[data-tilt="0.5"]');
-		up.dispatchEvent(new window.Event("pointerdown"));
+		up.dispatchEvent(Object.assign(new window.Event("pointerdown"), { button: 0, pointerId: 1 }));
 		for (let i = 0; i < 5; i++) {
 			await Promise.resolve();
 		}
@@ -326,13 +326,13 @@ describe("live ptz overlay", () => {
 		document.body.innerHTML = `<div></div>`;
 		const element = document.querySelector("div");
 		const calls = [];
-		global.fetch = (url, opts) => {
+		global.fetch = /** @type {any} */ ((url, opts) => {
 			calls.push({ url, body: JSON.parse(opts.body) });
 			return Promise.resolve({
 				status: 200,
 				json: () => Promise.resolve({ presets: [] }),
 			});
-		};
+		});
 		// @ts-ignore
 		newViewer(element, mkMonitors(), "hls", mkPtz(true)).reset();
 		for (let i = 0; i < 5; i++) {
@@ -341,7 +341,7 @@ describe("live ptz overlay", () => {
 
 		const pad = document.querySelector(".js-ptz-live-pad");
 		const btn = pad.querySelector('[data-tilt="0.5"]');
-		btn.dispatchEvent(new window.Event("pointerdown"));
+		btn.dispatchEvent(Object.assign(new window.Event("pointerdown"), { button: 0, pointerId: 1 }));
 		for (let i = 0; i < 5; i++) {
 			await Promise.resolve();
 		}
@@ -350,10 +350,11 @@ describe("live ptz overlay", () => {
 				(c) =>
 					c.url.includes("api/monitor/ptz?id=m1") &&
 					c.body.command === "move" &&
-					c.body.tilt === 0.5,
+					c.body.tilt === 0.25 &&
+					c.body.timeout === "PT0.5S",
 			),
 		).toBe(true);
-		btn.dispatchEvent(new window.Event("pointerup"));
+		btn.dispatchEvent(Object.assign(new window.Event("pointerup"), { button: 0, pointerId: 1 }));
 		for (let i = 0; i < 5; i++) {
 			await Promise.resolve();
 		}

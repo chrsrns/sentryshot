@@ -142,6 +142,7 @@ mod ptz {
             _pan: Option<f64>,
             _tilt: Option<f64>,
             _zoom: Option<f64>,
+            _timeout: Option<&str>,
         ) -> Result<(), ptz::Error> {
             if self.err {
                 return Err(ptz::Error::NoPtzService);
@@ -198,6 +199,7 @@ mod ptz {
             pan: None,
             tilt: None,
             zoom: None,
+            timeout: None,
             preset_token: None,
             preset_name: None,
         }
@@ -316,6 +318,25 @@ mod ptz {
     }
 
     #[tokio::test]
+    async fn ptz_timeout_outside_allowlist_is_400() {
+        let (state, query, _) = harness(Some(monitor_config(true)), stub_client(false));
+        let mut c = cmd("move");
+        c.pan = Some(0.5);
+        c.timeout = Some("PT3S".to_owned());
+        let resp = ptz_handler(state, query, Json(c)).await;
+        assert_eq!(StatusCode::BAD_REQUEST, resp.status());
+    }
+
+    #[tokio::test]
+    async fn ptz_timeout_on_non_move_is_400() {
+        let (state, query, _) = harness(Some(monitor_config(true)), stub_client(false));
+        let mut c = cmd("stop");
+        c.timeout = Some("PT0.5S".to_owned());
+        let resp = ptz_handler(state, query, Json(c)).await;
+        assert_eq!(StatusCode::BAD_REQUEST, resp.status());
+    }
+
+    #[tokio::test]
     async fn ptz_missing_monitor_is_404() {
         let (state, query, _) = harness(None, stub_client(false));
         let resp = ptz_handler(state, query, Json(cmd("stop"))).await;
@@ -379,6 +400,7 @@ mod ptz {
             _p: Option<f64>,
             _t: Option<f64>,
             _z: Option<f64>,
+            _timeout: Option<&str>,
         ) -> Result<(), ptz::Error> {
             tokio::time::sleep(self.delay).await;
             self.ops.lock().unwrap().push("move".to_owned());

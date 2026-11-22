@@ -99,13 +99,14 @@ Request body:
 	"pan": 0.5,
 	"tilt": 0,
 	"zoom": 0,
+	"timeout": "PT2S",
 	"presetToken": "1",
 	"presetName": "Gate"
 }
 ```
 
 - `command`: `move` | `stop` | `home` | `getPresets` | `gotoPreset` | `setPreset` | `removePreset` | `capabilities`
-- `move`: at least one of `pan`/`tilt`/`zoom` required, each −1.0..=1.0. The camera holds movement for ~2s (server-side `Timeout`) unless a `stop` follows.
+- `move`: at least one of `pan`/`tilt`/`zoom` required, each −1.0..=1.0. Optional `timeout` — `PT0.5S` | `PT1S` | `PT2S`, default `PT2S` — is interpolated into the `ContinuousMove` camera-side `Timeout`, bounding how long the camera holds movement without a `stop`. Short taps should send `PT0.5S`; note some firmware ignores `Timeout` and jogs a fixed duration instead (velocity is the only knob there). `timeout` is rejected on any non-`move` command.
 - `gotoPreset`/`removePreset`: `presetToken` required.
 - `setPreset`: `presetName` required, 1..=64 characters.
 - `stop`: stops all axes; `home`: moves to the camera home position.
@@ -129,7 +130,7 @@ Response `200`:
 
 | Status | Meaning |
 | --- | --- |
-| `400` | unknown command, missing required field, out-of-range velocity, `presetName` empty or over 64 chars |
+| `400` | unknown command, missing required field, out-of-range velocity, `presetName` empty or over 64 chars, `timeout` outside the allowlist or attached to a non-`move` command |
 | `404` | monitor does not exist |
 | `409` | monitor `ptz.enable` is not `true` |
 | `502` | camera fault or timeout, or a command the camera marked unsupported |

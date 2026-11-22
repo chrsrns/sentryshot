@@ -395,6 +395,18 @@ describe("newPtzField panel", () => {
 		}
 	};
 
+	/** Pointer event with a primary button + pointer id. */
+	const ptr = (type, props = {}) => {
+		const ev = /** @type {any} */ (Object.assign(new Event(type), props));
+		if (ev.button === undefined) {
+			ev.button = 0;
+		}
+		if (ev.pointerId === undefined) {
+			ev.pointerId = 1;
+		}
+		return ev;
+	};
+
 	test("panel hidden until a persisted enabled config is set", () => {
 		document.body.replaceChildren();
 		const field = mkField();
@@ -409,7 +421,7 @@ describe("newPtzField panel", () => {
 		expect(li.hidden).toBe(true);
 	});
 
-	test("hold sends move, heartbeats, and stop on release", async () => {
+	test("hold sends pulse, upgrade move, heartbeats, and stop on release", async () => {
 		document.body.replaceChildren();
 		jest.useFakeTimers();
 		const calls = mkFetch();
@@ -423,67 +435,203 @@ describe("newPtzField panel", () => {
 				/** @type {HTMLElement} */ (b).dataset.tilt === "0.5" &&
 				/** @type {HTMLElement} */ (b).dataset.pan === "0",
 		);
-		up.dispatchEvent(new Event("pointerdown"));
+		up.dispatchEvent(ptr("pointerdown"));
+		await flush();
+		// Every press starts as a tap-pulse: sign·0.25 per axis, PT0.5S.
+		expect(calls.at(-1).body).toEqual({
+			command: "move",
+			tilt: 0.25,
+			pan: 0,
+			timeout: "PT0.5S",
+		});
+
+		// Still held at 300ms → upgrade to full velocity + heartbeat.
+		jest.advanceTimersByTime(300);
 		await flush();
 		expect(calls.at(-1).body).toEqual({
 			command: "move",
 			tilt: 0.5,
 			pan: 0,
+			timeout: "PT2S",
 		});
 
 		const before = calls.length;
 		jest.advanceTimersByTime(1600);
 		await flush();
 		expect(calls).toHaveLength(before + 1);
-		expect(calls.at(-1).body.command).toBe("move");
+		expect(calls.at(-1).body).toEqual({
+			command: "move",
+			tilt: 0.5,
+			pan: 0,
+			timeout: "PT2S",
+		});
 
-		up.dispatchEvent(new Event("pointerup"));
+		up.dispatchEvent(ptr("pointerup"));
 		await flush();
 		expect(calls.at(-1).body).toEqual({ command: "stop" });
 		jest.useRealTimers();
 	});
 
-	test("heartbeat skipped while prior move in-flight", async () => {
+	test("tap releases before upgrade — stop, then no ghost move", async () => {
 		document.body.replaceChildren();
 		jest.useFakeTimers();
-		const calls = [];
-		let resolveFirst;
-		global.fetch = (url, opts) => {
-			calls.push({ url, body: JSON.parse(opts.body) });
-			if (resolveFirst === undefined) {
-				return new Promise((resolve) => {
-					resolveFirst = resolve;
-				});
-			}
-			return Promise.resolve({ status: 200, json: () => Promise.resolve({}) });
-		};
+		const calls = mkFetch();
 		const field = mkField();
 		field.set({ enable: true, onvifAddr: "" });
 		document.body.append(field.elems[2]);
 		await flush();
-		// getPresets call consumed the pending fetch.
-		resolveFirst({ status: 200, json: () => Promise.resolve({}) });
-		await flush();
-		resolveFirst = undefined;
 
 		const up = [...field.elems[2].querySelectorAll(".ptz-hold")].find(
 			(b) =>
 				/** @type {HTMLElement} */ (b).dataset.tilt === "0.5" &&
 				/** @type {HTMLElement} */ (b).dataset.pan === "0",
 		);
-		up.dispatchEvent(new Event("pointerdown"));
+		up.dispatchEvent(ptr("pointerdown"));
 		await flush();
-		const n = calls.length; // move in-flight, not resolved
+		expect(calls.at(-1).body.timeout).toBe("PT0.5S");
 
+		up.dispatchEvent(ptr("pointerup"));
+		await flush();
+		expect(calls.at(-1).body).toEqual({ command: "stop" });
+
+		// The cleared upgrade timer must not fire a full-velocity move
+		// after the stop.
+		const n = calls.length;
+		jest.advanceTimersByTime(2000);
+		await flush();
+		expect(calls).toHaveLength(n);
+		jest.useRealTimers();
+	});
+
+	test("heartbeat beat dropped while commands queued or in-flight", async () => {
+		document.body.replaceChildren();
+		jest.useFakeTimers();
+		const calls = [];
+		/** @type {undefined | ((v: any) => void)} */
+		let release;
+		global.fetch = /** @type {any} */ ((url, opts) => {
+			calls.push({ url, body: JSON.parse(/** @type {string} */ (opts.body)) });
+			if (release === undefined) {
+				return new Promise((resolve) => {
+					release = resolve;
+				});
+			}
+			return Promise.resolve({ status: 200, json: () => Promise.resolve({}) });
+		});
+		const field = mkField();
+		field.set({ enable: true, onvifAddr: "" });
+		document.body.append(field.elems[2]);
+		await flush();
+		// getPresets consumed the pending fetch slot.
+		/** @type {any} */ (release)({ status: 200, json: () => Promise.resolve({}) });
+		await flush();
+		release = undefined;
+
+		const up = [...field.elems[2].querySelectorAll(".ptz-hold")].find(
+			(b) =>
+				/** @type {HTMLElement} */ (b).dataset.tilt === "0.5" &&
+				/** @type {HTMLElement} */ (b).dataset.pan === "0",
+		);
+		up.dispatchEvent(ptr("pointerdown"));
+		await flush();
+		const n = calls.length; // Pulse in-flight, not resolved.
+
+		// Upgrade enqueues unconditionally; the beat is droppable while
+		// anything is queued or awaiting response.
+		jest.advanceTimersByTime(2000);
+		await flush();
+		expect(calls).toHaveLength(n);
+
+		/** @type {any} */ (release)({ status: 200, json: () => Promise.resolve({}) });
+		await flush();
+		release = undefined;
 		jest.advanceTimersByTime(1600);
 		await flush();
-		expect(calls).toHaveLength(n); // beat skipped
+		expect(
+			calls.filter((c) => c.body.command === "move").length,
+		).toBeGreaterThan(1); // Beats resume after the queue drains.
+		jest.useRealTimers();
+	});
 
-		resolveFirst({ status: 200, json: () => Promise.resolve({}) });
+	test("release stop dispatches after its move settles — no overtake", async () => {
+		document.body.replaceChildren();
+		// The previous test's field unmounts here — let its MutationObserver
+		// detach (a stray stop fetch) run before the mock installs.
 		await flush();
-		jest.advanceTimersByTime(1600);
+		jest.useFakeTimers();
+		const order = [];
+		const resolvers = [];
+		global.fetch = /** @type {any} */ ((url, opts) => {
+			const body = JSON.parse(/** @type {string} */ (opts.body));
+			return new Promise((resolve) => {
+				resolvers.push(() => {
+					order.push(body.command);
+					resolve({ status: 200, json: () => Promise.resolve({}) });
+				});
+			});
+		});
+		const field = mkField();
+		field.set({ enable: true, onvifAddr: "" });
+		document.body.append(field.elems[2]);
+
+		const up = [...field.elems[2].querySelectorAll(".ptz-hold")].find(
+			(b) =>
+				/** @type {HTMLElement} */ (b).dataset.tilt === "0.5" &&
+				/** @type {HTMLElement} */ (b).dataset.pan === "0",
+		);
+		up.dispatchEvent(ptr("pointerdown"));
+		jest.advanceTimersByTime(300);
+		up.dispatchEvent(ptr("pointerup"));
+
+		// Only the pulse has been dispatched to fetch so far — upgrade
+		// and stop wait behind it in the queue. Draining fetches in
+		// dispatch order surfaces move, move, stop.
+		for (let i = 0; i < 10 && resolvers.length > 0; i++) {
+			for (const r of resolvers.splice(0)) {
+				r();
+			}
+			await flush();
+		}
+		expect(order.filter((c) => c === "move" || c === "stop")).toEqual([
+			"move",
+			"move",
+			"stop",
+		]);
+		jest.useRealTimers();
+	});
+
+	test("auxiliary press does not actuate; aux release does not cancel", async () => {
+		document.body.replaceChildren();
+		jest.useFakeTimers();
+		const calls = mkFetch();
+		const field = mkField();
+		field.set({ enable: true, onvifAddr: "" });
+		document.body.append(field.elems[2]);
 		await flush();
-		expect(calls).toHaveLength(n + 1); // beats resume
+
+		const up = [...field.elems[2].querySelectorAll(".ptz-hold")].find(
+			(b) =>
+				/** @type {HTMLElement} */ (b).dataset.tilt === "0.5" &&
+				/** @type {HTMLElement} */ (b).dataset.pan === "0",
+		);
+		// Right-button press → nothing sent.
+		up.dispatchEvent(ptr("pointerdown", { button: 2 }));
+		await flush();
+		expect(calls.some((c) => c.body.command === "move")).toBe(false);
+
+		// Primary press starts the hold; a different pointer's release
+		// must not cancel it.
+		up.dispatchEvent(ptr("pointerdown", { pointerId: 1 }));
+		await flush();
+		jest.advanceTimersByTime(300);
+		await flush();
+		up.dispatchEvent(ptr("pointerup", { pointerId: 9 }));
+		await flush();
+		expect(calls.some((c) => c.body.command === "stop")).toBe(false);
+
+		up.dispatchEvent(ptr("pointerup", { pointerId: 1 }));
+		await flush();
+		expect(calls.at(-1).body).toEqual({ command: "stop" });
 		jest.useRealTimers();
 	});
 
@@ -500,7 +648,7 @@ describe("newPtzField panel", () => {
 				/** @type {HTMLElement} */ (b).dataset.tilt === "0.5" &&
 				/** @type {HTMLElement} */ (b).dataset.pan === "0",
 		);
-		up.dispatchEvent(new Event("pointerdown"));
+		up.dispatchEvent(ptr("pointerdown"));
 		await flush();
 		window.dispatchEvent(new Event("blur"));
 		await flush();
@@ -521,7 +669,7 @@ describe("newPtzField panel", () => {
 				/** @type {HTMLElement} */ (b).dataset.tilt === "0.5" &&
 				/** @type {HTMLElement} */ (b).dataset.pan === "0",
 		);
-		up.dispatchEvent(new Event("pointerdown"));
+		up.dispatchEvent(ptr("pointerdown"));
 		await flush();
 		li.remove();
 		await flush();
@@ -663,7 +811,7 @@ describe("newPtzField panel", () => {
 			)
 		);
 		expect(up.disabled).toBeFalsy();
-		up.dispatchEvent(new Event("pointerdown"));
+		up.dispatchEvent(ptr("pointerdown"));
 		await flush();
 		expect(calls.at(-1).body.command).toBe("move");
 		jest.useRealTimers();
@@ -703,14 +851,25 @@ describe("newPtzField panel", () => {
 			li.querySelector('[data-pan="-0.5"][data-tilt="0.5"]')
 		);
 		expect(diag.textContent).toBe("↖");
-		diag.dispatchEvent(new Event("pointerdown"));
+		diag.dispatchEvent(ptr("pointerdown"));
 		await flush();
+		// Pulse carries both axes at sign·0.25.
+		expect(calls.at(-1).body).toEqual({
+			command: "move",
+			pan: -0.25,
+			tilt: 0.25,
+			timeout: "PT0.5S",
+		});
+		jest.advanceTimersByTime(300);
+		await flush();
+		// Upgrade carries the full combined velocity in one move.
 		expect(calls.at(-1).body).toEqual({
 			command: "move",
 			pan: -0.5,
 			tilt: 0.5,
+			timeout: "PT2S",
 		});
-		diag.dispatchEvent(new Event("pointerup"));
+		diag.dispatchEvent(ptr("pointerup"));
 		await flush();
 
 		const n = calls.length;
@@ -771,7 +930,7 @@ describe("newPtzField panel", () => {
 		const up = /** @type {HTMLElement} */ (
 			li.querySelector('[data-tilt="0.5"][data-pan="0"]')
 		);
-		up.dispatchEvent(new Event("pointerdown"));
+		up.dispatchEvent(ptr("pointerdown"));
 		await flush();
 		expect(calls.at(-1).body.command).toBe("move");
 
@@ -808,7 +967,7 @@ describe("newPtzField panel", () => {
 		const up = /** @type {HTMLElement} */ (
 			li.querySelector('[data-tilt="0.5"][data-pan="0"]')
 		);
-		up.dispatchEvent(new Event("pointerdown"));
+		up.dispatchEvent(ptr("pointerdown"));
 		await flush();
 
 		// `stop` marks mid-hold → cascade strikes every hold control and the
@@ -844,7 +1003,7 @@ describe("newPtzField panel", () => {
 		const up = /** @type {HTMLElement} */ (
 			li.querySelector('[data-tilt="0.5"][data-pan="0"]')
 		);
-		up.dispatchEvent(new Event("pointerdown"));
+		up.dispatchEvent(ptr("pointerdown"));
 		await flush();
 		const moves = calls.filter((c) => c.body.command === "move").length;
 		expect(moves).toBe(1);
