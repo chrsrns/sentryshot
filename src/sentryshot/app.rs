@@ -384,6 +384,16 @@ impl App {
                 "/api/scan",
                 post(scan_handler).with_state(Arc::new(scan::scanner::Scanner::default())),
             )
+            // Monitor PTZ.
+            .route_admin(
+                "/api/monitor/ptz",
+                post(ptz_handler).with_state(Arc::new(PtzRouteState {
+                    monitors: self.monitor_manager.clone(),
+                    factory: Arc::new(|endpoint, creds| {
+                        Arc::new(ptz::OnvifPtz::new(endpoint, creds)) as ptz::ArcPtzClient
+                    }),
+                })),
+            )
             // Recording delete.
             .route_user_no_csrf(
                 "/api/recording/delete/{*id}",

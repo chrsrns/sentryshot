@@ -6,6 +6,8 @@
 
 use async_trait::async_trait;
 use common::monitor::PtzConfig;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use url::Url;
@@ -56,7 +58,7 @@ pub enum Error {
 #[async_trait]
 pub trait PtzClient: Send + Sync {
     /// Continuous move; absent velocities leave that axis untouched.
-    async fn move_(
+    async fn move_cam(
         &self,
         pan: Option<f64>,
         tilt: Option<f64>,
@@ -67,7 +69,7 @@ pub trait PtzClient: Send + Sync {
     async fn stop(&self) -> Result<(), Error>;
 
     /// Move to the camera's home position.
-    async fn goto_home(&self) -> Result<(), Error>;
+    async fn home(&self) -> Result<(), Error>;
 
     /// All stored presets.
     async fn get_presets(&self) -> Result<Vec<Preset>, Error>;
@@ -83,10 +85,34 @@ pub trait PtzClient: Send + Sync {
 }
 
 /// A stored preset.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct Preset {
     pub token: String,
     pub name: String,
+}
+
+/// Shared client handle.
+pub type ArcPtzClient = Arc<dyn PtzClient>;
+
+/// `POST /api/monitor/ptz` request body (camelCase on the wire).
+#[derive(Debug, Deserialize)]
+pub struct PtzCommand {
+    pub command: String,
+    pub pan: Option<f64>,
+    pub tilt: Option<f64>,
+    pub zoom: Option<f64>,
+    #[serde(rename = "presetToken")]
+    pub preset_token: Option<String>,
+    #[serde(rename = "presetName")]
+    pub preset_name: Option<String>,
+}
+
+/// `POST /api/monitor/ptz` response body — `presets` populated for
+/// `getPresets` only.
+#[derive(Debug, Serialize)]
+pub struct PtzResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presets: Option<Vec<Preset>>,
 }
 
 /// Resolve the ONVIF device-service endpoint: a valid stored
@@ -350,7 +376,7 @@ impl OnvifPtz {
 
 #[async_trait]
 impl PtzClient for OnvifPtz {
-    async fn move_(
+    async fn move_cam(
         &self,
         pan: Option<f64>,
         tilt: Option<f64>,
@@ -395,7 +421,7 @@ impl PtzClient for OnvifPtz {
         Ok(())
     }
 
-    async fn goto_home(&self) -> Result<(), Error> {
+    async fn home(&self) -> Result<(), Error> {
         self.op(|s| {
             format!(
                 r#"<tptz:GotoHomePosition xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"><tptz:ProfileToken>{}</tptz:ProfileToken></tptz:GotoHomePosition>"#,
@@ -656,7 +682,7 @@ mod tests {
         let device = spawn_stub(stub.clone()).await;
         let client = OnvifPtz::new(device, (String::new(), String::new()));
 
-        client.move_(Some(0.5), Some(-0.25), None).await.unwrap();
+        client.move_cam(Some(0.5), Some(-0.25), None).await.unwrap();
 
         let log = stub.log.lock().unwrap().clone();
         assert_eq!(
@@ -685,7 +711,7 @@ mod tests {
         let device = spawn_stub(stub.clone()).await;
         let client = OnvifPtz::new(device, (String::new(), String::new()));
 
-        client.move_(None, None, Some(0.8)).await.unwrap();
+        client.move_cam(None, None, Some(0.8)).await.unwrap();
 
         let bodies = stub.bodies.lock().unwrap().clone();
         let mv = bodies.last().unwrap();
@@ -714,7 +740,7 @@ mod tests {
         let device = spawn_stub(stub.clone()).await;
         let client = OnvifPtz::new(device, (String::new(), String::new()));
 
-        client.goto_home().await.unwrap();
+        client.home().await.unwrap();
 
         let log = stub.log.lock().unwrap().clone();
         assert_eq!(
@@ -737,7 +763,7 @@ mod tests {
         let client = OnvifPtz::new(device, (String::new(), String::new()));
 
         assert!(matches!(
-            client.move_(Some(0.1), None, None).await,
+            client.move_cam(Some(0.1), None, None).await,
             Err(Error::NoPtzProfile)
         ));
     }
@@ -749,7 +775,7 @@ mod tests {
         let device = spawn_stub(stub.clone()).await;
         let client = OnvifPtz::new(device, (String::new(), String::new()));
 
-        assert!(matches!(client.goto_home().await, Err(Error::NoPtzProfile)));
+        assert!(matches!(client.home().await, Err(Error::NoPtzProfile)));
     }
 
     #[tokio::test]
@@ -759,11 +785,11 @@ mod tests {
             (String::new(), String::new()),
         );
         assert!(matches!(
-            client.move_(Some(1.5), None, None).await,
+            client.move_cam(Some(1.5), None, None).await,
             Err(Error::BadVelocity)
         ));
         assert!(matches!(
-            client.move_(None, Some(-1.1), None).await,
+            client.move_cam(None, Some(-1.1), None).await,
             Err(Error::BadVelocity)
         ));
     }
