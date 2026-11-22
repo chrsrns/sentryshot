@@ -2,7 +2,7 @@
 
 // @ts-check
 
-import { newScanModal } from "./settings.js";
+import { newScanModal, newPtzField } from "./settings.js";
 
 describe("newScanModal", () => {
 	test("open attaches modal to the document", () => {
@@ -335,5 +335,41 @@ describe("newScanModal", () => {
 
 		expect(picked.sourcertsp.mainStream).toBe("rtsp://10.0.0.9/main");
 		expect(picked.sourcertsp.subStream).toBe("rtsp://10.0.0.9/extra");
+	});
+});
+
+describe("newPtzField", () => {
+	test("round-trips enable and onvifAddr", () => {
+		const field = newPtzField();
+
+		field.set({ enable: true, onvifAddr: "http://cam/onvif/device_service" });
+		expect(field.value()).toEqual({
+			enable: true,
+			onvifAddr: "http://cam/onvif/device_service",
+		});
+
+		field.set(undefined);
+		expect(field.value()).toEqual({ enable: false, onvifAddr: "" });
+	});
+
+	test("validates onvifAddr", () => {
+		const field = newPtzField();
+
+		for (const bad of [
+			"https://cam",
+			"http://u:p@cam",
+			"http://cam/x?y=1",
+			"http://cam/x#f",
+			"rtsp://cam",
+			"not a url",
+		]) {
+			field.set({ enable: true, onvifAddr: bad });
+			expect(field.validate()).toBeDefined();
+		}
+
+		for (const good of ["", "http://cam", "http://cam:8080/onvif/device_service"]) {
+			field.set({ enable: true, onvifAddr: good });
+			expect(field.validate()).toBeUndefined();
+		}
 	});
 });

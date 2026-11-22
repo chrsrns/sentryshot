@@ -1216,6 +1216,50 @@ function newSourceRTSP() {
 	};
 }
 
+/**
+ * @typedef PtzConfig
+ * @property {boolean} enable
+ * @property {string} onvifAddr
+ */
+
+/** @type {InputRule[]} */
+const ptzOnvifAddrRules = [
+	[/^(?!\s*$)(?!http:\/\/)/, "must be empty or an http:// URL"],
+	[/^http:\/\/($|[#/?])/, "missing host"],
+	[/^http:\/\/[^#/?]*@/, "credentials not allowed"],
+	[/[#?]/, "query and fragment not allowed"],
+];
+
+/** @returns {Field<PtzConfig>} */
+function newPtzField() {
+	const fields = {
+		enable: fieldTemplate.toggle("Enable PTZ", false),
+		onvifAddr: newErrorField(ptzOnvifAddrRules, {
+			input: "text",
+			label: "ONVIF address",
+			placeholder: "http://x.x.x.x/onvif/device_service (optional)",
+			doc: "ONVIF device service address. Leave empty to derive it from the main stream host",
+		}),
+	};
+
+	const form = newForm(fields);
+	return {
+		elems: [...fields.enable.elems, ...fields.onvifAddr.elems],
+		value() {
+			/** @type {PtzConfig} */
+			const value = { enable: false, onvifAddr: "" };
+			form.get(value);
+			return value;
+		},
+		set(input) {
+			form.set(input === undefined ? {} : input);
+		},
+		validate() {
+			return form.validate();
+		},
+	};
+}
+
 /** @returns {Field<string>} */
 function newIdField() {
 	let value;
@@ -1269,6 +1313,7 @@ function init(uiData) {
 	monitorFields.sourcertsp = newSourceRTSP();
 	monitorFields.alwaysRecord = fieldTemplate.toggle("Always record", false);
 	monitorFields.videoLength = fieldTemplate.number("Video length (min)", "15", 15);
+	monitorFields.ptz = newPtzField();
 	//timestampOffset: fieldTemplate.integer("Timestamp offset (ms)", "500", "500"),
 	/* SETTINGS_LAST_MONITOR_FIELD */
 
@@ -1312,4 +1357,4 @@ function init(uiData) {
 		.replaceChildren(...rendererCategories([monitor, group, account]));
 }
 
-export { init, newScanModal };
+export { init, newScanModal, newPtzField };
