@@ -199,9 +199,7 @@ describe("live ptz overlay", () => {
 		newViewer(element, mkMonitors(), "hls", mkPtz(true)).reset();
 
 		expect(document.querySelectorAll(".js-ptz-live-pad")).toHaveLength(1);
-		expect(document.querySelectorAll(".js-ptz-live-marker")).toHaveLength(
-			1,
-		);
+		expect(document.querySelectorAll(".js-ptz-live-btn")).toHaveLength(1);
 	});
 
 	test("no pad for non-admin or disabled monitors", () => {

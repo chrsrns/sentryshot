@@ -209,10 +209,14 @@ export function newPtzController(csrfToken, getMonitorId, errorElem) {
 	};
 }
 
+const iconPtzPath = "assets/icons/feather/move.svg";
+
 /**
- * Compact PTZ pad for the /live grid. Returns a streamer Button: the bar
- * gets a small marker, and init() appends the pad as a `.player-overlay`
- * sibling inside the feed so it reveals with the same hover mechanism.
+ * PTZ control for a /live tile. The overlay bar gets a feather-icon
+ * `feed-btn` (same chrome as recordings/fullscreen); clicking it toggles
+ * a compact pad anchored above the bar. The pad is a `.player-overlay`
+ * sibling inside the feed, so once opened it follows the same
+ * reveal/hide lifecycle as the bar itself.
  *
  * @param {string} csrfToken
  * @param {string} monitorId
@@ -221,15 +225,14 @@ export function newLivePtz(csrfToken, monitorId) {
 	const pad = /** @type {HTMLElement} */ (htmlToElem(/* HTML */ `
 		<div
 			class="js-ptz-live-pad player-overlay absolute flex flex-col gap-1 p-1 rounded-md bg-color1"
-			style="z-index: 2; right: 0; bottom: 12%; border: none; font-size: 0.9em;"
+			style="z-index: 2; left: 50%; transform: translateX(-50%); bottom: 12%; border: none; font-size: 0.9em;"
+			hidden
 		>
 			<div class="flex gap-1 items-center">
 				<button type="button" class="ptz-hold px-2 rounded-lg bg-color2 hover:bg-color3" data-pan="0" data-tilt="0.5">↑</button>
 				<button type="button" class="ptz-hold px-2 rounded-lg bg-color2 hover:bg-color3" data-pan="0" data-tilt="-0.5">↓</button>
 				<button type="button" class="ptz-hold px-2 rounded-lg bg-color2 hover:bg-color3" data-pan="-0.5" data-tilt="0">←</button>
 				<button type="button" class="ptz-hold px-2 rounded-lg bg-color2 hover:bg-color3" data-pan="0.5" data-tilt="0">→</button>
-			</div>
-			<div class="flex gap-1 items-center">
 				<button type="button" class="ptz-hold px-2 rounded-lg bg-color2 hover:bg-color3" data-zoom="0.5">zoom+</button>
 				<button type="button" class="ptz-hold px-2 rounded-lg bg-color2 hover:bg-color3" data-zoom="-0.5">zoom−</button>
 				<button type="button" class="js-ptz-home px-2 rounded-lg bg-color2 hover:bg-color3">home</button>
@@ -259,11 +262,20 @@ export function newLivePtz(csrfToken, monitorId) {
 
 	/** @type {MutationObserver|undefined} */
 	let observer;
+	let presetsLoaded = false;
+
+	const btn = /** @type {HTMLElement} */ (htmlToElem(/* HTML */ `
+		<button type="button" class="js-ptz-live-btn feed-btn p-1 bg-transparent" title="PTZ">
+			<img
+				class="icon-filter"
+				style="height: calc(var(--scale) * 1.5rem); aspect-ratio: 1;"
+				src="${iconPtzPath}"
+			/>
+		</button>
+	`));
 
 	return {
-		elem: htmlToElem(/* HTML */ `
-			<span class="js-ptz-live-marker px-1 text-1.3" title="PTZ">✛</span>
-		`),
+		elem: btn,
 		/**
 		 * @param {Element} $overlay
 		 */
@@ -272,7 +284,13 @@ export function newLivePtz(csrfToken, monitorId) {
 				$overlay.parentElement.append(pad);
 			}
 			controller.attach();
-			controller.loadPresets(presetsElem);
+			btn.onclick = () => {
+				pad.hidden = !pad.hidden;
+				if (!pad.hidden && !presetsLoaded) {
+					presetsLoaded = true;
+					controller.loadPresets(presetsElem);
+				}
+			};
 			// Unmount/navigation-away: cancel heartbeat + stop. The
 			// camera-side Timeout still bounds a stop lost on unload.
 			observer = new MutationObserver(() => {
