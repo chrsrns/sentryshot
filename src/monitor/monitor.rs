@@ -467,6 +467,9 @@ impl MonitorManagerState {
     // Changes are not applied until the montior restarts.
     // Returns `true` if monitor was created.
     pub async fn monitor_set(&mut self, config: MonitorConfig) -> Result<bool, MonitorSetError> {
+        if !config.config().ptz.onvif_addr_ok() {
+            return Err(MonitorSetError::InvalidPtzAddr);
+        }
         let id = config.id();
 
         // Write config to file.
@@ -677,8 +680,8 @@ mod tests {
         ArcStreamerMuxer, DummyLogger, DummyStorage, DynError, H264Data, MonitorName,
         ParseMonitorIdError, TrackParameters,
         monitor::{
-            Config, DummyMonitorHooks, DynH264Writer, Protocol, SelectedSource, SourceConfig,
-            SourceRtspConfig, StreamerImpl,
+            Config, DummyMonitorHooks, DynH264Writer, Protocol, PtzConfig, SelectedSource,
+            SourceConfig, SourceRtspConfig, StreamerImpl,
         },
         time::UnixH264,
     };
@@ -853,6 +856,7 @@ mod tests {
                 source: SelectedSource::Rtsp,
                 always_record: false,
                 video_length: 0.0,
+                ptz: PtzConfig::default(),
             },
             SourceConfig::Rtsp(SourceRtspConfig {
                 protocol: Protocol::Tcp,
@@ -907,6 +911,7 @@ mod tests {
                 source: SelectedSource::Rtsp,
                 always_record: false,
                 video_length: 0.0,
+                ptz: PtzConfig::default(),
             },
             SourceConfig::Rtsp(SourceRtspConfig {
                 protocol: Protocol::Tcp,
@@ -981,6 +986,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_monitor_set_rejects_bad_onvif_addr() {
+        let (token, tracker, _temp_dir, _config_dir, manager) = new_test_manager().await;
+
+        let config = MonitorConfig::new(
+            Config {
+                id: m_id("bad"),
+                name: name("bad"),
+                enable: false,
+                source: SelectedSource::Rtsp,
+                always_record: false,
+                video_length: 0.0,
+                ptz: PtzConfig::new(true, "https://cam".to_owned()),
+            },
+            SourceConfig::Rtsp(SourceRtspConfig {
+                protocol: Protocol::Tcp,
+                main_stream: "rtsp://x1".parse().unwrap(),
+                sub_stream: None,
+            }),
+            json!({
+                "id": "bad",
+                "name": "bad",
+                "enable": false,
+                "source": "rtsp",
+                "sourcertsp": {
+                    "protocol": "tcp",
+                    "mainStream": "rtsp://x1",
+                },
+                "alwaysRecord": false,
+                "videoLength": 0.0,
+                "ptz": {"enable": true, "onvifAddr": "https://cam"},
+            }),
+        );
+
+        assert!(matches!(
+            manager.monitor_set(config).await.unwrap(),
+            Err(MonitorSetError::InvalidPtzAddr)
+        ));
+
+        stop_manager(token, tracker).await;
+    }
+
+    #[tokio::test]
     async fn test_monitor_configs() {
         let (token, tracker, _temp_dir, _, manager) = new_test_manager().await;
 
@@ -996,6 +1043,7 @@ mod tests {
                         source: SelectedSource::Rtsp,
                         always_record: false,
                         video_length: 0.0,
+                        ptz: PtzConfig::default(),
                     },
                     SourceConfig::Rtsp(SourceRtspConfig {
                         protocol: Protocol::Tcp,
@@ -1026,6 +1074,7 @@ mod tests {
                         source: SelectedSource::Rtsp,
                         always_record: false,
                         video_length: 0.0,
+                        ptz: PtzConfig::default(),
                     },
                     SourceConfig::Rtsp(SourceRtspConfig {
                         protocol: Protocol::Udp,

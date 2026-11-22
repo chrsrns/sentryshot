@@ -15,7 +15,9 @@ use axum::{
 use common::{
     AccountId, AccountSetRequest, AccountsMap, ArcAuth, ArcLogger, AuthAccountDeleteError,
     AuthenticatedUser, ILogger, LogEntry, LogLevel, MonitorId,
-    monitor::{ArcMonitorManager, MonitorConfig, MonitorDeleteError, MonitorRestartError},
+    monitor::{
+        ArcMonitorManager, MonitorConfig, MonitorDeleteError, MonitorRestartError, MonitorSetError,
+    },
     recording::RecordingId,
 };
 use eventdb::{EventDb, EventQuery};
@@ -421,6 +423,9 @@ pub async fn monitor_put_handler(
                 } else {
                     StatusCode::OK.into_response()
                 }
+            }
+            Some(Err(e @ MonitorSetError::InvalidPtzAddr)) => {
+                (StatusCode::BAD_REQUEST, e.to_string()).into_response()
             }
             Some(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
             None => StatusCode::NOT_FOUND.into_response(),

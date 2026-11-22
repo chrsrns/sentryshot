@@ -57,7 +57,6 @@ impl MonitorConfig {
     pub fn raw(&self) -> &serde_json::Value {
         &self.raw
     }
-    #[must_use]
     pub fn raw_mut(&mut self) -> &mut serde_json::Value {
         &mut self.raw
     }
@@ -135,6 +134,55 @@ pub struct Config {
 
     #[serde(rename = "videoLength")]
     pub video_length: f64,
+
+    #[serde(default)]
+    pub ptz: PtzConfig,
+}
+
+/// PTZ section of a monitor config — persisted under `"ptz"`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct PtzConfig {
+    #[serde(default)]
+    enable: bool,
+
+    #[serde(default, rename = "onvifAddr")]
+    onvif_addr: String,
+}
+
+impl PtzConfig {
+    #[must_use]
+    pub fn new(enable: bool, onvif_addr: String) -> Self {
+        Self { enable, onvif_addr }
+    }
+
+    #[must_use]
+    pub fn enable(&self) -> bool {
+        self.enable
+    }
+
+    #[must_use]
+    pub fn onvif_addr(&self) -> &str {
+        &self.onvif_addr
+    }
+
+    /// Save-time validation: empty (derive at command time) or an
+    /// absolute `http` URL with a host — no `https`, userinfo, query
+    /// or fragment. Config-file load never fails on a bad value.
+    #[must_use]
+    pub fn onvif_addr_ok(&self) -> bool {
+        if self.onvif_addr.is_empty() {
+            return true;
+        }
+        let Ok(url) = url::Url::parse(&self.onvif_addr) else {
+            return false;
+        };
+        url.scheme() == "http"
+            && url.has_host()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+    }
 }
 
 impl Serialize for MonitorConfig {
@@ -390,6 +438,9 @@ pub enum MonitorSetError {
 
     #[error("write config to file: {0}")]
     WriteFile(std::io::Error),
+
+    #[error("invalid ptz onvifAddr — empty or absolute http URL without userinfo/query/fragment")]
+    InvalidPtzAddr,
 }
 
 #[derive(Debug, Error)]
@@ -484,3 +535,61 @@ pub trait StreamerImpl {
 }
 
 pub type ArcStreamer = Arc<dyn StreamerImpl + Send + Sync>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    fn minimal_monitor_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": "m1",
+            "name": "cam",
+            "enable": true,
+            "source": "rtsp",
+            "sourcertsp": {
+                "protocol": "tcp",
+                "mainStream": "rtsp://x"
+            },
+            "alwaysRecord": false,
+            "videoLength": 15
+        })
+    }
+
+    #[test]
+    fn ptz_defaults_when_absent() {
+        let cfg: MonitorConfig =
+            serde_json::from_value(minimal_monitor_json()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(PtzConfig::default(), cfg.config().ptz);
+    }
+
+    #[test]
+    fn ptz_round_trips() {
+        let mut v = minimal_monitor_json();
+        v["ptz"] =
+            serde_json::json!({"enable": true, "onvifAddr": "http://cam/onvif/device_service"});
+        let cfg: MonitorConfig =
+            serde_json::from_value(v.clone()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(cfg.config().ptz.enable());
+        assert_eq!(
+            "http://cam/onvif/device_service",
+            cfg.config().ptz.onvif_addr()
+        );
+        // Raw passthrough preserves the section verbatim.
+        assert_eq!(v, *cfg.raw());
+    }
+
+    #[test]
+    fn onvif_addr_validation() {
+        let ok = |a: &str| PtzConfig::new(false, a.to_owned()).onvif_addr_ok();
+        assert!(ok(""));
+        assert!(ok("http://cam"));
+        assert!(ok("http://cam:8080/onvif/device_service"));
+        assert!(!ok("https://cam"));
+        assert!(!ok("http://u:p@cam"));
+        assert!(!ok("http://cam/x?y=1"));
+        assert!(!ok("http://cam/x#f"));
+        assert!(!ok("rtsp://cam"));
+        assert!(!ok("not a url"));
+    }
+}
