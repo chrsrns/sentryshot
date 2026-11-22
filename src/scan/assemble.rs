@@ -33,6 +33,7 @@ struct Cand {
     resolution: Option<Resolution>,
     hint: ScanRole,
     auth: Option<String>,
+    video_codec: Option<String>,
 }
 
 fn vendor_role(path: &str) -> ScanRole {
@@ -71,33 +72,26 @@ fn normalize(url: &str) -> Option<(url::Url, String)> {
     Some((u, key))
 }
 
-/// Assemble one `DiscoveredCamera` — pure, no I/O.
-#[must_use]
-pub fn assemble(
-    ip: Ipv4Addr,
-    name: Option<String>,
-    hardware: Option<String>,
-    xaddrs: Vec<String>,
-    ptz: bool,
-    backchannel: bool,
-    input: Input,
-) -> DiscoveredCamera {
-    let mut cands: Vec<Cand> = Vec::new();
+/// Build candidates from all probe sources; returns them plus the
+/// auth-required flag folded in.
+fn collect_cands(ip: Ipv4Addr, input: &Input) -> (Vec<Cand>, bool) {
+    let mut cands = Vec::new();
     let mut needs_auth = input.needs_auth;
 
-    for (profile, uri) in input.onvif {
+    for (profile, uri) in &input.onvif {
         cands.push(Cand {
-            url: uri,
-            profile_name: profile.name,
+            url: uri.clone(),
+            profile_name: profile.name.clone(),
             resolution: profile.resolution,
             hint: ScanRole::Extra,
             auth: input.onvif_auth.then(|| "wsse".to_owned()),
+            video_codec: None,
         });
     }
     if input.onvif_auth {
         needs_auth = true;
     }
-    for hit in input.vendor {
+    for hit in &input.vendor {
         if hit.path.is_empty() {
             needs_auth = true;
             continue;
@@ -107,10 +101,11 @@ pub fn assemble(
             profile_name: None,
             resolution: None,
             hint: vendor_role(&hit.path),
-            auth: hit.auth,
+            auth: hit.auth.clone(),
+            video_codec: None,
         });
     }
-    for hit in input.paths {
+    for hit in &input.paths {
         if hit.auth.is_some() {
             needs_auth = true;
         }
@@ -119,19 +114,45 @@ pub fn assemble(
             profile_name: None,
             resolution: None,
             hint: hit.role,
-            auth: hit.auth,
+            auth: hit.auth.clone(),
+            video_codec: hit.codec.clone(),
         });
     }
+    (cands, needs_auth)
+}
 
-    // filter + dedupe by normalized creds-free URL
-    let mut seen = std::collections::HashSet::new();
+/// Assemble one `DiscoveredCamera` — pure, no I/O.
+#[must_use]
+pub fn assemble(
+    ip: Ipv4Addr,
+    name: Option<String>,
+    hardware: Option<String>,
+    xaddrs: Vec<String>,
+    ptz: bool,
+    backchannel: bool,
+    input: &Input,
+) -> DiscoveredCamera {
+    let (cands, needs_auth) = collect_cands(ip, input);
+
+    // filter + dedupe by normalized creds-free URL; a duplicate
+    // carrying a probed codec fills it in on the kept candidate.
+    let mut seen = std::collections::HashMap::new();
     let mut uniq: Vec<(url::Url, Cand)> = Vec::new();
     for c in cands {
         let Some((u, key)) = normalize(&c.url) else {
             continue;
         };
-        if seen.insert(key) {
-            uniq.push((u, c));
+        match seen.entry(key) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(uniq.len());
+                uniq.push((u, c));
+            }
+            std::collections::hash_map::Entry::Occupied(o) => {
+                let i = *o.get();
+                if uniq[i].1.video_codec.is_none() {
+                    uniq[i].1.video_codec = c.video_codec;
+                }
+            }
         }
     }
 
@@ -169,6 +190,7 @@ pub fn assemble(
                 rtsp_url: u.to_string(),
                 role,
                 auth: c.auth,
+                video_codec: c.video_codec.unwrap_or_else(|| "unknown".to_owned()),
             }
         })
         .collect();
@@ -224,7 +246,7 @@ mod tests {
     fn roles_by_resolution_then_deterministic() {
         let mut i = empty();
         i.onvif = vec![profile("sub", 640, 360), profile("main", 1920, 1080)];
-        let cam = assemble(ip(), None, None, vec![], false, false, i);
+        let cam = assemble(ip(), None, None, vec![], false, false, &i);
         assert_eq!(ScanRole::Main, cam.streams[0].role);
         assert_eq!(
             Some(Resolution {
@@ -246,8 +268,9 @@ mod tests {
             path: "x".into(),
             role: ScanRole::Main,
             auth: None,
+            codec: None,
         }];
-        let cam = assemble(ip(), None, None, vec![], false, false, i);
+        let cam = assemble(ip(), None, None, vec![], false, false, &i);
         assert_eq!(1, cam.streams.len());
     }
 
@@ -263,14 +286,16 @@ mod tests {
                 path: "a".into(),
                 role: ScanRole::Main,
                 auth: Some("digest".into()),
+                codec: None,
             },
             PathHit {
                 path: "b".into(),
                 role: ScanRole::Sub,
                 auth: None,
+                codec: None,
             },
         ];
-        let cam = assemble(ip(), None, None, vec![], false, false, i);
+        let cam = assemble(ip(), None, None, vec![], false, false, &i);
         assert!(cam.needs_auth);
         assert!(cam.streams[0].rtsp_url.contains("admin"));
         assert!(cam.streams[0].rtsp_url.contains("p%40ss"));
@@ -288,9 +313,34 @@ mod tests {
             },
             "http://x/video".into(),
         )];
-        let cam = assemble(ip(), Some("cam".into()), None, vec![], true, false, i);
+        let cam = assemble(ip(), Some("cam".into()), None, vec![], true, false, &i);
         assert!(cam.streams.is_empty());
         assert!(cam.ptz);
+    }
+
+    #[test]
+    fn codec_from_path_hit_and_dedupe_merge() {
+        let mut i = empty();
+        // Same URL via ONVIF (no codec) and path-probe (verified h264):
+        // dedupe keeps the ONVIF cand but merges the probed codec.
+        i.onvif = vec![profile("x", 1920, 1080)];
+        i.paths = vec![PathHit {
+            path: "x".into(),
+            role: ScanRole::Main,
+            auth: None,
+            codec: Some("h264".into()),
+        }];
+        let cam = assemble(ip(), None, None, vec![], false, false, &i);
+        assert_eq!(1, cam.streams.len());
+        assert_eq!("h264", cam.streams[0].video_codec);
+    }
+
+    #[test]
+    fn onvif_streams_default_unknown_codec() {
+        let mut i = empty();
+        i.onvif = vec![profile("x", 1920, 1080)];
+        let cam = assemble(ip(), None, None, vec![], false, false, &i);
+        assert_eq!("unknown", cam.streams[0].video_codec);
     }
 
     #[test]
@@ -306,7 +356,7 @@ mod tests {
                 auth: None,
             },
         ];
-        let cam = assemble(ip(), None, None, vec![], false, false, i);
+        let cam = assemble(ip(), None, None, vec![], false, false, &i);
         assert_eq!(ScanRole::Main, cam.streams[0].role);
         assert_eq!(ScanRole::Sub, cam.streams[1].role);
     }

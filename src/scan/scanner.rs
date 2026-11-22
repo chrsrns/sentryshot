@@ -24,6 +24,11 @@ const ENUM_BUDGET: Duration = Duration::from_secs(6);
 type Outcome = Arc<Result<ScanResult, ScanError>>;
 type Slot = Option<(ScanRequest, watch::Receiver<Option<Outcome>>)>;
 
+enum Act {
+    Leader(watch::Sender<Option<Outcome>>),
+    Join(watch::Receiver<Option<Outcome>>),
+}
+
 /// Single-flight scan coordinator — identical parsed requests join the
 /// in-flight scan; different requests get [`ScanError::Busy`].
 #[derive(Default)]
@@ -40,10 +45,6 @@ impl Scanner {
     /// error.
     pub async fn scan(&self, req: ScanRequest) -> Result<ScanResult, ScanError> {
         req.target()?; // validate before join: identical errors for all callers
-        enum Act {
-            Leader(watch::Sender<Option<Outcome>>),
-            Join(watch::Receiver<Option<Outcome>>),
-        }
         let act = {
             let mut g = self.in_flight.lock().await;
             match g.as_ref() {
@@ -179,15 +180,17 @@ async fn scan_one(
     // Per-IP probes target the REQUESTED host — a stray or spoofed
     // unicast reply must never retarget probing or creds.
     let Some(probe_ip) = per_ip else {
-        return assemble::assemble(
+        let mut cam = assemble::assemble(
             dev.ip,
             dev.name,
             dev.hardware,
             dev.xaddrs,
             ptz,
             backchannel,
-            input,
+            &input,
         );
+        fill_codecs(&mut cam, &creds, deadline).await;
+        return cam;
     };
     if !remaining(deadline).is_zero() {
         if remaining(deadline) > vendor_timeout() {
@@ -205,29 +208,53 @@ async fn scan_one(
             let server = rtsp::fingerprint(probe_ip).await;
             let hits = rtsp::probe_paths(deadline, probe_ip, &creds, server.as_deref()).await;
             // Retina-verify answered candidates; hits that fail are
-            // dropped as false positives. Auth-flagged hits stay.
-            for hit in hits {
+            // dropped as false positives. Auth-flagged hits stay with
+            // codec unknown — the challenge blocks the DESCRIBE.
+            for mut hit in hits {
                 if hit.auth.is_none()
                     && !remaining(deadline).is_zero()
                     && let Ok(u) = url::Url::parse(&format!("rtsp://{}:554/{}", probe_ip, hit.path))
-                    && rtsp::verify(u, &creds, remaining(deadline)).await.is_err()
                 {
-                    continue;
+                    match rtsp::describe_codec(u, &creds, remaining(deadline)).await {
+                        Ok(codec) => hit.codec = Some(codec),
+                        Err(_) => continue,
+                    }
                 }
                 input.paths.push(hit);
             }
         }
     }
 
-    assemble::assemble(
+    let mut cam = assemble::assemble(
         dev.ip,
         dev.name,
         dev.hardware,
         dev.xaddrs,
         ptz,
         backchannel,
-        input,
-    )
+        &input,
+    );
+    fill_codecs(&mut cam, &creds, deadline).await;
+    cam
+}
+
+/// DESCRIBE every emitted stream still codec-unknown, once post-dedupe.
+/// Enumeration-evidenced URIs stay on failure as `"unknown"`;
+/// evidence-less path candidates were already dropped pre-assembly.
+async fn fill_codecs(cam: &mut DiscoveredCamera, creds: &Creds, deadline: Instant) {
+    for s in &mut cam.streams {
+        if s.video_codec != "unknown" || remaining(deadline).is_zero() {
+            continue;
+        }
+        let Ok(mut u) = url::Url::parse(&s.rtsp_url) else {
+            continue;
+        };
+        let _ = u.set_username("");
+        let _ = u.set_password(None);
+        if let Ok(codec) = rtsp::describe_codec(u, creds, remaining(deadline)).await {
+            s.video_codec = codec;
+        }
+    }
 }
 
 fn vendor_timeout() -> Duration {

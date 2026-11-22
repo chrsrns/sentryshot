@@ -105,6 +105,11 @@ pub struct ScanStream {
     /// (`basic`/`digest`) or ONVIF `NotAuthorized` (`wsse`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<String>,
+
+    /// SDP video `encoding_name` from the DESCRIBE probe (`h264`,
+    /// `h265`, …). `"none"` when the SDP carries no video stream,
+    /// `"unknown"` when the probe did not complete.
+    pub video_codec: String,
 }
 
 /// Pixel resolution of a profile.
@@ -242,6 +247,7 @@ mod tests {
                     rtsp_url: "rtsp://10.0.0.1/x".into(),
                     role: ScanRole::Main,
                     auth: Some("digest".into()),
+                    video_codec: "h264".into(),
                 }],
                 ptz: true,
                 backchannel: false,

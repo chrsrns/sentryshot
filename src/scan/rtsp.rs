@@ -49,6 +49,9 @@ pub struct PathHit {
     pub role: ScanRole,
     /// Server demanded auth; scheme tag (`basic`/`digest`).
     pub auth: Option<String>,
+    /// Video codec recorded when the candidate verified via
+    /// `retina` describe; unset until then.
+    pub codec: Option<String>,
 }
 
 /// Raw RTSP request → `(status, headers-text)`. ≤1.5 s each hop.
@@ -152,6 +155,7 @@ pub async fn probe_paths(
                 path: (*path).to_owned(),
                 role,
                 auth: None,
+                codec: None,
             }),
             401 => {
                 let scheme = header(&resp, "www-authenticate").map(|v| {
@@ -166,6 +170,7 @@ pub async fn probe_paths(
                         path: (*path).to_owned(),
                         role,
                         auth: scheme,
+                        codec: None,
                     });
                     continue;
                 }
@@ -196,20 +201,15 @@ pub async fn probe_paths(
                 let req2 = format!(
                     "DESCRIBE {url} RTSP/1.0\r\nCSeq: 3\r\nAccept: application/sdp\r\nAuthorization: {auth_hdr}\r\n\r\n"
                 );
-                match request(&mut s, &req2).await {
-                    // Verified-but-auth-required: keep the scheme tag so
-                    // creds embed in the emitted URL (assemble).
-                    Ok((200, _)) => hits.push(PathHit {
+                // Verified-but-auth-required: keep the scheme tag so
+                // creds embed in the emitted URL (assemble).
+                if let Ok((200 | 401, _)) = request(&mut s, &req2).await {
+                    hits.push(PathHit {
                         path: (*path).to_owned(),
                         role,
                         auth: scheme,
-                    }),
-                    Ok((401, _)) => hits.push(PathHit {
-                        path: (*path).to_owned(),
-                        role,
-                        auth: scheme,
-                    }),
-                    _ => {}
+                        codec: None,
+                    });
                 }
             }
             _ => {}
@@ -220,7 +220,15 @@ pub async fn probe_paths(
 
 /// Verify a candidate via `retina` DESCRIBE, externally timed — the
 /// pinned client has no request timeout (spec calls this out).
-pub async fn verify(url: url::Url, creds: &Creds, budget: Duration) -> Result<(), ScanError> {
+///
+/// On success returns the SDP video stream's `encoding_name`
+/// (`"h264"`, `"h265"`, …), or `"none"` when the SDP carries no video
+/// stream.
+pub async fn describe_codec(
+    url: url::Url,
+    creds: &Creds,
+    budget: Duration,
+) -> Result<String, ScanError> {
     let rcreds = if creds.is_empty() {
         None
     } else {
@@ -237,11 +245,15 @@ pub async fn verify(url: url::Url, creds: &Creds, budget: Duration) -> Result<()
             .session_group(group)
             .teardown(retina::client::TeardownPolicy::Always),
     );
-    tokio::time::timeout(budget, fut)
+    let session = tokio::time::timeout(budget, fut)
         .await
         .map_err(|_| ScanError::Timeout)?
         .map_err(|e| ScanError::Malformed(e.to_string()))?;
-    Ok(())
+    Ok(session
+        .streams()
+        .iter()
+        .find(|s| s.media() == "video")
+        .map_or_else(|| "none".to_owned(), |s| s.encoding_name().to_owned()))
 }
 
 #[cfg(test)]
@@ -270,6 +282,80 @@ mod tests {
             .unwrap();
         assert_eq!(200, status);
         assert_eq!(Some("FakeCam/1.0"), header(&resp, "server"));
+    }
+
+    /// Scripted RTSP responder: `200` to everything, canned SDP on
+    /// `DESCRIBE`. Returns once the peer closes (TEARDOWN/drop).
+    async fn fake_describe_server(sdp: &'static str) -> url::Url {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                // Read one request (headers end at \r\n\r\n).
+                loop {
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    match s.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf).into_owned();
+                let cseq = header(&req, "cseq").unwrap_or("0").to_owned();
+                buf.clear();
+                let resp = if req.starts_with("DESCRIBE") {
+                    format!(
+                        "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{sdp}",
+                        sdp.len()
+                    )
+                } else {
+                    format!(
+                        "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nPublic: OPTIONS, DESCRIBE, TEARDOWN\r\n\r\n"
+                    )
+                };
+                if s.write_all(resp.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        url::Url::parse(&format!("rtsp://{}:{}/x", addr.ip(), addr.port())).unwrap()
+    }
+
+    const SDP_H264: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=x\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1;profile-level-id=42001f\r\na=control:trackID=0\r\n";
+
+    const SDP_AUDIO_ONLY: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=x\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\nm=audio 0 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\na=control:trackID=0\r\n";
+
+    #[tokio::test]
+    async fn describe_codec_reads_video_encoding() {
+        let url = fake_describe_server(SDP_H264).await;
+        let codec = describe_codec(url, &Creds::default(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!("h264", codec);
+    }
+
+    #[tokio::test]
+    async fn describe_codec_none_when_no_video() {
+        let url = fake_describe_server(SDP_AUDIO_ONLY).await;
+        let codec = describe_codec(url, &Creds::default(), Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!("none", codec);
+    }
+
+    #[tokio::test]
+    async fn describe_codec_errs_when_unreachable() {
+        // Closed port on loopback fails fast.
+        let url = url::Url::parse("rtsp://127.0.0.1:1/x").unwrap();
+        assert!(
+            describe_codec(url, &Creds::default(), Duration::from_secs(5))
+                .await
+                .is_err()
+        );
     }
 
     #[test]

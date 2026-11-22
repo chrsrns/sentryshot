@@ -354,7 +354,7 @@ function newScanModal(token) {
 				const s = document.createElement("div");
 				s.textContent = `${stream.role}: ${stream.rtspUrl}${
 					stream.profileName ? ` (${stream.profileName})` : ""
-				}`;
+				}${stream.videoCodec === "h264" ? "" : ` [${stream.videoCodec} — unsupported]`}`;
 				item.append(s);
 			}
 			if (cam.streams.length > 0) {
@@ -363,6 +363,18 @@ function newScanModal(token) {
 				pickBtn.onclick = () => {
 					const main = cam.streams.find((st) => st.role === "main");
 					const sub = cam.streams.find((st) => st.role === "sub");
+					const picked = [main, sub].filter((st) => st !== undefined);
+					const unsupported = picked.filter((st) => st.videoCodec !== "h264");
+					if (
+						unsupported.length > 0 &&
+						!confirm(
+							`picked stream(s) use ${unsupported
+								.map((st) => st.videoCodec)
+								.join(", ")} — SentryShot only plays h264. Apply anyway?`,
+						)
+					) {
+						return;
+					}
 					onPick({
 						source: "rtsp",
 						sourcertsp: {
