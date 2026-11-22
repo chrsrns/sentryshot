@@ -90,6 +90,82 @@ describe("newScanModal", () => {
 		);
 	});
 
+	/** Sets a labeled text field inside the modal. */
+	const setModalField = (modal, label, value) => {
+		const l = [...modal.elem.querySelectorAll("label")].find(
+			(x) => x.textContent === label,
+		);
+		const input = modal.elem.querySelector(`#${l.htmlFor}`);
+		input.value = value;
+	};
+
+	test("Use injects modal creds into creds-free picked urls", async () => {
+		document.body.replaceChildren();
+		global.confirm = () => true;
+		const modal = newScanModal("token");
+		let picked;
+		modal.onPick = (p) => {
+			picked = p;
+		};
+
+		await runScan(modal, scanBody("h264"));
+
+		setModalField(modal, "Username", "admin");
+		setModalField(modal, "Password", "s@cret");
+
+		const useBtn = [...modal.elem.querySelectorAll("button")].find(
+			(b) => b.textContent.trim() === "Use",
+		);
+		useBtn.click();
+
+		expect(picked.sourcertsp.mainStream).toBe(
+			"rtsp://admin:s%40cret@10.0.0.9/main",
+		);
+	});
+
+	test("Use leaves backend-embedded creds urls untouched", async () => {
+		document.body.replaceChildren();
+		global.confirm = () => true;
+		const modal = newScanModal("token");
+		let picked;
+		modal.onPick = (p) => {
+			picked = p;
+		};
+
+		const body = scanBody("h264");
+		body.cameras[0].streams[0].rtspUrl = "rtsp://cam:cam@10.0.0.9/main";
+		await runScan(modal, body);
+
+		setModalField(modal, "Username", "admin");
+		setModalField(modal, "Password", "secret");
+
+		const useBtn = [...modal.elem.querySelectorAll("button")].find(
+			(b) => b.textContent.trim() === "Use",
+		);
+		useBtn.click();
+
+		expect(picked.sourcertsp.mainStream).toBe("rtsp://cam:cam@10.0.0.9/main");
+	});
+
+	test("Use passes urls through verbatim when no creds supplied", async () => {
+		document.body.replaceChildren();
+		global.confirm = () => true;
+		const modal = newScanModal("token");
+		let picked;
+		modal.onPick = (p) => {
+			picked = p;
+		};
+
+		await runScan(modal, scanBody("h264"));
+
+		const useBtn = [...modal.elem.querySelectorAll("button")].find(
+			(b) => b.textContent.trim() === "Use",
+		);
+		useBtn.click();
+
+		expect(picked.sourcertsp.mainStream).toBe("rtsp://10.0.0.9/main");
+	});
+
 	test("sub-stream select drives slot assignment", async () => {
 		document.body.replaceChildren();
 		global.confirm = () => true;

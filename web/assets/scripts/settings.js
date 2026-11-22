@@ -462,6 +462,21 @@ function newScanModal(token) {
 						<span class="text-2 text-color">Use</span>
 					</button>
 				`);
+				/** Injects modal-supplied creds into a creds-free stream url. @param {string} url */
+				const injectCreds = (url) => {
+					const user = userField.value();
+					const pass = passField.value();
+					if (user === "" && pass === "") {
+						return url;
+					}
+					if (/^rtsp:\/\/[^/@]*@/.test(url)) {
+						return url;
+					}
+					return url.replace(
+						"rtsp://",
+						`rtsp://${encodeURIComponent(user)}:${encodeURIComponent(pass)}@`,
+					);
+				};
 				pickBtn.onclick = () => {
 					const picked = [sel.main, sel.sub].filter((st) => st !== undefined);
 					const unsupported = picked.filter((st) => st.videoCodec !== "h264");
@@ -479,8 +494,10 @@ function newScanModal(token) {
 						source: "rtsp",
 						sourcertsp: {
 							protocol: "tcp",
-							mainStream: sel.main === undefined ? "" : sel.main.rtspUrl,
-							subStream: sel.sub === undefined ? "" : sel.sub.rtspUrl,
+							mainStream:
+								sel.main === undefined ? "" : injectCreds(sel.main.rtspUrl),
+							subStream:
+								sel.sub === undefined ? "" : injectCreds(sel.sub.rtspUrl),
 						},
 						name: sanitizeMonitorName(cam.name, cam.ip),
 					});
