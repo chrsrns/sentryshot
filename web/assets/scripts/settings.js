@@ -18,6 +18,7 @@ import {
 	newForm,
 	newField,
 	newErrorField,
+	newRawSelectField,
 	newRawSelectCustomField,
 	inputRules,
 	fieldTemplate,
@@ -294,21 +295,43 @@ function newCategory(title, icon, form, onNav) {
  * @param {string} token
  * @returns {{elem: Element, open: () => void, onPick: (p: object) => void}}
  */
+/** Masks an embedded password in a stream url for display. @param {string} url */
+const maskUrlPassword = (url) =>
+	url.replace(/:\/\/([^/:@]+):[^/@]*@/, "://$1:•••@");
+
 function newScanModal(token) {
-	const hostInput = document.createElement("input");
-	hostInput.placeholder = "camera IP (optional)";
-	const userInput = document.createElement("input");
-	userInput.placeholder = "username (optional)";
-	const passInput = document.createElement("input");
-	passInput.placeholder = "password (optional)";
-	passInput.type = "password";
+	const hostField = newField({
+		input: "text",
+		label: "Camera IP",
+		placeholder: "optional — empty scans LAN",
+	});
+	const userField = newField({
+		input: "text",
+		label: "Username",
+		placeholder: "optional",
+	});
+	const passField = newField({
+		input: "password",
+		label: "Password",
+		placeholder: "optional",
+	});
 	const statusElem = document.createElement("div");
+	statusElem.className = "px-2 pb-1 text-1.5";
 	const listElem = document.createElement("ul");
 
+	const scanBtn = htmlToElem(/* HTML */ `
+		<button class="m-2 px-2 rounded-lg bg-color2 hover:bg-color3">
+			<span class="text-2 text-color">Scan</span>
+		</button>
+	`);
+
 	const modal = newModal("Camera scan", [
-		hostInput,
-		userInput,
-		passInput,
+		htmlToElem("<ul></ul>", [
+			hostField.elems[0],
+			userField.elems[0],
+			passField.elems[0],
+		]),
+		htmlToElem("<div class=\"flex\"></div>", [scanBtn]),
 		statusElem,
 		listElem,
 	]);
@@ -323,6 +346,12 @@ function newScanModal(token) {
 		parent.append(el);
 	};
 
+	/** Display label for a stream; password masked, codec flagged. @param {any} st */
+	const streamLabel = (st) =>
+		`${st.role}: ${maskUrlPassword(st.rtspUrl)}${
+			st.profileName ? ` (${st.profileName})` : ""
+		}${st.videoCodec === "h264" ? "" : ` [${st.videoCodec} — unsupported]`}`;
+
 	const renderResults = (result) => {
 		listElem.replaceChildren();
 		statusElem.textContent = result.truncated
@@ -330,12 +359,15 @@ function newScanModal(token) {
 			: `${result.cameras.length} camera(s) found`;
 		for (const cam of result.cameras) {
 			const item = document.createElement("li");
-			row(item, cam.ip);
+			item.className = "px-2 pb-1 border-b-2 border-color1";
+			const header = document.createElement("div");
+			header.className = "text-1.5";
+			row(header, cam.ip);
 			if (cam.name) {
-				row(item, ` — ${cam.name}`);
+				row(header, ` — ${cam.name}`);
 			}
 			if (cam.hardware) {
-				row(item, ` (${cam.hardware})`);
+				row(header, ` (${cam.hardware})`);
 			}
 			const badges = [];
 			if (cam.needsAuth) {
@@ -348,36 +380,88 @@ function newScanModal(token) {
 				badges.push("audio");
 			}
 			if (badges.length > 0) {
-				row(item, ` [${badges.join(" ")}]`);
+				row(header, ` [${badges.join(" ")}]`);
 			}
+			item.append(header);
 			// Per-camera slot selection: defaults to the role-derived
-			// assignment; any stream (incl. extras) can be reassigned
-			// into the main or sub slot via its row buttons.
+			// assignment. Both the dropdowns and the per-stream →main/→sub
+			// buttons drive the same `sel` state.
 			const sel = {
 				main: cam.streams.find((st) => st.role === "main"),
 				sub: cam.streams.find((st) => st.role === "sub"),
 			};
+			const selects = {
+				main: newRawSelectField("Main stream", []),
+				sub: newRawSelectField("Sub stream", []),
+			};
+			const syncSelects = () => {
+				for (const slot of ["main", "sub"]) {
+					const $input = selects[slot].$input;
+					$input.value =
+						sel[slot] === undefined
+							? ""
+							: String(cam.streams.indexOf(sel[slot]));
+				}
+			};
+			for (const slot of ["main", "sub"]) {
+				const $input = selects[slot].$input;
+				const none = document.createElement("option");
+				none.value = "";
+				none.textContent = "— none —";
+				$input.append(none);
+				for (const [i, st] of cam.streams.entries()) {
+					const opt = document.createElement("option");
+					opt.value = String(i);
+					opt.textContent = streamLabel(st);
+					$input.append(opt);
+				}
+				$input.onchange = () => {
+					sel[slot] =
+						$input.value === ""
+							? undefined
+							: cam.streams[Number($input.value)];
+				};
+			}
+			syncSelects();
+			item.append(
+				htmlToElem("<ul></ul>", [
+					selects["main"].elem,
+					selects["sub"].elem,
+				]),
+			);
 			for (const stream of cam.streams) {
 				const s = document.createElement("div");
+				s.className = "px-1";
 				const text = document.createElement("span");
-				text.textContent = `${stream.role}: ${stream.rtspUrl}${
-					stream.profileName ? ` (${stream.profileName})` : ""
-				}${stream.videoCodec === "h264" ? "" : ` [${stream.videoCodec} — unsupported]`}`;
+				text.className = "text-1.5";
+				text.textContent = streamLabel(stream);
 				s.append(text);
 				for (const slot of ["main", "sub"]) {
-					const assign = document.createElement("button");
-					assign.textContent = `→${slot}`;
+					const assign = htmlToElem(/* HTML */ `
+						<button
+							class="ml-1 px-1 rounded-lg bg-color2 hover:bg-color3"
+						>
+							<span class="text-1.5 text-color"></span>
+						</button>
+					`);
+					assign.querySelector("span").textContent = `→${slot}`;
 					assign.onclick = () => {
 						sel[slot] = stream;
-						statusElem.textContent = `${slot} ← ${stream.rtspUrl}`;
+						syncSelects();
+						statusElem.textContent = `${slot} ← ${maskUrlPassword(
+							stream.rtspUrl,
+						)}`;
 					};
 					s.append(assign);
 				}
 				item.append(s);
 			}
 			if (cam.streams.length > 0) {
-				const pickBtn = document.createElement("button");
-				pickBtn.textContent = "use";
+				const pickBtn = htmlToElem(/* HTML */ `
+					<button class="m-2 px-2 rounded-lg bg-green hover:bg-green2">
+						<span class="text-2 text-color">Use</span>
+					</button>
+				`);
 				pickBtn.onclick = () => {
 					const picked = [sel.main, sel.sub].filter((st) => st !== undefined);
 					const unsupported = picked.filter((st) => st.videoCodec !== "h264");
@@ -408,17 +492,15 @@ function newScanModal(token) {
 		}
 	};
 
-	const scanBtn = document.createElement("button");
-	scanBtn.textContent = "scan";
 	scanBtn.onclick = async () => {
 		statusElem.textContent = "scanning…";
 		listElem.replaceChildren();
 		const { status, body } = await fetchPostJson(
 			"/api/scan",
 			{
-				host: hostInput.value,
-				username: userInput.value,
-				password: passInput.value,
+				host: hostField.value(),
+				username: userField.value(),
+				password: passField.value(),
 			},
 			token,
 		);
@@ -432,7 +514,6 @@ function newScanModal(token) {
 		}
 		renderResults(body);
 	};
-	modal.$content.prepend(scanBtn);
 
 	return {
 		elem: modal.elem,
