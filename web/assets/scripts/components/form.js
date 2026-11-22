@@ -33,6 +33,7 @@ import { uniqueID, htmlToElem } from "../libs/common.js";
  * @property {() => string|undefined} validate
  * @property {() => Element} elem
  * @property {(values: {[x: string]: any}) => void} set
+ * @property {(values: {[x: string]: any}) => void} patch
  * @property {(values: {[x: string]: any}) => void} get
  */
 
@@ -117,6 +118,16 @@ function newForm(fields) {
 				if (values === undefined) {
 					field.set(undefined);
 				} else {
+					field.set(values[key]);
+				}
+			}
+		},
+		// Only sets the keys present in `values`; others keep
+		// their current value. Used for partial prefills that
+		// must not clear untouched fields (e.g. `id`).
+		patch(values) {
+			for (const [key, field] of Object.entries(fields)) {
+				if (key in values) {
 					field.set(values[key]);
 				}
 			}

@@ -63,6 +63,30 @@ describe("newForm", () => {
 		expect(fieldValue()).toBeUndefined();
 	});
 
+	test("patch only sets provided keys", () => {
+		const values = {};
+		const form = newForm({
+			id: {
+				elems: [htmlToElem("<span>html</span>")],
+				set(input) {
+					values["id"] = input;
+				},
+			},
+			name: {
+				elems: [htmlToElem("<span>html</span>")],
+				set(input) {
+					values["name"] = input;
+				},
+			},
+		});
+
+		form.set({ id: "abc", name: "cam" });
+		form.patch({ name: "renamed" });
+
+		expect(values["id"]).toBe("abc");
+		expect(values["name"]).toBe("renamed");
+	});
+
 	const newTestForm = () => {
 		return newForm({
 			field: {

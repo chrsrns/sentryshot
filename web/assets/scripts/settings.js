@@ -475,7 +475,9 @@ function newMonitor(token, fields, getMonitorId, monitors) {
 		scanModal.open();
 	});
 	scanModal.onPick = (prefill) => {
-		form.set(prefill);
+		// patch, not set — the prefill carries only name+streams;
+		// set() would clear untouched fields like the monitor id.
+		form.patch(prefill);
 	};
 
 	form.addButton("delete", onDelete);
