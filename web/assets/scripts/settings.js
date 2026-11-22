@@ -498,7 +498,7 @@ function newScanModal(token) {
 					if (warnings.length > 0 && !confirm(`${warnings.join("; ")}. Apply anyway?`)) {
 						return;
 					}
-					onPick({
+					const prefill = {
 						source: "rtsp",
 						sourcertsp: {
 							protocol: "tcp",
@@ -508,7 +508,20 @@ function newScanModal(token) {
 								sel.sub === undefined ? "" : injectCreds(sel.sub.rtspUrl),
 						},
 						name: sanitizeMonitorName(cam.name, cam.ip),
-					});
+					};
+					if (cam.ptz === true) {
+						// First http XAddr; none → empty, derived at
+						// command time from the main stream host.
+						const httpXaddr = (cam.xaddrs || []).find((x) =>
+							x.startsWith("http://"),
+						);
+						// @ts-ignore
+						prefill.ptz = {
+							enable: true,
+							onvifAddr: httpXaddr === undefined ? "" : httpXaddr,
+						};
+					}
+					onPick(prefill);
 					modal.close();
 				};
 				item.append(pickBtn);
@@ -1230,8 +1243,12 @@ const ptzOnvifAddrRules = [
 	[/[#?]/, "query and fragment not allowed"],
 ];
 
-/** @returns {Field<PtzConfig>} */
-function newPtzField() {
+/**
+ * @param {string} csrfToken
+ * @param {() => string} getMonitorId
+ * @returns {Field<PtzConfig>}
+ */
+function newPtzField(csrfToken, getMonitorId) {
 	const fields = {
 		enable: fieldTemplate.toggle("Enable PTZ", false),
 		onvifAddr: newErrorField(ptzOnvifAddrRules, {
@@ -1241,10 +1258,11 @@ function newPtzField() {
 			doc: "ONVIF device service address. Leave empty to derive it from the main stream host",
 		}),
 	};
+	const panel = newPtzPanel(csrfToken, getMonitorId);
 
 	const form = newForm(fields);
 	return {
-		elems: [...fields.enable.elems, ...fields.onvifAddr.elems],
+		elems: [...fields.enable.elems, ...fields.onvifAddr.elems, panel.elem],
 		value() {
 			/** @type {PtzConfig} */
 			const value = { enable: false, onvifAddr: "" };
@@ -1252,10 +1270,239 @@ function newPtzField() {
 			return value;
 		},
 		set(input) {
-			form.set(input === undefined ? {} : input);
+			const value = input === undefined ? {} : input;
+			form.set(value);
+			// Panel only for a persisted monitor saved with ptz enabled —
+			// commands read stored config + creds, so an unsaved toggle
+			// could never authenticate anyway.
+			if (value.enable === true) {
+				panel.show();
+			} else {
+				panel.hide();
+			}
 		},
 		validate() {
 			return form.validate();
+		},
+	};
+}
+
+/** Milliseconds between move heartbeats while a pad/zoom button is held. */
+const PTZ_HEARTBEAT_MS = 1500;
+
+/**
+ * PTZ test panel: direction pad + zoom hold-to-move, home, preset list.
+ * Visibility is driven by the ptz field's set() — shown only when a
+ * persisted monitor's saved config has enable=true.
+ *
+ * @param {string} csrfToken
+ * @param {() => string} getMonitorId
+ */
+function newPtzPanel(csrfToken, getMonitorId) {
+	const elem = /** @type {HTMLElement} */ (htmlToElem(/* HTML */ `
+		<li class="ptz-panel form-item" hidden>
+			<div class="flex flex-col gap-1 p-2 border border-color3 rounded-lg w-max">
+				<div class="flex gap-1 items-center">
+					<button type="button" class="ptz-hold px-2 rounded-lg bg-color2 hover:bg-color3" data-pan="0" data-tilt="0.5">↑</button>
+					<button type="button" class="ptz-hold px-2 rounded-lg bg-color2 hover:bg-color3" data-pan="0" data-tilt="-0.5">↓</button>
+					<button type="button" class="ptz-hold px-2 rounded-lg bg-color2 hover:bg-color3" data-pan="-0.5" data-tilt="0">←</button>
+					<button type="button" class="ptz-hold px-2 rounded-lg bg-color2 hover:bg-color3" data-pan="0.5" data-tilt="0">→</button>
+					<button type="button" class="ptz-hold px-2 rounded-lg bg-color2 hover:bg-color3" data-zoom="0.5">zoom+</button>
+					<button type="button" class="ptz-hold px-2 rounded-lg bg-color2 hover:bg-color3" data-zoom="-0.5">zoom−</button>
+					<button type="button" class="js-ptz-home px-2 rounded-lg bg-color2 hover:bg-color3">home</button>
+				</div>
+				<div class="js-ptz-presets flex flex-col gap-1"></div>
+				<div class="flex gap-1 items-center">
+					<input type="text" class="js-ptz-name px-1 bg-color1" placeholder="preset name" maxlength="64" />
+					<button type="button" class="js-ptz-save px-2 rounded-lg bg-color2 hover:bg-color3">save</button>
+				</div>
+				<div class="js-ptz-error text-red"></div>
+			</div>
+		</li>
+	`));
+
+	const errorElem = /** @type {HTMLElement} */ (elem.querySelector(".js-ptz-error"));
+	const presetsElem = /** @type {HTMLElement} */ (elem.querySelector(".js-ptz-presets"));
+	const nameInput = /** @type {HTMLInputElement} */ (elem.querySelector(".js-ptz-name"));
+
+	/** @param {number} status @param {any} body */
+	const showError = (status, body) => {
+		const detail = body === undefined || body === null ? "" : `: ${typeof body === "string" ? body : JSON.stringify(body)}`;
+		errorElem.textContent = `${status}${detail}`;
+	};
+
+	/** @param {object} cmd */
+	const send = async (cmd) => {
+		const { status, body } = await fetchPostJson(
+			`api/monitor/ptz?id=${getMonitorId()}`,
+			cmd,
+			csrfToken,
+		).catch(() => ({ status: 0, body: undefined }));
+		if (status === 0) {
+			errorElem.textContent = "network error";
+			return 0;
+		}
+		if (status !== 200) {
+			showError(status, body);
+		}
+		return status;
+	};
+
+	/** @type {ReturnType<typeof setInterval>|undefined} */
+	let heartbeat;
+	let inFlight = false;
+	let moving = false;
+
+	/** @param {{pan?: number, tilt?: number, zoom?: number}} vel */
+	const move = async (vel) => {
+		if (inFlight) {
+			return; // Skip beat while a prior move is still in-flight.
+		}
+		inFlight = true;
+		try {
+			await send(Object.assign({ command: "move" }, vel));
+		} finally {
+			inFlight = false;
+		}
+	};
+
+	const stop = () => {
+		send({ command: "stop" });
+	};
+
+	/** @param {{pan?: number, tilt?: number, zoom?: number}} vel */
+	const holdStart = (vel) => {
+		releaseHold(false); // clear any stale state without a stop.
+		moving = true;
+		move(vel);
+		heartbeat = setInterval(() => {
+			move(vel);
+		}, PTZ_HEARTBEAT_MS);
+	};
+
+	/** @param {boolean} sendStop */
+	const releaseHold = (sendStop) => {
+		if (heartbeat !== undefined) {
+			clearInterval(heartbeat);
+			heartbeat = undefined;
+		}
+		if (moving) {
+			moving = false;
+			if (sendStop) {
+				stop();
+			}
+		}
+	};
+
+	for (const btn of /** @type {NodeListOf<HTMLElement>} */ (
+		elem.querySelectorAll(".ptz-hold")
+	)) {
+		const vel = {};
+		for (const axis of ["pan", "tilt", "zoom"]) {
+			if (btn.dataset[axis] !== undefined) {
+				// @ts-ignore
+				vel[axis] = Number(btn.dataset[axis]);
+			}
+		}
+		btn.addEventListener("pointerdown", (e) => {
+			e.preventDefault();
+			holdStart(vel);
+		});
+		for (const ev of ["pointerup", "pointerleave", "pointercancel"]) {
+			btn.addEventListener(ev, () => {
+				releaseHold(true);
+			});
+		}
+	}
+	// @ts-ignore
+	elem.querySelector(".js-ptz-home").onclick = () => {
+		send({ command: "home" });
+	};
+	// @ts-ignore
+	elem.querySelector(".js-ptz-save").onclick = async () => {
+		const name = nameInput.value;
+		if (name === "") {
+			errorElem.textContent = "preset name required";
+			return;
+		}
+		if (name.length > 64) {
+			errorElem.textContent = "preset name must be 64 characters or less";
+			return;
+		}
+		const status = await send({ command: "setPreset", presetName: name });
+		if (status === 200) {
+			nameInput.value = "";
+			await loadPresets();
+		}
+	};
+
+	const loadPresets = async () => {
+		const { status, body } = await fetchPostJson(
+			`api/monitor/ptz?id=${getMonitorId()}`,
+			{ command: "getPresets" },
+			csrfToken,
+		).catch(() => ({ status: 0, body: undefined }));
+		if (status !== 200) {
+			showError(status, body);
+			return;
+		}
+		const presets = body === undefined ? [] : body.presets || [];
+		presetsElem.replaceChildren();
+		for (const p of presets) {
+			const row = htmlToElem(/* HTML */ `
+				<div class="flex gap-1 items-center">
+					<span class="js-ptz-preset-name"></span>
+					<button type="button" class="js-ptz-recall px-2 rounded-lg bg-color2 hover:bg-color3">recall</button>
+					<button type="button" class="js-ptz-delete px-2 rounded-lg bg-color2 hover:bg-color3">delete</button>
+				</div>
+			`);
+			// textContent only — device-supplied strings.
+			row.querySelector(".js-ptz-preset-name").textContent = p.name;
+			// @ts-ignore
+			row.querySelector(".js-ptz-recall").onclick = () => {
+				send({ command: "gotoPreset", presetToken: p.token });
+			};
+			// @ts-ignore
+			row.querySelector(".js-ptz-delete").onclick = async () => {
+				const status = await send({ command: "removePreset", presetToken: p.token });
+				if (status === 200) {
+					await loadPresets();
+				}
+			};
+			presetsElem.append(row);
+		}
+	};
+
+	const onBlur = () => {
+		releaseHold(true);
+	};
+
+	/** @type {MutationObserver|undefined} */
+	let observer;
+
+	return {
+		elem,
+		show() {
+			elem.hidden = false;
+			loadPresets();
+			window.addEventListener("blur", onBlur);
+			// Unmount/navigation-away: cancel the heartbeat + stop. The
+			// camera-side Timeout still bounds a stop lost on unload.
+			observer = new MutationObserver(() => {
+				if (!elem.isConnected) {
+					releaseHold(true);
+				}
+			});
+			observer.observe(document.body, { childList: true, subtree: true });
+		},
+		hide() {
+			elem.hidden = true;
+			releaseHold(true);
+			window.removeEventListener("blur", onBlur);
+			if (observer !== undefined) {
+				observer.disconnect();
+				observer = undefined;
+			}
 		},
 	};
 }
@@ -1313,7 +1560,7 @@ function init(uiData) {
 	monitorFields.sourcertsp = newSourceRTSP();
 	monitorFields.alwaysRecord = fieldTemplate.toggle("Always record", false);
 	monitorFields.videoLength = fieldTemplate.number("Video length (min)", "15", 15);
-	monitorFields.ptz = newPtzField();
+	monitorFields.ptz = newPtzField(uiData.csrfToken, getMonitorId);
 	//timestampOffset: fieldTemplate.integer("Timestamp offset (ms)", "500", "500"),
 	/* SETTINGS_LAST_MONITOR_FIELD */
 
@@ -1357,4 +1604,4 @@ function init(uiData) {
 		.replaceChildren(...rendererCategories([monitor, group, account]));
 }
 
-export { init, newScanModal, newPtzField };
+export { init, newScanModal, newPtzField, newPtzPanel };
