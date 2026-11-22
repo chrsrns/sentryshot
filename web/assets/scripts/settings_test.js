@@ -390,7 +390,7 @@ describe("newPtzField panel", () => {
 
 	/** Flush microtasks a few times (fetch chains). */
 	const flush = async () => {
-		for (let i = 0; i < 5; i++) {
+		for (let i = 0; i < 12; i++) {
 			await Promise.resolve();
 		}
 	};
@@ -537,7 +537,8 @@ describe("newPtzField panel", () => {
 		const li = field.elems[2];
 		document.body.append(li);
 		await flush();
-		expect(calls[0].body).toEqual({ command: "getPresets" });
+		expect(calls[0].body).toEqual({ command: "capabilities" });
+		expect(calls[1].body).toEqual({ command: "getPresets" });
 
 		// Device names render as text only.
 		const names = [...li.querySelectorAll(".js-ptz-preset-name")].map(
@@ -599,6 +600,87 @@ describe("newPtzField panel", () => {
 		await flush();
 		expect(li.querySelector(".js-ptz-error").textContent).toContain("64");
 		expect(calls.some((c) => c.body.command === "setPreset")).toBe(false);
+	});
+
+	test("unsupported marks disable + label, presets skipped", async () => {
+		document.body.replaceChildren();
+		jest.useFakeTimers();
+		const calls = mkFetch({ unsupported: ["home", "getPresets"] });
+		const field = mkField();
+		field.set({ enable: true, onvifAddr: "" });
+		const li = field.elems[2];
+		document.body.append(li);
+		await flush();
+
+		expect(calls[0].body).toEqual({ command: "capabilities" });
+		// `getPresets` marked → preset list never requested.
+		expect(calls.some((c) => c.body.command === "getPresets")).toBe(false);
+
+		const home = /** @type {HTMLButtonElement} */ (
+			li.querySelector(".js-ptz-home")
+		);
+		expect(home.disabled).toBe(true);
+		expect(home.textContent).toContain("unsupported");
+		expect(li.querySelector(".js-ptz-presets").textContent).toContain(
+			"unsupported",
+		);
+		const nameInput = /** @type {HTMLInputElement} */ (
+			li.querySelector(".js-ptz-name")
+		);
+		const saveBtn = /** @type {HTMLButtonElement} */ (
+			li.querySelector(".js-ptz-save")
+		);
+		expect(nameInput.disabled).toBe(true);
+		expect(saveBtn.disabled).toBe(true);
+
+		// Movement controls untouched — still usable.
+		const up = /** @type {HTMLButtonElement} */ (
+			[...li.querySelectorAll(".ptz-hold")].find(
+				(b) => /** @type {HTMLElement} */ (b).dataset.tilt === "0.5",
+			)
+		);
+		expect(up.disabled).toBeFalsy();
+		up.dispatchEvent(new Event("pointerdown"));
+		await flush();
+		expect(calls.at(-1).body.command).toBe("move");
+		jest.useRealTimers();
+	});
+
+	test("supported camera leaves controls enabled", async () => {
+		document.body.replaceChildren();
+		const calls = mkFetch({ unsupported: [] });
+		const field = mkField();
+		field.set({ enable: true, onvifAddr: "" });
+		const li = field.elems[2];
+		document.body.append(li);
+		await flush();
+
+		const homeBtn = /** @type {HTMLButtonElement} */ (
+			li.querySelector(".js-ptz-home")
+		);
+		const saveBtn2 = /** @type {HTMLButtonElement} */ (
+			li.querySelector(".js-ptz-save")
+		);
+		expect(homeBtn.disabled).toBeFalsy();
+		expect(saveBtn2.disabled).toBeFalsy();
+		expect(calls.some((c) => c.body.command === "getPresets")).toBe(true);
+	});
+
+	test("value() round-trips unsupported marks", () => {
+		const field = mkField();
+		field.set({
+			enable: true,
+			onvifAddr: "",
+			unsupported: ["home", "getPresets"],
+		});
+		expect(field.value()).toEqual({
+			enable: true,
+			onvifAddr: "",
+			unsupported: ["home", "getPresets"],
+		});
+		// Cleared state drops the key entirely.
+		field.set(undefined);
+		expect(field.value()).toEqual({ enable: false, onvifAddr: "" });
 	});
 });
 

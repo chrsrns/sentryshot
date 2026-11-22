@@ -466,14 +466,44 @@ impl MonitorManagerState {
     // Sets config for specified monitor.
     // Changes are not applied until the montior restarts.
     // Returns `true` if monitor was created.
-    pub async fn monitor_set(&mut self, config: MonitorConfig) -> Result<bool, MonitorSetError> {
+    pub async fn monitor_set(
+        &mut self,
+        mut config: MonitorConfig,
+    ) -> Result<bool, MonitorSetError> {
         if !config.config().ptz.onvif_addr_ok() {
             return Err(MonitorSetError::InvalidPtzAddr);
         }
-        let id = config.id();
+        let id = config.id().clone();
+
+        // Endpoint surface changed → stale capability marks are dropped.
+        let stale_marks = self.configs.get(&id).is_some_and(|old| {
+            if config.config().ptz.unsupported().is_empty() {
+                return false;
+            }
+            if old.config().ptz.onvif_addr() != config.config().ptz.onvif_addr() {
+                return true;
+            }
+            match (old.source(), config.source()) {
+                (SourceConfig::Rtsp(a), SourceConfig::Rtsp(b)) => a.main_stream != b.main_stream,
+            }
+        });
+        if stale_marks {
+            if let Some(ptz) = config
+                .raw_mut()
+                .get_mut("ptz")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                ptz.insert("unsupported".to_owned(), serde_json::json!([]));
+            }
+            // Typed views deserialize once — re-parse so the stored
+            // config reflects the patched raw.
+            if let Ok(fresh) = serde_json::from_value::<MonitorConfig>(config.raw().clone()) {
+                config = fresh;
+            }
+        }
 
         // Write config to file.
-        let path = self.config_path(id);
+        let path = self.config_path(&id);
         let mut temp_path = path.clone();
         temp_path.set_file_name(id.to_string() + ".json.tmp");
         let json = serde_json::to_vec_pretty(&config)?;
@@ -481,14 +511,14 @@ impl MonitorManagerState {
             .await
             .map_err(MonitorSetError::WriteFile)?;
 
-        let created = !self.configs.contains_key(id);
+        let created = !self.configs.contains_key(&id);
         if created {
-            self.log(LogLevel::Info, id, "created");
+            self.log(LogLevel::Info, &id, "created");
         } else {
-            self.log(LogLevel::Info, id, "saved");
+            self.log(LogLevel::Info, &id, "saved");
         }
 
-        self.configs.insert(id.to_owned(), config);
+        self.configs.insert(id, config);
         Ok(created)
     }
 
@@ -1023,6 +1053,60 @@ mod tests {
             manager.monitor_set(config).await.unwrap(),
             Err(MonitorSetError::InvalidPtzAddr)
         ));
+
+        stop_manager(token, tracker).await;
+    }
+
+    #[tokio::test]
+    async fn monitor_set_clears_ptz_marks_on_endpoint_change() {
+        let (token, tracker, _temp_dir, _, manager) = new_test_manager().await;
+        let base = || {
+            json!({
+                "id": "cam", "name": "cam", "enable": false,
+                "source": "rtsp",
+                "sourcertsp": {"protocol": "tcp", "mainStream": "rtsp://x1"},
+                "alwaysRecord": false, "videoLength": 0.0,
+                "ptz": {
+                    "enable": true, "onvifAddr": "",
+                    "unsupported": ["getPresets", "home"],
+                },
+            })
+        };
+
+        // Ordinary save — same endpoint surface → marks preserved.
+        manager
+            .monitor_set(serde_json::from_value(base()).unwrap())
+            .await
+            .unwrap();
+        let got = manager.monitor_config(m_id("cam")).await.unwrap().unwrap();
+        assert_eq!(&["getPresets", "home"], got.config().ptz.unsupported());
+
+        // mainStream change → different camera surface → marks dropped.
+        let mut changed = base();
+        changed["sourcertsp"]["mainStream"] = json!("rtsp://x2");
+        manager
+            .monitor_set(serde_json::from_value(changed).unwrap())
+            .await
+            .unwrap();
+        let got = manager.monitor_config(m_id("cam")).await.unwrap().unwrap();
+        assert!(got.config().ptz.unsupported().is_empty());
+
+        // onvifAddr change also clears.
+        let mut marks = base();
+        marks["sourcertsp"]["mainStream"] = json!("rtsp://x2");
+        manager
+            .monitor_set(serde_json::from_value(marks).unwrap())
+            .await
+            .unwrap();
+        let mut addr = base();
+        addr["sourcertsp"]["mainStream"] = json!("rtsp://x2");
+        addr["ptz"]["onvifAddr"] = json!("http://other:8899/onvif/device_service");
+        manager
+            .monitor_set(serde_json::from_value(addr).unwrap())
+            .await
+            .unwrap();
+        let got = manager.monitor_config(m_id("cam")).await.unwrap().unwrap();
+        assert!(got.config().ptz.unsupported().is_empty());
 
         stop_manager(token, tracker).await;
     }

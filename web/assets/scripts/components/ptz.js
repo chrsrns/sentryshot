@@ -92,6 +92,23 @@ export function newPtzController(csrfToken, getMonitorId, errorElem) {
 		releaseHold(true);
 	};
 
+	/**
+	 * Query `capabilities` once. Returns the unsupported-command list —
+	 * `[]` on any transport/camera fault (supported-by-default; the
+	 * real op still errors honestly if it hits a gap).
+	 */
+	const capabilities = async () => {
+		const { status, body } = await fetchPostJson(
+			`api/monitor/ptz?id=${getMonitorId()}`,
+			{ command: "capabilities" },
+			csrfToken,
+		).catch(() => ({ status: 0, body: undefined }));
+		if (status !== 200 || body === undefined || body === null) {
+			return [];
+		}
+		return body.unsupported || [];
+	};
+
 	/** @param {HTMLElement} presetsElem */
 	const loadPresets = async (presetsElem) => {
 		const { status, body } = await fetchPostJson(
@@ -135,6 +152,7 @@ export function newPtzController(csrfToken, getMonitorId, errorElem) {
 
 	return {
 		send,
+		capabilities,
 		/**
 		 * Wire every `.ptz-hold` button under root: pointerdown starts a
 		 * hold-to-move with the button's data-pan/tilt/zoom velocity,
@@ -207,6 +225,51 @@ export function newPtzController(csrfToken, getMonitorId, errorElem) {
 			window.removeEventListener("blur", onBlur);
 		},
 	};
+}
+
+/**
+ * Disable + label controls for commands the camera reported
+ * unsupported. Command → control map shared by the settings panel and
+ * the live pad (same DOM classes).
+ *
+ * @param {Element|HTMLElement} root
+ * @param {string[]} unsupported
+ * @returns {boolean} `true` when `getPresets` is marked — callers skip
+ * the preset list entirely.
+ */
+export function applyPtzCapabilities(root, unsupported) {
+	/** @param {HTMLButtonElement|HTMLInputElement} el */
+	const mark = (el) => {
+		el.disabled = true;
+		el.classList.add("opacity-50");
+		el.title = "unsupported on this camera";
+	};
+	if (unsupported.includes("move") || unsupported.includes("stop")) {
+		for (const btn of root.querySelectorAll(".ptz-hold")) {
+			mark(/** @type {HTMLButtonElement} */ (btn));
+		}
+	}
+	const home = /** @type {HTMLButtonElement|null} */ (root.querySelector(".js-ptz-home"));
+	if (unsupported.includes("home") && home) {
+		mark(home);
+		home.textContent = "home (unsupported)";
+	}
+	if (
+		["getPresets", "setPreset", "gotoPreset", "removePreset"].some((c) =>
+			unsupported.includes(c),
+		)
+	) {
+		for (const el of root.querySelectorAll(".js-ptz-name, .js-ptz-save")) {
+			mark(/** @type {HTMLInputElement} */ (el));
+		}
+		const presets = /** @type {HTMLElement|null} */ (
+			root.querySelector(".js-ptz-presets")
+		);
+		if (presets && unsupported.includes("getPresets")) {
+			presets.textContent = "presets unsupported on this camera";
+		}
+	}
+	return unsupported.includes("getPresets");
 }
 
 const iconPtzPath = "assets/icons/feather/move.svg";
@@ -288,7 +351,14 @@ export function newLivePtz(csrfToken, monitorId) {
 				pad.hidden = !pad.hidden;
 				if (!pad.hidden && !presetsLoaded) {
 					presetsLoaded = true;
-					controller.loadPresets(presetsElem);
+					controller
+						.capabilities()
+						.then((unsupported) =>
+							applyPtzCapabilities(pad, unsupported)
+								? Promise.resolve()
+								: controller.loadPresets(presetsElem),
+						)
+						.catch(() => {});
 				}
 			};
 			// Unmount/navigation-away: cancel heartbeat + stop. The

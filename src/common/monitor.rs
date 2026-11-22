@@ -147,12 +147,21 @@ pub struct PtzConfig {
 
     #[serde(default, rename = "onvifAddr")]
     onvif_addr: String,
+
+    /// Command names the camera reported `not implemented` — persisted
+    /// capability marks (V254). Cleared when the endpoint changes.
+    #[serde(default)]
+    unsupported: Vec<String>,
 }
 
 impl PtzConfig {
     #[must_use]
     pub fn new(enable: bool, onvif_addr: String) -> Self {
-        Self { enable, onvif_addr }
+        Self {
+            enable,
+            onvif_addr,
+            unsupported: Vec::new(),
+        }
     }
 
     #[must_use]
@@ -163,6 +172,11 @@ impl PtzConfig {
     #[must_use]
     pub fn onvif_addr(&self) -> &str {
         &self.onvif_addr
+    }
+
+    #[must_use]
+    pub fn unsupported(&self) -> &[String] {
+        &self.unsupported
     }
 
     /// Save-time validation: empty (derive at command time) or an
