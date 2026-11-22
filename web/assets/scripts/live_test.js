@@ -213,6 +213,114 @@ describe("live ptz overlay", () => {
 		expect(document.querySelectorAll(".js-ptz-live-pad")).toHaveLength(0);
 	});
 
+	test("rail markup + DOM order rail → popover → bar", () => {
+		uidReset();
+		document.body.innerHTML = `<div></div>`;
+		const element = document.querySelector("div");
+		global.fetch = () => Promise.reject(new Error("no network"));
+		// @ts-ignore
+		newViewer(element, mkMonitors(), "hls", mkPtz(true)).reset();
+
+		const rail = /** @type {HTMLElement} */ (
+			document.querySelector(".js-ptz-live-pad")
+		);
+		expect(rail.classList.contains("ptz-rail")).toBe(true);
+		// Cross cluster + divider + zoom + home + presets toggle.
+		expect(rail.querySelectorAll(".ptz-hold")).toHaveLength(6);
+		expect(rail.querySelector(".js-ptz-stop").textContent).toBe("■");
+		expect(rail.querySelector(".js-ptz-home").textContent).toBe("⌂");
+		expect(rail.querySelector(".js-ptz-presets-btn").textContent).toBe("★");
+		expect(rail.querySelector(".ptz-rail-sep")).not.toBeNull();
+
+		// DOM order rail → popover → bar keeps the bar lit while the
+		// rail/popover is hovered (forward-only sibling selectors).
+		const popover = /** @type {HTMLElement} */ (
+			document.querySelector(".js-ptz-presets-pop")
+		);
+		expect(popover.classList.contains("ptz-popover")).toBe(true);
+		expect(rail.nextElementSibling).toBe(popover);
+		expect(
+			/** @type {Element} */ (popover.nextElementSibling).classList.contains(
+				"player-overlay",
+			),
+		).toBe(true);
+	});
+
+	test("presets ★ toggles popover; rail collapse closes it", () => {
+		uidReset();
+		document.body.innerHTML = `<div></div>`;
+		const element = document.querySelector("div");
+		global.fetch = () => Promise.reject(new Error("no network"));
+		// @ts-ignore
+		newViewer(element, mkMonitors(), "hls", mkPtz(true)).reset();
+
+		const rail = /** @type {HTMLElement} */ (
+			document.querySelector(".js-ptz-live-pad")
+		);
+		const popover = /** @type {HTMLElement} */ (
+			document.querySelector(".js-ptz-presets-pop")
+		);
+		const btn = /** @type {HTMLElement} */ (
+			document.querySelector(".js-ptz-live-btn")
+		);
+		const presetsBtn = /** @type {HTMLElement} */ (
+			rail.querySelector(".js-ptz-presets-btn")
+		);
+
+		btn.click(); // open rail
+		expect(rail.hidden).toBe(false);
+		presetsBtn.click();
+		expect(popover.hidden).toBe(false);
+		presetsBtn.click();
+		expect(popover.hidden).toBe(true);
+		presetsBtn.click();
+		expect(popover.hidden).toBe(false);
+		btn.click(); // collapse rail → popover closes too
+		expect(rail.hidden).toBe(true);
+		expect(popover.hidden).toBe(true);
+	});
+
+	test("rail collapse while holding sends stop", async () => {
+		uidReset();
+		document.body.innerHTML = `<div></div>`;
+		const element = document.querySelector("div");
+		const calls = [];
+		global.fetch = /** @type {any} */ ((url, opts) => {
+			calls.push({
+				url,
+				body: JSON.parse(/** @type {string} */ (opts.body)),
+			});
+			return Promise.resolve({
+				status: 200,
+				json: () => Promise.resolve({ presets: [] }),
+			});
+		});
+		// @ts-ignore
+		newViewer(element, mkMonitors(), "hls", mkPtz(true)).reset();
+		for (let i = 0; i < 5; i++) {
+			await Promise.resolve();
+		}
+
+		/** @type {HTMLElement} */ (
+			document.querySelector(".js-ptz-live-btn")
+		).click(); // open rail
+		const rail = document.querySelector(".js-ptz-live-pad");
+		const up = rail.querySelector('[data-tilt="0.5"]');
+		up.dispatchEvent(new window.Event("pointerdown"));
+		for (let i = 0; i < 5; i++) {
+			await Promise.resolve();
+		}
+		expect(calls.some((c) => c.body.command === "move")).toBe(true);
+
+		/** @type {HTMLElement} */ (
+			document.querySelector(".js-ptz-live-btn")
+		).click(); // collapse
+		for (let i = 0; i < 5; i++) {
+			await Promise.resolve();
+		}
+		expect(calls.some((c) => c.body.command === "stop")).toBe(true);
+	});
+
 	test("hold sends move and release sends stop via the shared route", async () => {
 		uidReset();
 		document.body.innerHTML = `<div></div>`;

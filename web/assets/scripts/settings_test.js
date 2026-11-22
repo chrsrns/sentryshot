@@ -419,7 +419,9 @@ describe("newPtzField panel", () => {
 		await flush();
 
 		const up = [...field.elems[2].querySelectorAll(".ptz-hold")].find(
-			(b) => b.dataset.tilt === "0.5",
+			(b) =>
+				/** @type {HTMLElement} */ (b).dataset.tilt === "0.5" &&
+				/** @type {HTMLElement} */ (b).dataset.pan === "0",
 		);
 		up.dispatchEvent(new Event("pointerdown"));
 		await flush();
@@ -465,7 +467,9 @@ describe("newPtzField panel", () => {
 		resolveFirst = undefined;
 
 		const up = [...field.elems[2].querySelectorAll(".ptz-hold")].find(
-			(b) => b.dataset.tilt === "0.5",
+			(b) =>
+				/** @type {HTMLElement} */ (b).dataset.tilt === "0.5" &&
+				/** @type {HTMLElement} */ (b).dataset.pan === "0",
 		);
 		up.dispatchEvent(new Event("pointerdown"));
 		await flush();
@@ -492,7 +496,9 @@ describe("newPtzField panel", () => {
 		await flush();
 
 		const up = [...field.elems[2].querySelectorAll(".ptz-hold")].find(
-			(b) => b.dataset.tilt === "0.5",
+			(b) =>
+				/** @type {HTMLElement} */ (b).dataset.tilt === "0.5" &&
+				/** @type {HTMLElement} */ (b).dataset.pan === "0",
 		);
 		up.dispatchEvent(new Event("pointerdown"));
 		await flush();
@@ -511,7 +517,9 @@ describe("newPtzField panel", () => {
 		await flush();
 
 		const up = [...li.querySelectorAll(".ptz-hold")].find(
-			(b) => b.dataset.tilt === "0.5",
+			(b) =>
+				/** @type {HTMLElement} */ (b).dataset.tilt === "0.5" &&
+				/** @type {HTMLElement} */ (b).dataset.pan === "0",
 		);
 		up.dispatchEvent(new Event("pointerdown"));
 		await flush();
@@ -547,7 +555,9 @@ describe("newPtzField panel", () => {
 		expect(names).toEqual(["Gate", "<img onerror=x>"]);
 		expect(li.querySelector(".js-ptz-presets img")).toBeNull();
 
-		li.querySelector(".js-ptz-home").click();
+		/** @type {HTMLElement} */ (
+			li.querySelector(".js-ptz-home")
+		).click();
 		await flush();
 		expect(calls.at(-1).body).toEqual({ command: "home" });
 
@@ -605,7 +615,9 @@ describe("newPtzField panel", () => {
 	test("unsupported marks disable + label, presets skipped", async () => {
 		document.body.replaceChildren();
 		jest.useFakeTimers();
-		const calls = mkFetch({ unsupported: ["home", "getPresets"] });
+		const calls = mkFetch({
+			unsupported: ["home", "getPresets", "setPreset"],
+		});
 		const field = mkField();
 		field.set({ enable: true, onvifAddr: "" });
 		const li = field.elems[2];
@@ -620,10 +632,19 @@ describe("newPtzField panel", () => {
 			li.querySelector(".js-ptz-home")
 		);
 		expect(home.disabled).toBe(true);
-		expect(home.textContent).toContain("unsupported");
-		expect(li.querySelector(".js-ptz-presets").textContent).toContain(
-			"unsupported",
+		expect(home.classList.contains("ptz-unsupported")).toBe(true);
+		expect(home.textContent).toBe("⌂"); // Glyph preserved — no label rewrite.
+		expect(home.closest(".js-ptz-wrap").getAttribute("title")).toBe(
+			"unsupported on this camera",
 		);
+		// `getPresets` marked → the ★ toggle itself is struck; nothing
+		// renders in place of the preset UI.
+		const presetsBtn = /** @type {HTMLButtonElement} */ (
+			li.querySelector(".js-ptz-presets-btn")
+		);
+		expect(presetsBtn.disabled).toBe(true);
+		expect(presetsBtn.classList.contains("ptz-unsupported")).toBe(true);
+		expect(li.querySelector(".js-ptz-presets").textContent).toBe("");
 		const nameInput = /** @type {HTMLInputElement} */ (
 			li.querySelector(".js-ptz-name")
 		);
@@ -636,7 +657,9 @@ describe("newPtzField panel", () => {
 		// Movement controls untouched — still usable.
 		const up = /** @type {HTMLButtonElement} */ (
 			[...li.querySelectorAll(".ptz-hold")].find(
-				(b) => /** @type {HTMLElement} */ (b).dataset.tilt === "0.5",
+				(b) =>
+					/** @type {HTMLElement} */ (b).dataset.tilt === "0.5" &&
+					/** @type {HTMLElement} */ (b).dataset.pan === "0",
 			)
 		);
 		expect(up.disabled).toBeFalsy();
@@ -664,6 +687,298 @@ describe("newPtzField panel", () => {
 		expect(homeBtn.disabled).toBeFalsy();
 		expect(saveBtn2.disabled).toBeFalsy();
 		expect(calls.some((c) => c.body.command === "getPresets")).toBe(true);
+	});
+
+	test("diagonal hold sends combined pan+tilt, centre stop is tap-only", async () => {
+		document.body.replaceChildren();
+		jest.useFakeTimers();
+		const calls = mkFetch();
+		const field = mkField();
+		field.set({ enable: true, onvifAddr: "" });
+		const li = field.elems[2];
+		document.body.append(li);
+		await flush();
+
+		const diag = /** @type {HTMLElement} */ (
+			li.querySelector('[data-pan="-0.5"][data-tilt="0.5"]')
+		);
+		expect(diag.textContent).toBe("↖");
+		diag.dispatchEvent(new Event("pointerdown"));
+		await flush();
+		expect(calls.at(-1).body).toEqual({
+			command: "move",
+			pan: -0.5,
+			tilt: 0.5,
+		});
+		diag.dispatchEvent(new Event("pointerup"));
+		await flush();
+
+		const n = calls.length;
+		/** @type {HTMLElement} */ (
+			li.querySelector(".js-ptz-stop")
+		).click();
+		await flush();
+		expect(calls).toHaveLength(n + 1); // Tap only — no move precedes it.
+		expect(calls.at(-1).body).toEqual({ command: "stop" });
+		jest.useRealTimers();
+	});
+
+	test("capability shrink restores controls", async () => {
+		document.body.replaceChildren();
+		const marks = { list: ["home"] };
+		global.fetch = /** @type {any} */ ((_url, opts) => {
+			const cmd = JSON.parse(/** @type {string} */ (opts.body)).command;
+			const json = cmd === "capabilities" ? { unsupported: marks.list } : {};
+			return Promise.resolve({ status: 200, json: () => Promise.resolve(json) });
+		});
+		const field = mkField();
+		field.set({ enable: true, onvifAddr: "" });
+		const li = field.elems[2];
+		document.body.append(li);
+		await flush();
+		const home = /** @type {HTMLButtonElement} */ (
+			li.querySelector(".js-ptz-home")
+		);
+		expect(home.disabled).toBe(true);
+
+		marks.list = [];
+		field.set(undefined);
+		field.set({ enable: true, onvifAddr: "" });
+		await flush();
+		expect(home.disabled).toBe(false);
+		expect(home.classList.contains("ptz-unsupported")).toBe(false);
+		expect(home.closest(".js-ptz-wrap").getAttribute("title")).toBeNull();
+	});
+
+	test("mid-hold mark cancels the heartbeat and sends stop", async () => {
+		document.body.replaceChildren();
+		jest.useFakeTimers();
+		const caps = { list: /** @type {string[]} */ ([]) };
+		const calls = [];
+		global.fetch = /** @type {any} */ ((_url, opts) => {
+			const body = JSON.parse(/** @type {string} */ (opts.body));
+			calls.push({ url: _url, body });
+			const json =
+				body.command === "capabilities" ? { unsupported: caps.list } : {};
+			return Promise.resolve({ status: 200, json: () => Promise.resolve(json) });
+		});
+		const field = mkField();
+		field.set({ enable: true, onvifAddr: "" });
+		const li = field.elems[2];
+		document.body.append(li);
+		await flush();
+
+		const up = /** @type {HTMLElement} */ (
+			li.querySelector('[data-tilt="0.5"][data-pan="0"]')
+		);
+		up.dispatchEvent(new Event("pointerdown"));
+		await flush();
+		expect(calls.at(-1).body.command).toBe("move");
+
+		// Marks arrive mid-hold → held control released: heartbeat dead, stop sent.
+		caps.list = ["move"];
+		field.set({ enable: true, onvifAddr: "" });
+		await flush();
+		expect(calls.some((c) => c.body.command === "stop")).toBe(true);
+		const moves = calls.filter((c) => c.body.command === "move").length;
+		jest.advanceTimersByTime(3200);
+		await flush();
+		expect(calls.filter((c) => c.body.command === "move")).toHaveLength(moves);
+		jest.useRealTimers();
+	});
+
+	test("stop mark skips the release stop and cascades to holds", async () => {
+		document.body.replaceChildren();
+		jest.useFakeTimers();
+		const caps = { list: /** @type {string[]} */ ([]) };
+		const calls = [];
+		global.fetch = /** @type {any} */ ((_url, opts) => {
+			const body = JSON.parse(/** @type {string} */ (opts.body));
+			calls.push({ url: _url, body });
+			const json =
+				body.command === "capabilities" ? { unsupported: caps.list } : {};
+			return Promise.resolve({ status: 200, json: () => Promise.resolve(json) });
+		});
+		const field = mkField();
+		field.set({ enable: true, onvifAddr: "" });
+		const li = field.elems[2];
+		document.body.append(li);
+		await flush();
+
+		const up = /** @type {HTMLElement} */ (
+			li.querySelector('[data-tilt="0.5"][data-pan="0"]')
+		);
+		up.dispatchEvent(new Event("pointerdown"));
+		await flush();
+
+		// `stop` marks mid-hold → cascade strikes every hold control and the
+		// release must NOT send a stop the camera can't honour.
+		caps.list = ["stop"];
+		field.set({ enable: true, onvifAddr: "" });
+		await flush();
+		expect(up.classList.contains("ptz-unsupported")).toBe(true);
+		expect(calls.some((c) => c.body.command === "stop")).toBe(false);
+		const moves = calls.filter((c) => c.body.command === "move").length;
+		jest.advanceTimersByTime(3200);
+		await flush();
+		expect(calls.filter((c) => c.body.command === "move")).toHaveLength(moves);
+		jest.useRealTimers();
+	});
+
+	test("faulted move cancels the heartbeat", async () => {
+		document.body.replaceChildren();
+		jest.useFakeTimers();
+		const calls = [];
+		global.fetch = /** @type {any} */ ((_url, opts) => {
+			const body = JSON.parse(/** @type {string} */ (opts.body));
+			calls.push({ url: _url, body });
+			const status = body.command === "move" ? 502 : 200;
+			return Promise.resolve({ status, json: () => Promise.resolve({}) });
+		});
+		const field = mkField();
+		field.set({ enable: true, onvifAddr: "" });
+		const li = field.elems[2];
+		document.body.append(li);
+		await flush();
+
+		const up = /** @type {HTMLElement} */ (
+			li.querySelector('[data-tilt="0.5"][data-pan="0"]')
+		);
+		up.dispatchEvent(new Event("pointerdown"));
+		await flush();
+		const moves = calls.filter((c) => c.body.command === "move").length;
+		expect(moves).toBe(1);
+		jest.advanceTimersByTime(3200);
+		await flush();
+		expect(calls.filter((c) => c.body.command === "move")).toHaveLength(moves);
+		jest.useRealTimers();
+	});
+
+	test("capability marks apply to asynchronously created preset rows", async () => {
+		document.body.replaceChildren();
+		global.fetch = /** @type {any} */ ((_url, opts) => {
+			const body = JSON.parse(opts.body);
+			const json =
+				body.command === "capabilities"
+					? { unsupported: ["gotoPreset"] }
+					: (body.command === "getPresets"
+						? { presets: [{ name: "p1", token: "t1" }] }
+						: {});
+			return Promise.resolve({ status: 200, json: () => Promise.resolve(json) });
+		});
+		const field = mkField();
+		field.set({ enable: true, onvifAddr: "" });
+		const li = field.elems[2];
+		document.body.append(li);
+		await flush();
+
+		const recall = /** @type {HTMLButtonElement} */ (
+			li.querySelector(".js-ptz-recall")
+		);
+		const del = /** @type {HTMLButtonElement} */ (
+			li.querySelector(".js-ptz-delete")
+		);
+		expect(recall.disabled).toBe(true);
+		expect(recall.classList.contains("ptz-unsupported")).toBe(true);
+		expect(recall.closest(".js-ptz-wrap").getAttribute("title")).toBe(
+			"unsupported on this camera",
+		);
+		expect(del.disabled).toBe(false);
+	});
+
+	test("successful command clears a prior error", async () => {
+		document.body.replaceChildren();
+		let fail = true;
+		global.fetch = /** @type {any} */ ((_url, opts) => {
+			const body = JSON.parse(opts.body);
+			const status = body.command === "home" && fail ? 502 : 200;
+			return Promise.resolve({ status, json: () => Promise.resolve("x") });
+		});
+		const field = mkField();
+		field.set({ enable: true, onvifAddr: "" });
+		const li = field.elems[2];
+		document.body.append(li);
+		await flush();
+
+		/** @type {HTMLElement} */ (
+			li.querySelector(".js-ptz-home")
+		).click();
+		await flush();
+		expect(li.querySelector(".js-ptz-error").textContent).toContain("502");
+		fail = false;
+		/** @type {HTMLElement} */ (
+			li.querySelector(".js-ptz-home")
+		).click();
+		await flush();
+		expect(li.querySelector(".js-ptz-error").textContent).toBe("");
+	});
+
+	test("failed capabilities query keeps prior marks", async () => {
+		document.body.replaceChildren();
+		const caps = { fail: false };
+		global.fetch = /** @type {any} */ ((_url, opts) => {
+			const body = JSON.parse(opts.body);
+			if (body.command === "capabilities" && caps.fail) {
+				return Promise.resolve({
+					status: 500,
+					json: () => Promise.resolve("boom"),
+				});
+			}
+			const json =
+				body.command === "capabilities" ? { unsupported: ["home"] } : {};
+			return Promise.resolve({ status: 200, json: () => Promise.resolve(json) });
+		});
+		const field = mkField();
+		field.set({ enable: true, onvifAddr: "" });
+		const li = field.elems[2];
+		document.body.append(li);
+		await flush();
+		const home = /** @type {HTMLButtonElement} */ (
+			li.querySelector(".js-ptz-home")
+		);
+		expect(home.disabled).toBe(true);
+
+		// A failed probe is no result — the mark stays instead of clearing.
+		caps.fail = true;
+		field.set(undefined);
+		field.set({ enable: true, onvifAddr: "" });
+		await flush();
+		expect(home.disabled).toBe(true);
+		expect(home.classList.contains("ptz-unsupported")).toBe(true);
+	});
+
+	test("preset list refetches on every open", async () => {
+		document.body.replaceChildren();
+		const calls = mkFetch({ presets: [] });
+		const field = mkField();
+		field.set({ enable: true, onvifAddr: "" });
+		document.body.append(field.elems[2]);
+		await flush();
+		expect(
+			calls.filter((c) => c.body.command === "getPresets"),
+		).toHaveLength(1);
+
+		field.set(undefined);
+		field.set({ enable: true, onvifAddr: "" });
+		await flush();
+		expect(
+			calls.filter((c) => c.body.command === "getPresets"),
+		).toHaveLength(2);
+	});
+
+	test("show() is idempotent — one blur listener", async () => {
+		document.body.replaceChildren();
+		mkFetch();
+		const spy = jest.spyOn(window, "addEventListener");
+		const field = mkField();
+		field.set({ enable: true, onvifAddr: "" });
+		field.set({ enable: true, onvifAddr: "" });
+		document.body.append(field.elems[2]);
+		await flush();
+		expect(
+			spy.mock.calls.filter((c) => c[0] === "blur"),
+		).toHaveLength(1);
+		spy.mockRestore();
 	});
 
 	test("value() round-trips unsupported marks", () => {

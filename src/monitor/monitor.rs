@@ -475,6 +475,31 @@ impl MonitorManagerState {
         }
         let id = config.id().clone();
 
+        // The server owns capability marks — the FE form payload can
+        // carry a stale copy from before a mid-session fault, so the
+        // stored marks union into the incoming set before the
+        // endpoint-change clear evaluates it.
+        if let Some(old) = self.configs.get(&id) {
+            let mut union: Vec<String> = old.config().ptz.unsupported().to_vec();
+            for mark in config.config().ptz.unsupported() {
+                if !union.contains(mark) {
+                    union.push(mark.clone());
+                }
+            }
+            if union != config.config().ptz.unsupported() {
+                if let Some(ptz) = config
+                    .raw_mut()
+                    .get_mut("ptz")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    ptz.insert("unsupported".to_owned(), serde_json::json!(union));
+                }
+                if let Ok(fresh) = serde_json::from_value::<MonitorConfig>(config.raw().clone()) {
+                    config = fresh;
+                }
+            }
+        }
+
         // Endpoint surface changed → stale capability marks are dropped.
         let stale_marks = self.configs.get(&id).is_some_and(|old| {
             if config.config().ptz.unsupported().is_empty() {
@@ -1103,6 +1128,87 @@ mod tests {
         addr["ptz"]["onvifAddr"] = json!("http://other:8899/onvif/device_service");
         manager
             .monitor_set(serde_json::from_value(addr).unwrap())
+            .await
+            .unwrap();
+        let got = manager.monitor_config(m_id("cam")).await.unwrap().unwrap();
+        assert!(got.config().ptz.unsupported().is_empty());
+
+        stop_manager(token, tracker).await;
+    }
+
+    #[tokio::test]
+    async fn monitor_set_unions_ptz_marks_on_same_endpoint() {
+        let (token, tracker, _temp_dir, _, manager) = new_test_manager().await;
+        let base = || {
+            json!({
+                "id": "cam", "name": "cam", "enable": false,
+                "source": "rtsp",
+                "sourcertsp": {"protocol": "tcp", "mainStream": "rtsp://x1"},
+                "alwaysRecord": false, "videoLength": 0.0,
+                "ptz": {
+                    "enable": true, "onvifAddr": "",
+                    "unsupported": ["getPresets", "home"],
+                },
+            })
+        };
+
+        manager
+            .monitor_set(serde_json::from_value(base()).unwrap())
+            .await
+            .unwrap();
+
+        // Stale form payload: loaded before `home` faulted mid-session.
+        // Same endpoint → stored marks merge with the stale incoming set.
+        let mut stale = base();
+        stale["ptz"]["unsupported"] = json!(["getPresets"]);
+        manager
+            .monitor_set(serde_json::from_value(stale).unwrap())
+            .await
+            .unwrap();
+        let got = manager.monitor_config(m_id("cam")).await.unwrap().unwrap();
+        assert_eq!(&["getPresets", "home"], got.config().ptz.unsupported());
+
+        // An incoming payload lacking the field entirely unions to stored.
+        let mut bare = base();
+        bare["ptz"].as_object_mut().unwrap().remove("unsupported");
+        manager
+            .monitor_set(serde_json::from_value(bare).unwrap())
+            .await
+            .unwrap();
+        let got = manager.monitor_config(m_id("cam")).await.unwrap().unwrap();
+        assert_eq!(&["getPresets", "home"], got.config().ptz.unsupported());
+
+        stop_manager(token, tracker).await;
+    }
+
+    #[tokio::test]
+    async fn monitor_set_union_still_clears_on_endpoint_change() {
+        let (token, tracker, _temp_dir, _, manager) = new_test_manager().await;
+        let base = || {
+            json!({
+                "id": "cam", "name": "cam", "enable": false,
+                "source": "rtsp",
+                "sourcertsp": {"protocol": "tcp", "mainStream": "rtsp://x1"},
+                "alwaysRecord": false, "videoLength": 0.0,
+                "ptz": {
+                    "enable": true, "onvifAddr": "",
+                    "unsupported": ["home"],
+                },
+            })
+        };
+
+        manager
+            .monitor_set(serde_json::from_value(base()).unwrap())
+            .await
+            .unwrap();
+
+        // Empty incoming set + endpoint change → union restores the mark
+        // into the config first, then the endpoint-diff clears it.
+        let mut changed = base();
+        changed["ptz"]["unsupported"] = json!([]);
+        changed["sourcertsp"]["mainStream"] = json!("rtsp://x2");
+        manager
+            .monitor_set(serde_json::from_value(changed).unwrap())
             .await
             .unwrap();
         let got = manager.monitor_config(m_id("cam")).await.unwrap().unwrap();
