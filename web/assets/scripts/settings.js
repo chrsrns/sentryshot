@@ -25,6 +25,7 @@ import {
 	newPasswordField,
 } from "./components/form.js";
 import { newModal } from "./components/modal.js";
+import { newPtzController } from "./components/ptz.js";
 
 /** @typedef {import("./components/form.js").InputRule} InputRule */
 
@@ -1287,9 +1288,6 @@ function newPtzField(csrfToken, getMonitorId) {
 	};
 }
 
-/** Milliseconds between move heartbeats while a pad/zoom button is held. */
-const PTZ_HEARTBEAT_MS = 1500;
-
 /**
  * PTZ test panel: direction pad + zoom hold-to-move, home, preset list.
  * Visibility is driven by the ptz field's set() — shown only when a
@@ -1325,157 +1323,15 @@ function newPtzPanel(csrfToken, getMonitorId) {
 	const presetsElem = /** @type {HTMLElement} */ (elem.querySelector(".js-ptz-presets"));
 	const nameInput = /** @type {HTMLInputElement} */ (elem.querySelector(".js-ptz-name"));
 
-	/** @param {number} status @param {any} body */
-	const showError = (status, body) => {
-		const detail = body === undefined || body === null ? "" : `: ${typeof body === "string" ? body : JSON.stringify(body)}`;
-		errorElem.textContent = `${status}${detail}`;
-	};
-
-	/** @param {object} cmd */
-	const send = async (cmd) => {
-		const { status, body } = await fetchPostJson(
-			`api/monitor/ptz?id=${getMonitorId()}`,
-			cmd,
-			csrfToken,
-		).catch(() => ({ status: 0, body: undefined }));
-		if (status === 0) {
-			errorElem.textContent = "network error";
-			return 0;
-		}
-		if (status !== 200) {
-			showError(status, body);
-		}
-		return status;
-	};
-
-	/** @type {ReturnType<typeof setInterval>|undefined} */
-	let heartbeat;
-	let inFlight = false;
-	let moving = false;
-
-	/** @param {{pan?: number, tilt?: number, zoom?: number}} vel */
-	const move = async (vel) => {
-		if (inFlight) {
-			return; // Skip beat while a prior move is still in-flight.
-		}
-		inFlight = true;
-		try {
-			await send(Object.assign({ command: "move" }, vel));
-		} finally {
-			inFlight = false;
-		}
-	};
-
-	const stop = () => {
-		send({ command: "stop" });
-	};
-
-	/** @param {{pan?: number, tilt?: number, zoom?: number}} vel */
-	const holdStart = (vel) => {
-		releaseHold(false); // clear any stale state without a stop.
-		moving = true;
-		move(vel);
-		heartbeat = setInterval(() => {
-			move(vel);
-		}, PTZ_HEARTBEAT_MS);
-	};
-
-	/** @param {boolean} sendStop */
-	const releaseHold = (sendStop) => {
-		if (heartbeat !== undefined) {
-			clearInterval(heartbeat);
-			heartbeat = undefined;
-		}
-		if (moving) {
-			moving = false;
-			if (sendStop) {
-				stop();
-			}
-		}
-	};
-
-	for (const btn of /** @type {NodeListOf<HTMLElement>} */ (
-		elem.querySelectorAll(".ptz-hold")
-	)) {
-		const vel = {};
-		for (const axis of ["pan", "tilt", "zoom"]) {
-			if (btn.dataset[axis] !== undefined) {
-				// @ts-ignore
-				vel[axis] = Number(btn.dataset[axis]);
-			}
-		}
-		btn.addEventListener("pointerdown", (e) => {
-			e.preventDefault();
-			holdStart(vel);
-		});
-		for (const ev of ["pointerup", "pointerleave", "pointercancel"]) {
-			btn.addEventListener(ev, () => {
-				releaseHold(true);
-			});
-		}
-	}
+	const controller = newPtzController(csrfToken, getMonitorId, errorElem);
+	controller.bindHold(elem);
 	// @ts-ignore
 	elem.querySelector(".js-ptz-home").onclick = () => {
-		send({ command: "home" });
+		controller.send({ command: "home" });
 	};
-	// @ts-ignore
-	elem.querySelector(".js-ptz-save").onclick = async () => {
-		const name = nameInput.value;
-		if (name === "") {
-			errorElem.textContent = "preset name required";
-			return;
-		}
-		if (name.length > 64) {
-			errorElem.textContent = "preset name must be 64 characters or less";
-			return;
-		}
-		const status = await send({ command: "setPreset", presetName: name });
-		if (status === 200) {
-			nameInput.value = "";
-			await loadPresets();
-		}
-	};
-
-	const loadPresets = async () => {
-		const { status, body } = await fetchPostJson(
-			`api/monitor/ptz?id=${getMonitorId()}`,
-			{ command: "getPresets" },
-			csrfToken,
-		).catch(() => ({ status: 0, body: undefined }));
-		if (status !== 200) {
-			showError(status, body);
-			return;
-		}
-		const presets = body === undefined ? [] : body.presets || [];
-		presetsElem.replaceChildren();
-		for (const p of presets) {
-			const row = htmlToElem(/* HTML */ `
-				<div class="flex gap-1 items-center">
-					<span class="js-ptz-preset-name"></span>
-					<button type="button" class="js-ptz-recall px-2 rounded-lg bg-color2 hover:bg-color3">recall</button>
-					<button type="button" class="js-ptz-delete px-2 rounded-lg bg-color2 hover:bg-color3">delete</button>
-				</div>
-			`);
-			// textContent only — device-supplied strings.
-			row.querySelector(".js-ptz-preset-name").textContent = p.name;
-			// @ts-ignore
-			row.querySelector(".js-ptz-recall").onclick = () => {
-				send({ command: "gotoPreset", presetToken: p.token });
-			};
-			// @ts-ignore
-			row.querySelector(".js-ptz-delete").onclick = async () => {
-				const status = await send({ command: "removePreset", presetToken: p.token });
-				if (status === 200) {
-					await loadPresets();
-				}
-			};
-			presetsElem.append(row);
-		}
-	};
-
-	const onBlur = () => {
-		releaseHold(true);
-	};
+	controller.bindPresetSave(nameInput, /** @type {Element} */ (elem.querySelector(".js-ptz-save")), () =>
+		controller.loadPresets(presetsElem),
+	);
 
 	/** @type {MutationObserver|undefined} */
 	let observer;
@@ -1484,21 +1340,20 @@ function newPtzPanel(csrfToken, getMonitorId) {
 		elem,
 		show() {
 			elem.hidden = false;
-			loadPresets();
-			window.addEventListener("blur", onBlur);
+			controller.loadPresets(presetsElem);
+			controller.attach();
 			// Unmount/navigation-away: cancel the heartbeat + stop. The
 			// camera-side Timeout still bounds a stop lost on unload.
 			observer = new MutationObserver(() => {
 				if (!elem.isConnected) {
-					releaseHold(true);
+					controller.release();
 				}
 			});
 			observer.observe(document.body, { childList: true, subtree: true });
 		},
 		hide() {
 			elem.hidden = true;
-			releaseHold(true);
-			window.removeEventListener("blur", onBlur);
+			controller.detach();
 			if (observer !== undefined) {
 				observer.disconnect();
 				observer = undefined;

@@ -175,3 +175,82 @@ test("fullscreen", () => {
 	expect(isFullscreen(0)).toBe(true);
 	expect(isFullscreen(1)).toBe(false);
 });
+
+describe("live ptz overlay", () => {
+	const mkMonitors = () => [
+		{ enable: true, id: "m1", name: "cam1", hasSubStream: false },
+		{ enable: true, id: "m2", name: "cam2", hasSubStream: false },
+	];
+	const mkPtz = (isAdmin) => ({
+		isAdmin,
+		csrfToken: "tok",
+		configs: {
+			m1: { ptz: { enable: true, onvifAddr: "" } },
+			m2: { ptz: { enable: false, onvifAddr: "" } },
+		},
+	});
+
+	test("pad rendered for admin on ptz-enabled monitors only", () => {
+		uidReset();
+		document.body.innerHTML = `<div></div>`;
+		const element = document.querySelector("div");
+		global.fetch = () => Promise.reject(new Error("no network"));
+		// @ts-ignore
+		newViewer(element, mkMonitors(), "hls", mkPtz(true)).reset();
+
+		expect(document.querySelectorAll(".js-ptz-live-pad")).toHaveLength(1);
+		expect(document.querySelectorAll(".js-ptz-live-marker")).toHaveLength(
+			1,
+		);
+	});
+
+	test("no pad for non-admin or disabled monitors", () => {
+		uidReset();
+		document.body.innerHTML = `<div></div>`;
+		const element = document.querySelector("div");
+		global.fetch = () => Promise.reject(new Error("no network"));
+		// @ts-ignore
+		newViewer(element, mkMonitors(), "hls", mkPtz(false)).reset();
+
+		expect(document.querySelectorAll(".js-ptz-live-pad")).toHaveLength(0);
+	});
+
+	test("hold sends move and release sends stop via the shared route", async () => {
+		uidReset();
+		document.body.innerHTML = `<div></div>`;
+		const element = document.querySelector("div");
+		const calls = [];
+		global.fetch = (url, opts) => {
+			calls.push({ url, body: JSON.parse(opts.body) });
+			return Promise.resolve({
+				status: 200,
+				json: () => Promise.resolve({ presets: [] }),
+			});
+		};
+		// @ts-ignore
+		newViewer(element, mkMonitors(), "hls", mkPtz(true)).reset();
+		for (let i = 0; i < 5; i++) {
+			await Promise.resolve();
+		}
+
+		const pad = document.querySelector(".js-ptz-live-pad");
+		const btn = pad.querySelector('[data-tilt="0.5"]');
+		btn.dispatchEvent(new window.Event("pointerdown"));
+		for (let i = 0; i < 5; i++) {
+			await Promise.resolve();
+		}
+		expect(
+			calls.some(
+				(c) =>
+					c.url.includes("api/monitor/ptz?id=m1") &&
+					c.body.command === "move" &&
+					c.body.tilt === 0.5,
+			),
+		).toBe(true);
+		btn.dispatchEvent(new window.Event("pointerup"));
+		for (let i = 0; i < 5; i++) {
+			await Promise.resolve();
+		}
+		expect(calls.some((c) => c.body.command === "stop")).toBe(true);
+	});
+});

@@ -9,6 +9,7 @@ import {
 	newOptionsMenuBtn,
 } from "./components/optionsMenu.js";
 import { newStreamer, newStreamerBtn } from "./components/streamer.js";
+import { newLivePtz } from "./components/ptz.js";
 
 /**
  * @typedef {import("./libs/common.js").MonitorInfo} MonitorInfo
@@ -19,11 +20,19 @@ import { newStreamer, newStreamerBtn } from "./components/streamer.js";
  */
 
 /**
+ * @typedef {Object} LivePtzOptions
+ * @property {boolean} isAdmin
+ * @property {string} csrfToken
+ * @property {{[x: string]: any}} configs
+ */
+
+/**
  * @param {Element} $parent
  * @param {MonitorsInfo} monitors
  * @param {"hls" | "sp"} streamer
+ * @param {LivePtzOptions=} ptz
  */
-function newViewer($parent, monitors, streamer) {
+function newViewer($parent, monitors, streamer, ptz) {
 	/** @type {string[]} */
 	let selectedMonitors = [];
 	/** @param {MonitorInfo} monitor */
@@ -73,6 +82,16 @@ function newViewer($parent, monitors, streamer) {
 					fullscreenBtn,
 					//newMp4StreamBtn.mute(monitor),
 				];
+				if (ptz !== undefined && ptz.isAdmin) {
+					const cfg = ptz.configs[monitor.id];
+					if (
+						cfg !== undefined &&
+						cfg["ptz"] !== undefined &&
+						cfg["ptz"]["enable"] === true
+					) {
+						buttons.push(newLivePtz(ptz.csrfToken, monitor.id));
+					}
+				}
 				feeds.push(newStreamer(monitor, preferLowRes, streamer, buttons));
 			}
 
@@ -143,7 +162,11 @@ function resBtn(content) {
 /** @param {UiData} uiData */
 function init(uiData) {
 	const $contentGrid = document.getElementById("js-content-grid");
-	const viewer = newViewer($contentGrid, uiData.monitorsInfo, uiData.flags.streamer);
+	const viewer = newViewer($contentGrid, uiData.monitorsInfo, uiData.flags.streamer, {
+		isAdmin: uiData.isAdmin,
+		csrfToken: uiData.csrfToken,
+		configs: uiData.monitors,
+	});
 
 	/** @type {Element[]} */
 	let buttons = [...newOptionsBtn.gridSize(viewer), resBtn(viewer)];
