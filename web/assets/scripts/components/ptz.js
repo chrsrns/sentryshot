@@ -6,6 +6,11 @@ import { fetchPostJson, htmlToElem } from "../libs/common.js";
 
 export const PTZ_HEARTBEAT_MS = 1500;
 
+/** A press held this long upgrades from tap-pulse to hold semantics. */
+export const PTZ_UPGRADE_MS = 300;
+/** Tap-pulse magnitude — sign preserved, fixed per axis. */
+const PULSE_VELOCITY = 0.25;
+
 const UNSUPPORTED_TITLE = "unsupported on this camera";
 
 /**
@@ -28,7 +33,7 @@ export function newPtzController(csrfToken, getMonitorId, errorElem) {
 	};
 
 	/** @param {object} cmd */
-	const send = async (cmd) => {
+	const doSend = async (cmd) => {
 		const { status, body } = await fetchPostJson(
 			`api/monitor/ptz?id=${getMonitorId()}`,
 			cmd,
@@ -46,9 +51,30 @@ export function newPtzController(csrfToken, getMonitorId, errorElem) {
 		return status;
 	};
 
+	// Per-surface send queue: each command's fetch dispatches only after
+	// the prior one settles. The server lock orders by arrival — queuing
+	// here is what keeps a release `stop` from overtaking its `move` on
+	// the wire. `pending` counts queued-unsent + awaiting-response, which
+	// is the heartbeat's in-flight signal.
+	let queue = Promise.resolve();
+	let pending = 0;
+	const settled = () => {};
+	/** @param {object} cmd */
+	const send = (cmd) => {
+		pending++;
+		const result = queue.then(() => doSend(cmd));
+		queue = result.then(settled, settled);
+		return result.finally(() => {
+			pending--;
+		});
+	};
+
 	/** @type {ReturnType<typeof setInterval>|undefined} */
 	let heartbeat;
-	let inFlight = false;
+	/** @type {ReturnType<typeof setTimeout>|undefined} */
+	let upgradeTimer;
+	/** The pointer that initiated the active hold — gates releases. */
+	let holdPointerId;
 	let moving = false;
 	let attached = false;
 	/** Commands the camera reported unsupported (FE-known marks). */
@@ -66,6 +92,11 @@ export function newPtzController(csrfToken, getMonitorId, errorElem) {
 			clearInterval(heartbeat);
 			heartbeat = undefined;
 		}
+		if (upgradeTimer !== undefined) {
+			clearTimeout(upgradeTimer);
+			upgradeTimer = undefined;
+		}
+		holdPointerId = undefined;
 		if (moving) {
 			moving = false;
 			if (sendStop) {
@@ -74,30 +105,51 @@ export function newPtzController(csrfToken, getMonitorId, errorElem) {
 		}
 	};
 
-	/** @param {{pan?: number, tilt?: number, zoom?: number}} vel */
-	const move = async (vel) => {
-		if (inFlight) {
-			return; // Skip beat while a prior move is still in-flight.
-		}
-		inFlight = true;
-		try {
-			const status = await send(Object.assign({ command: "move" }, vel));
-			if (status !== 200) {
-				releaseHold(true); // Faulted move — cancel + release semantics.
-			}
-		} finally {
-			inFlight = false;
+	/**
+	 * Enqueue a `move` at `vel` with camera-side `timeout`. A non-200
+	 * cancels the hold (release semantics — the faulted move may have
+	 * actuated motion, so `stop` still goes out).
+	 *
+	 * @param {{pan?: number, tilt?: number, zoom?: number}} vel
+	 * @param {string} timeout
+	 */
+	const move = async (vel, timeout) => {
+		const status = await send(Object.assign({ command: "move" }, vel, { timeout }));
+		if (status !== 200) {
+			releaseHold(true);
 		}
 	};
 
-	/** @param {{pan?: number, tilt?: number, zoom?: number}} vel */
-	const holdStart = (vel) => {
+	/**
+	 * Every press starts as a tap-pulse: `sign(v)·0.25` per axis with a
+	 * `PT0.5S` camera-side timeout. Still held at PTZ_UPGRADE_MS the
+	 * press upgrades to full-velocity hold semantics + heartbeat.
+	 *
+	 * @param {{pan?: number, tilt?: number, zoom?: number}} vel
+	 * @param {number} pointerId
+	 */
+	const holdStart = (vel, pointerId) => {
 		releaseHold(false); // clear any stale state without a stop.
 		moving = true;
-		move(vel);
-		heartbeat = setInterval(() => {
-			move(vel);
-		}, PTZ_HEARTBEAT_MS);
+		holdPointerId = pointerId;
+		const pulse = /** @type {{pan?: number, tilt?: number, zoom?: number}} */ ({});
+		for (const axis of /** @type {const} */ (["pan", "tilt", "zoom"])) {
+			if (vel[axis] !== undefined) {
+				pulse[axis] = Math.sign(vel[axis]) * PULSE_VELOCITY;
+			}
+		}
+		move(pulse, "PT0.5S");
+		upgradeTimer = setTimeout(() => {
+			upgradeTimer = undefined;
+			move(vel, "PT2S");
+			heartbeat = setInterval(() => {
+				// Droppable: skip the beat while a command is queued or
+				// awaiting response — pulses/upgrades/stops still enqueue.
+				if (pending === 0) {
+					move(vel, "PT2S");
+				}
+			}, PTZ_HEARTBEAT_MS);
+		}, PTZ_UPGRADE_MS);
 	};
 
 	const onBlur = () => {
@@ -189,11 +241,18 @@ export function newPtzController(csrfToken, getMonitorId, errorElem) {
 					}
 				}
 				btn.addEventListener("pointerdown", (e) => {
+					if (e.button !== 0) {
+						return; // Aux presses don't actuate.
+					}
 					e.preventDefault();
-					holdStart(vel);
+					holdStart(vel, e.pointerId);
 				});
 				for (const ev of ["pointerup", "pointerleave", "pointercancel"]) {
-					btn.addEventListener(ev, () => {
+					btn.addEventListener(ev, (e) => {
+						const pointerId = /** @type {PointerEvent} */ (e).pointerId;
+						if (holdPointerId !== undefined && pointerId !== holdPointerId) {
+							return; // A different press's release can't cancel this hold.
+						}
 						releaseHold(true);
 					});
 				}
@@ -395,15 +454,17 @@ export function newLivePtz(csrfToken, monitorId) {
 	const refresh = () => {
 		controller
 			.capabilities()
-			.then((res) => {
+			.then(async (res) => {
 				if (!res.ok) {
-					return res; // Failed query isn't a result — keep prior marks.
+					return; // Failed query isn't a result — keep prior marks.
 				}
 				const skip = applyPtzCapabilities(rail, res.unsupported, () =>
 					controller.release(),
 				);
 				applyPtzCapabilities(popover, res.unsupported);
-				return skip ? res : controller.loadPresets(presetsElem);
+				if (!skip) {
+					await controller.loadPresets(presetsElem);
+				}
 			})
 			.catch(() => {});
 	};

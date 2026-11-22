@@ -54,6 +54,9 @@ pub enum Error {
     #[error("velocity out of range −1.0..=1.0")]
     BadVelocity,
 
+    #[error("timeout not in allowlist PT0.5S/PT1S/PT2S")]
+    BadTimeout,
+
     #[error("preset name empty or over 64 characters")]
     BadPresetName,
 
@@ -65,11 +68,14 @@ pub enum Error {
 #[async_trait]
 pub trait PtzClient: Send + Sync {
     /// Continuous move; absent velocities leave that axis untouched.
+    /// `timeout` is the camera-side bound — allowlist-enforced
+    /// (`PT0.5S`/`PT1S`/`PT2S`, default `PT2S`).
     async fn move_cam(
         &self,
         pan: Option<f64>,
         tilt: Option<f64>,
         zoom: Option<f64>,
+        timeout: Option<&str>,
     ) -> Result<(), Error>;
 
     /// Stop all axes.
@@ -108,6 +114,7 @@ pub struct PtzCommand {
     pub pan: Option<f64>,
     pub tilt: Option<f64>,
     pub zoom: Option<f64>,
+    pub timeout: Option<String>,
     #[serde(rename = "presetToken")]
     pub preset_token: Option<String>,
     #[serde(rename = "presetName")]
@@ -418,11 +425,16 @@ impl PtzClient for OnvifPtz {
         pan: Option<f64>,
         tilt: Option<f64>,
         zoom: Option<f64>,
+        timeout: Option<&str>,
     ) -> Result<(), Error> {
         for v in [pan, tilt, zoom].into_iter().flatten() {
             if !(-1.0..=1.0).contains(&v) {
                 return Err(Error::BadVelocity);
             }
+        }
+        let timeout = timeout.unwrap_or(CAMERA_TIMEOUT);
+        if !["PT0.5S", "PT1S", "PT2S"].contains(&timeout) {
+            return Err(Error::BadTimeout);
         }
         self.op(|s| {
             let pantilt = if pan.is_some() || tilt.is_some() {
@@ -439,7 +451,7 @@ impl PtzClient for OnvifPtz {
             });
             let velocity = pantilt + &zoom_el;
             format!(
-                r#"<tptz:ContinuousMove xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"><tptz:ProfileToken>{}</tptz:ProfileToken><tptz:Velocity>{velocity}</tptz:Velocity><tptz:Timeout>{CAMERA_TIMEOUT}</tptz:Timeout></tptz:ContinuousMove>"#,
+                r#"<tptz:ContinuousMove xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"><tptz:ProfileToken>{}</tptz:ProfileToken><tptz:Velocity>{velocity}</tptz:Velocity><tptz:Timeout>{timeout}</tptz:Timeout></tptz:ContinuousMove>"#,
                 onvif::xml_escape(&s.profile_token),
             )
         })
@@ -729,7 +741,10 @@ mod tests {
         let device = spawn_stub(stub.clone()).await;
         let client = OnvifPtz::new(device, (String::new(), String::new()));
 
-        client.move_cam(Some(0.5), Some(-0.25), None).await.unwrap();
+        client
+            .move_cam(Some(0.5), Some(-0.25), None, None)
+            .await
+            .unwrap();
 
         let log = stub.log.lock().unwrap().clone();
         assert_eq!(
@@ -758,12 +773,43 @@ mod tests {
         let device = spawn_stub(stub.clone()).await;
         let client = OnvifPtz::new(device, (String::new(), String::new()));
 
-        client.move_cam(None, None, Some(0.8)).await.unwrap();
+        client.move_cam(None, None, Some(0.8), None).await.unwrap();
 
         let bodies = stub.bodies.lock().unwrap().clone();
         let mv = bodies.last().unwrap();
         assert!(!mv.contains("tt:PanTilt"));
         assert!(mv.contains(r#"tt:Zoom xmlns:tt="http://www.onvif.org/ver10/schema" x="0.8""#));
+    }
+
+    #[tokio::test]
+    async fn move_timeout_interpolated() {
+        let stub = new_stub();
+        let device = spawn_stub(stub.clone()).await;
+        let client = OnvifPtz::new(device, (String::new(), String::new()));
+
+        client
+            .move_cam(Some(0.5), None, None, Some("PT0.5S"))
+            .await
+            .unwrap();
+
+        let bodies = stub.bodies.lock().unwrap().clone();
+        let mv = bodies.last().unwrap();
+        assert!(mv.contains("<tptz:Timeout>PT0.5S</tptz:Timeout>"));
+    }
+
+    #[tokio::test]
+    async fn move_timeout_outside_allowlist_rejected() {
+        let stub = new_stub();
+        let device = spawn_stub(stub.clone()).await;
+        let client = OnvifPtz::new(device, (String::new(), String::new()));
+
+        // The seam re-checks the allowlist — the value interpolates
+        // into the SOAP body, so no camera traffic on rejection.
+        assert!(matches!(
+            client.move_cam(Some(0.5), None, None, Some("PT3S")).await,
+            Err(Error::BadTimeout)
+        ));
+        assert!(stub.log.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -810,7 +856,7 @@ mod tests {
         let client = OnvifPtz::new(device, (String::new(), String::new()));
 
         assert!(matches!(
-            client.move_cam(Some(0.1), None, None).await,
+            client.move_cam(Some(0.1), None, None, None).await,
             Err(Error::NoPtzProfile)
         ));
     }
@@ -832,7 +878,7 @@ mod tests {
         let device = spawn_stub(stub.clone()).await;
         let client = OnvifPtz::new(device, (String::new(), String::new()));
 
-        client.move_cam(Some(0.5), None, None).await.unwrap();
+        client.move_cam(Some(0.5), None, None, None).await.unwrap();
         client.stop().await.unwrap();
 
         let count = |action: &str| {
@@ -859,7 +905,7 @@ mod tests {
         let client = OnvifPtz::new(device, (String::new(), String::new()));
 
         assert!(matches!(
-            client.move_cam(Some(0.5), None, None).await,
+            client.move_cam(Some(0.5), None, None, None).await,
             Err(Error::NoPtzProfile)
         ));
         // First chain + one re-resolve on the fault retry.
@@ -893,11 +939,11 @@ mod tests {
             (String::new(), String::new()),
         );
         assert!(matches!(
-            client.move_cam(Some(1.5), None, None).await,
+            client.move_cam(Some(1.5), None, None, None).await,
             Err(Error::BadVelocity)
         ));
         assert!(matches!(
-            client.move_cam(None, Some(-1.1), None).await,
+            client.move_cam(None, Some(-1.1), None, None).await,
             Err(Error::BadVelocity)
         ));
     }

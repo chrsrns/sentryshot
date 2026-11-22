@@ -799,7 +799,11 @@ pub async fn ptz_handler(
     }
 
     let result = match cmd.command.as_str() {
-        "move" => client.move_cam(cmd.pan, cmd.tilt, cmd.zoom).await,
+        "move" => {
+            client
+                .move_cam(cmd.pan, cmd.tilt, cmd.zoom, cmd.timeout.as_deref())
+                .await
+        }
         "stop" => client.stop().await,
         "home" => client.home().await,
         "getPresets" => match client.get_presets().await {
@@ -860,17 +864,34 @@ fn ptz_validate(cmd: &ptz::PtzCommand) -> Option<Response> {
                     return bad("velocity out of range −1.0..=1.0");
                 }
             }
+            if let Some(t) = &cmd.timeout {
+                if !["PT0.5S", "PT1S", "PT2S"].contains(&t.as_str()) {
+                    return bad("timeout must be PT0.5S, PT1S, or PT2S");
+                }
+            }
         }
         "gotoPreset" | "removePreset" => {
+            if cmd.timeout.is_some() {
+                return bad("timeout applies to move only");
+            }
             if cmd.preset_token.is_none() {
                 return bad("presetToken required");
             }
         }
-        "setPreset" => match &cmd.preset_name {
-            Some(name) if !name.is_empty() && name.chars().count() <= 64 => {}
-            _ => return bad("presetName required, 1..=64 chars"),
-        },
-        "stop" | "home" | "getPresets" | "capabilities" => {}
+        "setPreset" => {
+            if cmd.timeout.is_some() {
+                return bad("timeout applies to move only");
+            }
+            match &cmd.preset_name {
+                Some(name) if !name.is_empty() && name.chars().count() <= 64 => {}
+                _ => return bad("presetName required, 1..=64 chars"),
+            }
+        }
+        "stop" | "home" | "getPresets" | "capabilities" => {
+            if cmd.timeout.is_some() {
+                return bad("timeout applies to move only");
+            }
+        }
         _ => return bad("unknown command"),
     }
     None
@@ -931,7 +952,16 @@ async fn ptz_capabilities(
 }
 
 fn ptz_error_response(e: &ptz::Error) -> Response {
-    (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
+    // Seam-level validation failures are client errors, not camera
+    // faults — route validation catches them first, but a caller
+    // bypassing it shouldn't mislabel a 400-class problem as 502.
+    let status = match e {
+        ptz::Error::BadVelocity | ptz::Error::BadTimeout | ptz::Error::BadPresetName => {
+            StatusCode::BAD_REQUEST
+        }
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    (status, e.to_string()).into_response()
 }
 
 /// Write a capability mark into the stored monitor config —
