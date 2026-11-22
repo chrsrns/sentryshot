@@ -44,6 +44,12 @@ pub enum Error {
 
     #[error("velocity out of range −1.0..=1.0")]
     BadVelocity,
+
+    #[error("preset name empty or over 64 characters")]
+    BadPresetName,
+
+    #[error("no preset token in reply")]
+    NoPresetToken,
 }
 
 /// PTZ command surface — mockable seam for route tests.
@@ -62,6 +68,25 @@ pub trait PtzClient: Send + Sync {
 
     /// Move to the camera's home position.
     async fn goto_home(&self) -> Result<(), Error>;
+
+    /// All stored presets.
+    async fn get_presets(&self) -> Result<Vec<Preset>, Error>;
+
+    /// Store the current position under `name`; returns the token.
+    async fn set_preset(&self, name: &str) -> Result<String, Error>;
+
+    /// Move to a stored preset.
+    async fn goto_preset(&self, token: &str) -> Result<(), Error>;
+
+    /// Delete a stored preset.
+    async fn remove_preset(&self, token: &str) -> Result<(), Error>;
+}
+
+/// A stored preset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Preset {
+    pub token: String,
+    pub name: String,
 }
 
 /// Resolve the ONVIF device-service endpoint: a valid stored
@@ -380,6 +405,79 @@ impl PtzClient for OnvifPtz {
         .await?;
         Ok(())
     }
+
+    async fn get_presets(&self) -> Result<Vec<Preset>, Error> {
+        let text = self
+            .op(|s| {
+                format!(
+                    r#"<tptz:GetPresets xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"><tptz:ProfileToken>{}</tptz:ProfileToken></tptz:GetPresets>"#,
+                    onvif::xml_escape(&s.profile_token),
+                )
+            })
+            .await?;
+        let doc = onvif::parse_doc(&text)?;
+        let mut out = Vec::new();
+        for n in doc.descendants() {
+            if !(n.is_element() && n.tag_name().name() == "Preset") {
+                continue;
+            }
+            out.push(Preset {
+                token: n.attribute("token").unwrap_or_default().to_owned(),
+                name: n
+                    .children()
+                    .find(|c| c.is_element() && c.tag_name().name() == "Name")
+                    .and_then(|c| c.text())
+                    .unwrap_or_default()
+                    .to_owned(),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn set_preset(&self, name: &str) -> Result<String, Error> {
+        if name.is_empty() || name.chars().count() > 64 {
+            return Err(Error::BadPresetName);
+        }
+        let text = self
+            .op(|s| {
+                format!(
+                    r#"<tptz:SetPreset xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"><tptz:ProfileToken>{}</tptz:ProfileToken><tptz:PresetName>{}</tptz:PresetName></tptz:SetPreset>"#,
+                    onvif::xml_escape(&s.profile_token),
+                    onvif::xml_escape(name),
+                )
+            })
+            .await?;
+        let doc = onvif::parse_doc(&text)?;
+        onvif::find_text(&doc, "PresetToken")
+            .into_iter()
+            .next()
+            .map(str::to_owned)
+            .ok_or(Error::NoPresetToken)
+    }
+
+    async fn goto_preset(&self, token: &str) -> Result<(), Error> {
+        self.op(|s| {
+            format!(
+                r#"<tptz:GotoPreset xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"><tptz:ProfileToken>{}</tptz:ProfileToken><tptz:PresetToken>{}</tptz:PresetToken></tptz:GotoPreset>"#,
+                onvif::xml_escape(&s.profile_token),
+                onvif::xml_escape(token),
+            )
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn remove_preset(&self, token: &str) -> Result<(), Error> {
+        self.op(|s| {
+            format!(
+                r#"<tptz:RemovePreset xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"><tptz:ProfileToken>{}</tptz:ProfileToken><tptz:PresetToken>{}</tptz:PresetToken></tptz:RemovePreset>"#,
+                onvif::xml_escape(&s.profile_token),
+                onvif::xml_escape(token),
+            )
+        })
+        .await?;
+        Ok(())
+    }
 }
 
 /// Translate a non-200 reply into the spec'd fault taxonomy:
@@ -423,6 +521,10 @@ mod tests {
 
     const FAULT_NO_PTZ_PROFILE: &str = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><s:Fault><s:Code><s:Value>s:Sender</s:Value><s:Subcode><s:Value>ter:NoPTZProfile</s:Value></s:Subcode></s:Code><s:Reason><s:Text>ptz profile missing</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>"#;
 
+    const PRESETS_RESP: &str = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><tptz:GetPresetsResponse xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"><tptz:Preset token="1"><tt:Name xmlns:tt="http://www.onvif.org/ver10/schema">Gate</tt:Name></tptz:Preset><tptz:Preset token="2"><tt:Name xmlns:tt="http://www.onvif.org/ver10/schema">A &amp; B &lt;yard&gt;</tt:Name></tptz:Preset></tptz:GetPresetsResponse></s:Body></s:Envelope>"#;
+
+    const SET_PRESET_RESP: &str = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><tptz:SetPresetResponse xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"><tptz:PresetToken>9</tptz:PresetToken></tptz:SetPresetResponse></s:Body></s:Envelope>"#;
+
     const OK_RESP: &str = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body/></s:Envelope>"#;
 
     type Log = Arc<Mutex<Vec<String>>>;
@@ -447,6 +549,10 @@ mod tests {
             "GetCapabilities",
             "GetServices",
             "GetProfiles",
+            "GetPresets",
+            "SetPreset",
+            "GotoPreset",
+            "RemovePreset",
             "ContinuousMove",
             "GotoHomePosition",
             "Stop",
@@ -486,6 +592,8 @@ mod tests {
                 (axum::http::StatusCode::OK, PROFILES_NO_PTZ.into())
             }
             "GetProfiles" => (axum::http::StatusCode::OK, PROFILES_RESP.into()),
+            "GetPresets" => (axum::http::StatusCode::OK, PRESETS_RESP.into()),
+            "SetPreset" => (axum::http::StatusCode::OK, SET_PRESET_RESP.into()),
             _ if stub.fault_ops => (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 FAULT_NO_PTZ_PROFILE.into(),
@@ -657,6 +765,74 @@ mod tests {
         assert!(matches!(
             client.move_(None, Some(-1.1), None).await,
             Err(Error::BadVelocity)
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_presets_parses_tokens_and_names() {
+        let stub = new_stub();
+        let device = spawn_stub(stub.clone()).await;
+        let client = OnvifPtz::new(device, (String::new(), String::new()));
+
+        let presets = client.get_presets().await.unwrap();
+        assert_eq!(
+            vec![
+                Preset {
+                    token: "1".into(),
+                    name: "Gate".into(),
+                },
+                Preset {
+                    token: "2".into(),
+                    name: "A & B <yard>".into(),
+                },
+            ],
+            presets
+        );
+    }
+
+    #[tokio::test]
+    async fn set_preset_escapes_name_and_returns_token() {
+        let stub = new_stub();
+        let device = spawn_stub(stub.clone()).await;
+        let client = OnvifPtz::new(device, (String::new(), String::new()));
+
+        let token = client.set_preset("A & B <yard>").await.unwrap();
+        assert_eq!("9", token);
+
+        let bodies = stub.bodies.lock().unwrap().clone();
+        let req = bodies.last().unwrap();
+        assert!(req.contains("<tptz:PresetName>A &amp; B &lt;yard&gt;</tptz:PresetName>"));
+    }
+
+    #[tokio::test]
+    async fn goto_and_remove_preset_carry_token() {
+        let stub = new_stub();
+        let device = spawn_stub(stub.clone()).await;
+        let client = OnvifPtz::new(device, (String::new(), String::new()));
+
+        client.goto_preset("p<1").await.unwrap();
+        client.remove_preset("p2").await.unwrap();
+
+        let bodies = stub.bodies.lock().unwrap().clone();
+        let goto = bodies.iter().find(|b| b.contains("GotoPreset")).unwrap();
+        let remove = bodies.iter().find(|b| b.contains("RemovePreset")).unwrap();
+        assert!(goto.contains("<tptz:PresetToken>p&lt;1</tptz:PresetToken>"));
+        assert!(remove.contains("<tptz:PresetToken>p2</tptz:PresetToken>"));
+    }
+
+    #[tokio::test]
+    async fn preset_name_bounds() {
+        let client = OnvifPtz::new(
+            "http://x/onvif/device_service".to_owned(),
+            (String::new(), String::new()),
+        );
+        assert!(matches!(
+            client.set_preset("").await,
+            Err(Error::BadPresetName)
+        ));
+        assert!(matches!(
+            client.set_preset(&"x".repeat(65)).await,
+            Err(Error::BadPresetName)
         ));
     }
 }
