@@ -679,6 +679,10 @@ struct PtzEntry {
     key: String,
     client: ptz::ArcPtzClient,
     lock: tokio::sync::Mutex<()>,
+    /// Command names the camera faulted `not implemented`/`not
+    /// recognized` — session-scoped marks; persisted copies live in
+    /// `ptz.unsupported` on the monitor config.
+    unsupported: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 /// Builds and caches `PtzEntry`s per monitor.
@@ -717,6 +721,7 @@ impl PtzService {
                     key,
                     client: (self.factory)(endpoint, creds),
                     lock: tokio::sync::Mutex::new(()),
+                    unsupported: std::sync::Mutex::new(std::collections::HashSet::new()),
                 });
                 entries.insert(id.to_owned(), entry.clone());
                 entry
@@ -741,30 +746,8 @@ pub async fn ptz_handler(
     Query(query): Query<MonitorIdQuery>,
     Json(cmd): Json<ptz::PtzCommand>,
 ) -> Response {
-    // Command validation before any camera traffic.
-    let bad = |msg: &'static str| (StatusCode::BAD_REQUEST, msg).into_response();
-    match cmd.command.as_str() {
-        "move" => {
-            if cmd.pan.is_none() && cmd.tilt.is_none() && cmd.zoom.is_none() {
-                return bad("move requires at least one velocity");
-            }
-            for v in [cmd.pan, cmd.tilt, cmd.zoom].into_iter().flatten() {
-                if !(-1.0..=1.0).contains(&v) {
-                    return bad("velocity out of range −1.0..=1.0");
-                }
-            }
-        }
-        "gotoPreset" | "removePreset" => {
-            if cmd.preset_token.is_none() {
-                return bad("presetToken required");
-            }
-        }
-        "setPreset" => match &cmd.preset_name {
-            Some(name) if !name.is_empty() && name.chars().count() <= 64 => {}
-            _ => return bad("presetName required, 1..=64 chars"),
-        },
-        "stop" | "home" | "getPresets" => {}
-        _ => return bad("unknown command"),
+    if let Some(resp) = ptz_validate(&cmd) {
+        return resp;
     }
 
     let Some(Some(config)) = state.monitors.monitor_config(query.id.clone()).await else {
@@ -783,23 +766,52 @@ pub async fn ptz_handler(
         };
     let key = format!("{endpoint}\u{0}{}\u{0}{}", creds.0, creds.1);
     let entry = state.service.entry(&query.id, key, endpoint, creds);
+
+    // Persisted marks ∪ session marks — already-proven-unsupported
+    // commands short-circuit without a camera round trip.
+    let unsupported = |extra: &std::collections::HashSet<String>| {
+        config
+            .config()
+            .ptz
+            .unsupported()
+            .iter()
+            .cloned()
+            .chain(extra.iter().cloned())
+            .collect::<std::collections::HashSet<String>>()
+    };
+    {
+        let session = entry
+            .unsupported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let all = unsupported(&session);
+        if cmd.command != "capabilities" && all.contains(cmd.command.as_str()) {
+            return ptz_error_response(&ptz::Error::NotImplemented);
+        }
+    }
+
     // Serialized per monitor — move lands before stop, in request order.
     let _guard = entry.lock.lock().await;
     let client = &entry.client;
+
+    if cmd.command == "capabilities" {
+        return ptz_capabilities(&state, &query.id, &entry, &unsupported).await;
+    }
 
     let result = match cmd.command.as_str() {
         "move" => client.move_cam(cmd.pan, cmd.tilt, cmd.zoom).await,
         "stop" => client.stop().await,
         "home" => client.home().await,
-        "getPresets" => {
-            return match client.get_presets().await {
-                Ok(presets) => Json(ptz::PtzResponse {
+        "getPresets" => match client.get_presets().await {
+            Ok(presets) => {
+                return Json(ptz::PtzResponse {
                     presets: Some(presets),
+                    unsupported: None,
                 })
-                .into_response(),
-                Err(e) => ptz_error_response(&e),
-            };
-        }
+                .into_response();
+            }
+            Err(e) => Err(e),
+        },
         "setPreset" => {
             // Validated above.
             client
@@ -820,11 +832,135 @@ pub async fn ptz_handler(
         _ => unreachable!("validated above"),
     };
     match result {
-        Ok(()) => Json(ptz::PtzResponse { presets: None }).into_response(),
-        Err(e) => ptz_error_response(&e),
+        Ok(()) => Json(ptz::PtzResponse {
+            presets: None,
+            unsupported: None,
+        })
+        .into_response(),
+        Err(e) => {
+            if matches!(e, ptz::Error::NotImplemented) {
+                mark_unsupported(&state, &query.id, &entry, &cmd.command).await;
+            }
+            ptz_error_response(&e)
+        }
     }
+}
+
+/// Command validation — `Some(response)` on failure, before any
+/// camera traffic.
+fn ptz_validate(cmd: &ptz::PtzCommand) -> Option<Response> {
+    let bad = |msg: &'static str| Some((StatusCode::BAD_REQUEST, msg).into_response());
+    match cmd.command.as_str() {
+        "move" => {
+            if cmd.pan.is_none() && cmd.tilt.is_none() && cmd.zoom.is_none() {
+                return bad("move requires at least one velocity");
+            }
+            for v in [cmd.pan, cmd.tilt, cmd.zoom].into_iter().flatten() {
+                if !(-1.0..=1.0).contains(&v) {
+                    return bad("velocity out of range −1.0..=1.0");
+                }
+            }
+        }
+        "gotoPreset" | "removePreset" => {
+            if cmd.preset_token.is_none() {
+                return bad("presetToken required");
+            }
+        }
+        "setPreset" => match &cmd.preset_name {
+            Some(name) if !name.is_empty() && name.chars().count() <= 64 => {}
+            _ => return bad("presetName required, 1..=64 chars"),
+        },
+        "stop" | "home" | "getPresets" | "capabilities" => {}
+        _ => return bad("unknown command"),
+    }
+    None
+}
+
+/// Record a capability mark: session set + persisted
+/// `ptz.unsupported` on the stored monitor config.
+async fn mark_unsupported(
+    state: &Arc<PtzRouteState>,
+    monitor_id: &MonitorId,
+    entry: &Arc<PtzEntry>,
+    command: &str,
+) {
+    entry
+        .unsupported
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(command.to_owned());
+    persist_mark(state, monitor_id, command).await;
+}
+
+/// `capabilities` — eager `GetPresets` probe (safe read drives the
+/// session resolve; a `not implemented` fault marks `getPresets`
+/// before the FE ever asks for the list), then the persisted ∪
+/// session mark set. Caller holds the entry lock.
+async fn ptz_capabilities(
+    state: &Arc<PtzRouteState>,
+    monitor_id: &MonitorId,
+    entry: &Arc<PtzEntry>,
+    unsupported: &impl Fn(&std::collections::HashSet<String>) -> std::collections::HashSet<String>,
+) -> Response {
+    let probe_needed = {
+        let session = entry
+            .unsupported
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !unsupported(&session).contains("getPresets")
+    };
+    if probe_needed
+        && matches!(
+            entry.client.get_presets().await,
+            Err(ptz::Error::NotImplemented)
+        )
+    {
+        mark_unsupported(state, monitor_id, entry, "getPresets").await;
+    }
+    let session = entry
+        .unsupported
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut marks: Vec<String> = unsupported(&session).into_iter().collect();
+    marks.sort();
+    Json(ptz::PtzResponse {
+        presets: None,
+        unsupported: Some(marks),
+    })
+    .into_response()
 }
 
 fn ptz_error_response(e: &ptz::Error) -> Response {
     (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
+}
+
+/// Write a capability mark into the stored monitor config —
+/// `ptz.unsupported` gains `command`. Best-effort: a read-modify-write
+/// failure is ignored, the session mark still protects this session.
+async fn persist_mark(state: &Arc<PtzRouteState>, monitor_id: &MonitorId, command: &str) {
+    let Some(Some(mut stored)) = state.monitors.monitor_config(monitor_id.clone()).await else {
+        return;
+    };
+    let mut marks: Vec<String> = stored.config().ptz.unsupported().to_vec();
+    if marks.iter().any(|c| c == command) {
+        return;
+    }
+    marks.push(command.to_owned());
+    marks.sort();
+    if let Some(ptz_obj) = stored
+        .raw_mut()
+        .as_object_mut()
+        .and_then(|raw| raw.get_mut("ptz"))
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        ptz_obj.insert("unsupported".to_owned(), serde_json::json!(marks));
+    } else {
+        return;
+    }
+    // Typed views deserialize once — re-parse before storing.
+    let Ok(stored) = serde_json::from_value::<common::monitor::MonitorConfig>(stored.raw().clone())
+    else {
+        return;
+    };
+    drop(state.monitors.monitor_set(stored).await);
 }

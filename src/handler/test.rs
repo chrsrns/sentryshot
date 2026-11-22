@@ -88,6 +88,7 @@ mod ptz {
 
     struct StubManager {
         config: Mutex<Option<MonitorConfig>>,
+        saved: Mutex<Vec<MonitorConfig>>,
     }
 
     #[async_trait]
@@ -100,9 +101,11 @@ mod ptz {
         }
         async fn monitor_set(
             &self,
-            _config: MonitorConfig,
+            config: MonitorConfig,
         ) -> Option<Result<bool, MonitorSetError>> {
-            unimplemented!()
+            *self.config.lock().unwrap() = Some(config.clone());
+            self.saved.lock().unwrap().push(config);
+            Some(Ok(false))
         }
         async fn monitor_set_and_restart(
             &self,
@@ -127,6 +130,9 @@ mod ptz {
     struct StubPtz {
         err: bool,
         presets: Vec<ptz::Preset>,
+        // op names that fault `not implemented` (B109 camera shape).
+        not_impl: std::collections::HashSet<&'static str>,
+        calls: Arc<Mutex<Vec<&'static str>>>,
     }
 
     #[async_trait]
@@ -143,21 +149,45 @@ mod ptz {
             Ok(())
         }
         async fn stop(&self) -> Result<(), ptz::Error> {
+            self.calls.lock().unwrap().push("stop");
+            if self.not_impl.contains("stop") {
+                return Err(ptz::Error::NotImplemented);
+            }
             Ok(())
         }
         async fn home(&self) -> Result<(), ptz::Error> {
+            self.calls.lock().unwrap().push("home");
+            if self.not_impl.contains("home") {
+                return Err(ptz::Error::NotImplemented);
+            }
             Ok(())
         }
         async fn get_presets(&self) -> Result<Vec<ptz::Preset>, ptz::Error> {
+            self.calls.lock().unwrap().push("getPresets");
+            if self.not_impl.contains("getPresets") {
+                return Err(ptz::Error::NotImplemented);
+            }
             Ok(self.presets.clone())
         }
         async fn set_preset(&self, _name: &str) -> Result<String, ptz::Error> {
+            self.calls.lock().unwrap().push("setPreset");
+            if self.not_impl.contains("setPreset") {
+                return Err(ptz::Error::NotImplemented);
+            }
             Ok("1".into())
         }
         async fn goto_preset(&self, _token: &str) -> Result<(), ptz::Error> {
+            self.calls.lock().unwrap().push("gotoPreset");
+            if self.not_impl.contains("gotoPreset") {
+                return Err(ptz::Error::NotImplemented);
+            }
             Ok(())
         }
         async fn remove_preset(&self, _token: &str) -> Result<(), ptz::Error> {
+            self.calls.lock().unwrap().push("removePreset");
+            if self.not_impl.contains("removePreset") {
+                return Err(ptz::Error::NotImplemented);
+            }
             Ok(())
         }
     }
@@ -209,6 +239,7 @@ mod ptz {
             State(Arc::new(PtzRouteState {
                 monitors: Arc::new(StubManager {
                     config: Mutex::new(config),
+                    saved: Mutex::new(vec![]),
                 }),
                 service: PtzService::new(Arc::new(move |endpoint, creds| {
                     *cap.lock().unwrap() = (endpoint, creds);
@@ -227,7 +258,31 @@ mod ptz {
         Arc::new(StubPtz {
             err,
             presets: vec![],
+            not_impl: std::collections::HashSet::new(),
+            calls: Arc::new(Mutex::new(vec![])),
         })
+    }
+
+    /// Monitor config carrying persisted capability marks — built
+    /// through serde so typed `ptz.unsupported` reflects raw.
+    fn monitor_config_marks(marks: &[&str]) -> MonitorConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": "m1", "name": "m", "enable": true,
+            "source": "rtsp",
+            "sourcertsp": {
+                "protocol": "tcp",
+                "mainStream": "rtsp://u%40x:p%40ss@cam/main",
+            },
+            "alwaysRecord": false, "videoLength": 0.0,
+            "ptz": {"enable": true, "onvifAddr": "", "unsupported": marks},
+        }))
+        .unwrap()
+    }
+
+    /// Monitor config with a raw `ptz` object (persist target) and no
+    /// marks.
+    fn monitor_config_ptz() -> MonitorConfig {
+        monitor_config_marks(&[])
     }
 
     #[tokio::test]
@@ -298,6 +353,8 @@ mod ptz {
                 token: "1".into(),
                 name: "Gate".into(),
             }],
+            not_impl: std::collections::HashSet::new(),
+            calls: Arc::new(Mutex::new(vec![])),
         });
         let (state, query, _) = harness(Some(monitor_config(true)), stub);
         let resp = ptz_handler(state, query, Json(cmd("getPresets"))).await;
@@ -388,6 +445,7 @@ mod ptz {
         }));
         let manager = Arc::new(StubManager {
             config: Mutex::new(Some(monitor_config(true))),
+            saved: Mutex::new(vec![]),
         });
         let state = Arc::new(PtzRouteState {
             monitors: manager.clone(),
@@ -422,5 +480,118 @@ mod ptz {
         let resp = ptz_handler(State(state), query(), Json(cmd("stop"))).await;
         assert_eq!(StatusCode::OK, resp.status());
         assert_eq!(2, *calls.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn capabilities_returns_persisted_marks() {
+        let calls = Arc::new(Mutex::new(vec![]));
+        let stub = Arc::new(StubPtz {
+            err: false,
+            presets: vec![],
+            not_impl: std::collections::HashSet::new(),
+            calls: calls.clone(),
+        });
+        let (state, query, _) = harness(Some(monitor_config_marks(&["home", "stop"])), stub);
+        let resp = ptz_handler(state, query, Json(cmd("capabilities"))).await;
+        assert_eq!(StatusCode::OK, resp.status());
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["unsupported"], serde_json::json!(["home", "stop"]));
+        // Eager probe ran — getPresets answered OK, no mark added.
+        assert_eq!(vec!["getPresets"], *calls.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn capabilities_probe_marks_and_persists() {
+        let calls = Arc::new(Mutex::new(vec![]));
+        let stub = Arc::new(StubPtz {
+            err: false,
+            presets: vec![],
+            not_impl: std::collections::HashSet::from(["getPresets"]),
+            calls: calls.clone(),
+        });
+        let manager = Arc::new(StubManager {
+            config: Mutex::new(Some(monitor_config_ptz())),
+            saved: Mutex::new(vec![]),
+        });
+        let state = Arc::new(PtzRouteState {
+            monitors: manager.clone(),
+            service: PtzService::new(Arc::new(move |_e, _c| stub.clone())),
+        });
+        let query = || {
+            Query(MonitorIdQuery {
+                id: "m1".to_owned().try_into().unwrap(),
+            })
+        };
+        let st = State(state.clone());
+        let resp = ptz_handler(st, query(), Json(cmd("capabilities"))).await;
+        assert_eq!(StatusCode::OK, resp.status());
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["unsupported"], serde_json::json!(["getPresets"]));
+
+        // Persisted into stored config — and a second call reads the
+        // mark without re-probing the camera.
+        let saved = manager.saved.lock().unwrap();
+        assert_eq!(1, saved.len());
+        assert_eq!(&["getPresets"], saved[0].config().ptz.unsupported());
+        drop(saved);
+        let resp = ptz_handler(State(state), query(), Json(cmd("capabilities"))).await;
+        assert_eq!(StatusCode::OK, resp.status());
+        assert_eq!(vec!["getPresets"], *calls.lock().unwrap());
+    }
+
+    #[tokio::test]
+    async fn marked_op_short_circuits_502() {
+        let calls = Arc::new(Mutex::new(vec![]));
+        let stub = Arc::new(StubPtz {
+            err: false,
+            presets: vec![],
+            not_impl: std::collections::HashSet::new(),
+            calls: calls.clone(),
+        });
+        let (state, query, _) = harness(Some(monitor_config_marks(&["home"])), stub);
+        let resp = ptz_handler(state, query, Json(cmd("home"))).await;
+        assert_eq!(StatusCode::BAD_GATEWAY, resp.status());
+        // ⊥ camera round trip — persisted mark did the answering.
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn op_fault_marks_and_short_circuits_next() {
+        let calls = Arc::new(Mutex::new(vec![]));
+        let stub = Arc::new(StubPtz {
+            err: false,
+            presets: vec![],
+            not_impl: std::collections::HashSet::from(["home"]),
+            calls: calls.clone(),
+        });
+        let manager = Arc::new(StubManager {
+            config: Mutex::new(Some(monitor_config_ptz())),
+            saved: Mutex::new(vec![]),
+        });
+        let state = Arc::new(PtzRouteState {
+            monitors: manager.clone(),
+            service: PtzService::new(Arc::new(move |_e, _c| stub.clone())),
+        });
+        let query = || {
+            Query(MonitorIdQuery {
+                id: "m1".to_owned().try_into().unwrap(),
+            })
+        };
+        let st = State(state.clone());
+        // First call — camera faults → marked + persisted.
+        let resp = ptz_handler(st, query(), Json(cmd("home"))).await;
+        assert_eq!(StatusCode::BAD_GATEWAY, resp.status());
+        assert_eq!(vec!["home"], *calls.lock().unwrap());
+        let saved = manager.saved.lock().unwrap();
+        assert_eq!(1, saved.len());
+        assert_eq!(&["home"], saved[0].config().ptz.unsupported());
+        drop(saved);
+
+        // Second call — persisted mark short-circuits, ⊥ camera call.
+        let resp = ptz_handler(State(state), query(), Json(cmd("home"))).await;
+        assert_eq!(StatusCode::BAD_GATEWAY, resp.status());
+        assert_eq!(vec!["home"], *calls.lock().unwrap());
     }
 }

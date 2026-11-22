@@ -104,11 +104,12 @@ Request body:
 }
 ```
 
-- `command`: `move` | `stop` | `home` | `getPresets` | `gotoPreset` | `setPreset` | `removePreset`
+- `command`: `move` | `stop` | `home` | `getPresets` | `gotoPreset` | `setPreset` | `removePreset` | `capabilities`
 - `move`: at least one of `pan`/`tilt`/`zoom` required, each −1.0..=1.0. The camera holds movement for ~2s (server-side `Timeout`) unless a `stop` follows.
 - `gotoPreset`/`removePreset`: `presetToken` required.
 - `setPreset`: `presetName` required, 1..=64 characters.
 - `stop`: stops all axes; `home`: moves to the camera home position.
+- `capabilities`: probes the camera and returns the unsupported-command list. Any op the camera faulted `not implemented`/`not recognized` is remembered in the monitor's `ptz.unsupported` and answered `502` on future calls without a camera round trip; the set clears when `ptz.onvifAddr` or `mainStream` changes.
 
 Response `200`:
 
@@ -118,14 +119,20 @@ Response `200`:
 }
 ```
 
-`presets` is present for `getPresets` only; other commands return `{}`.
+```json
+{
+	"unsupported": ["home", "getPresets"]
+}
+```
+
+`presets` is present for `getPresets` only, `unsupported` for `capabilities` only; other commands return `{}`.
 
 | Status | Meaning |
 | --- | --- |
 | `400` | unknown command, missing required field, out-of-range velocity, `presetName` empty or over 64 chars |
 | `404` | monitor does not exist |
 | `409` | monitor `ptz.enable` is not `true` |
-| `502` | camera fault or timeout |
+| `502` | camera fault or timeout, or a command the camera marked unsupported |
 
 
 ### POST /api/scan

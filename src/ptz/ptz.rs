@@ -46,6 +46,11 @@ pub enum Error {
     #[error("camera fault: {0}")]
     Fault(String),
 
+    /// Camera reported the op `not implemented`/`not recognized` —
+    /// a capability gap, not a transient fault.
+    #[error("command not implemented on this camera")]
+    NotImplemented,
+
     #[error("velocity out of range −1.0..=1.0")]
     BadVelocity,
 
@@ -110,11 +115,14 @@ pub struct PtzCommand {
 }
 
 /// `POST /api/monitor/ptz` response body — `presets` populated for
-/// `getPresets` only.
+/// `getPresets` only; `unsupported` for `capabilities` only.
 #[derive(Debug, Serialize)]
 pub struct PtzResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presets: Option<Vec<Preset>>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unsupported: Option<Vec<String>>,
 }
 
 /// Resolve the ONVIF device-service endpoint: a valid stored
@@ -378,6 +386,9 @@ impl OnvifPtz {
     /// ops that parse one.
     async fn op(&self, body_fn: impl Fn(&Session) -> String) -> Result<String, Error> {
         match self.run_op(&body_fn, false).await {
+            // Capability gap — the session is healthy; a re-resolve
+            // + retry cannot fix it.
+            e @ Err(Error::NotImplemented) => e,
             Err(e) => self.run_op(&body_fn, true).await.map_err(|_| e),
             ok => ok,
         }
@@ -546,6 +557,9 @@ fn fault_or(text: &str, status: u16) -> Error {
             }
         }
         if let Some(reason) = onvif::find_text(&doc, "Text").into_iter().next() {
+            if reason.contains("not implemented") || reason.contains("not recognized") {
+                return Error::NotImplemented;
+            }
             return Error::Fault(reason.to_owned());
         }
     }
@@ -572,6 +586,8 @@ mod tests {
     const PROFILES_NO_PTZ: &str = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><trt:GetProfilesResponse xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><trt:Profiles token="plain"><tt:Name xmlns:tt="http://www.onvif.org/ver10/schema">Main</tt:Name></trt:Profiles></trt:GetProfilesResponse></s:Body></s:Envelope>"#;
 
     const FAULT_NO_PTZ_PROFILE: &str = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><s:Fault><s:Code><s:Value>s:Sender</s:Value><s:Subcode><s:Value>ter:NoPTZProfile</s:Value></s:Subcode></s:Code><s:Reason><s:Text>ptz profile missing</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>"#;
+    // V380 partial-PTZ phrasing (B109).
+    const FAULT_NOT_IMPL: &str = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><s:Fault><s:Code><s:Value>s:Sender</s:Value></s:Code><s:Reason><s:Text>Method 'tptz:GetPresets' not implemented: method name or namespace not recognized</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>"#;
 
     const PRESETS_RESP: &str = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><tptz:GetPresetsResponse xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl"><tptz:Preset token="1"><tt:Name xmlns:tt="http://www.onvif.org/ver10/schema">Gate</tt:Name></tptz:Preset><tptz:Preset token="2"><tt:Name xmlns:tt="http://www.onvif.org/ver10/schema">A &amp; B &lt;yard&gt;</tt:Name></tptz:Preset></tptz:GetPresetsResponse></s:Body></s:Envelope>"#;
 
@@ -588,6 +604,7 @@ mod tests {
         caps_faults: bool,
         no_ptz_profile: bool,
         fault_ops: std::sync::atomic::AtomicBool,
+        not_impl_ops: std::sync::atomic::AtomicBool,
     }
 
     async fn handle(
@@ -646,6 +663,9 @@ mod tests {
             "GetProfiles" => (axum::http::StatusCode::OK, PROFILES_RESP.into()),
             "GetPresets" => (axum::http::StatusCode::OK, PRESETS_RESP.into()),
             "SetPreset" => (axum::http::StatusCode::OK, SET_PRESET_RESP.into()),
+            _ if stub.not_impl_ops.load(std::sync::atomic::Ordering::Relaxed) => {
+                (axum::http::StatusCode::BAD_REQUEST, FAULT_NOT_IMPL.into())
+            }
             _ if stub.fault_ops.load(std::sync::atomic::Ordering::Relaxed) => (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 FAULT_NO_PTZ_PROFILE.into(),
@@ -676,6 +696,7 @@ mod tests {
             caps_faults: false,
             no_ptz_profile: false,
             fault_ops: std::sync::atomic::AtomicBool::new(false),
+            not_impl_ops: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -946,6 +967,54 @@ mod tests {
         assert!(matches!(
             client.set_preset(&"x".repeat(65)).await,
             Err(Error::BadPresetName)
+        ));
+    }
+
+    #[tokio::test]
+    async fn not_implemented_fault_classified() {
+        let stub = new_stub();
+        stub.not_impl_ops
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let device = spawn_stub(stub.clone()).await;
+        let client = OnvifPtz::new(device, (String::new(), String::new()));
+
+        assert!(matches!(client.home().await, Err(Error::NotImplemented)));
+        // ⊥ re-resolve + retry — capability gap is not a stale session.
+        let resolves = stub
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| a.as_str() == "GetProfiles")
+            .count();
+        assert_eq!(1, resolves);
+    }
+
+    #[test]
+    fn not_impl_text_matching() {
+        let fault = |text: &str| {
+            format!(
+                r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><s:Fault><s:Code><s:Value>s:Sender</s:Value></s:Code><s:Reason><s:Text>{text}</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>"#
+            )
+        };
+        assert!(matches!(
+            fault_or(&fault("Method 'tptz:Stop' not implemented"), 400),
+            Error::NotImplemented
+        ));
+        assert!(matches!(
+            fault_or(
+                &fault("the requested action is not recognized by this device"),
+                400
+            ),
+            Error::NotImplemented
+        ));
+        assert!(matches!(
+            fault_or(&fault("ActionNotSupported"), 400),
+            Error::Fault(_)
+        ));
+        assert!(matches!(
+            fault_or(&fault("connection refused"), 500),
+            Error::Fault(_)
         ));
     }
 }

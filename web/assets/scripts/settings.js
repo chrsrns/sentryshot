@@ -25,7 +25,7 @@ import {
 	newPasswordField,
 } from "./components/form.js";
 import { newModal } from "./components/modal.js";
-import { newPtzController } from "./components/ptz.js";
+import { applyPtzCapabilities, newPtzController } from "./components/ptz.js";
 
 /** @typedef {import("./components/form.js").InputRule} InputRule */
 
@@ -1234,6 +1234,7 @@ function newSourceRTSP() {
  * @typedef PtzConfig
  * @property {boolean} enable
  * @property {string} onvifAddr
+ * @property {string[]=} unsupported
  */
 
 /** @type {InputRule[]} */
@@ -1262,16 +1263,23 @@ function newPtzField(csrfToken, getMonitorId) {
 	const panel = newPtzPanel(csrfToken, getMonitorId);
 
 	const form = newForm(fields);
+	/** @type {string[]|undefined} */
+	let unsupported;
 	return {
 		elems: [...fields.enable.elems, ...fields.onvifAddr.elems, panel.elem],
 		value() {
 			/** @type {PtzConfig} */
 			const value = { enable: false, onvifAddr: "" };
 			form.get(value);
+			// Server-managed capability marks — round-tripped untouched.
+			if (unsupported !== undefined) {
+				value.unsupported = unsupported;
+			}
 			return value;
 		},
 		set(input) {
 			const value = input === undefined ? {} : input;
+			unsupported = value.unsupported;
 			form.set(value);
 			// Panel only for a persisted monitor saved with ptz enabled —
 			// commands read stored config + creds, so an unsaved toggle
@@ -1340,8 +1348,15 @@ function newPtzPanel(csrfToken, getMonitorId) {
 		elem,
 		show() {
 			elem.hidden = false;
-			controller.loadPresets(presetsElem);
 			controller.attach();
+			controller
+				.capabilities()
+				.then((unsupported) =>
+					applyPtzCapabilities(elem, unsupported)
+						? Promise.resolve()
+						: controller.loadPresets(presetsElem),
+				)
+				.catch(() => {});
 			// Unmount/navigation-away: cancel the heartbeat + stop. The
 			// camera-side Timeout still bounds a stop lost on unload.
 			observer = new MutationObserver(() => {
