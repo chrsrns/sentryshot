@@ -785,6 +785,17 @@ img {
 }
 
 /* PTZ controls. */
+
+/* The bar is the last overlay sibling — hovering it can't reach the
+   rail/popover via `~`, so light them with a scoped :has instead. */
+/* stylelint-disable plugin/no-unsupported-browser-features */
+.ptz-rail:has(~ .player-overlay:hover),
+.ptz-popover:has(~ .player-overlay:hover) {
+	visibility: visible;
+	opacity: 1;
+}
+/* stylelint-enable plugin/no-unsupported-browser-features */
+
 .js-ptz-wrap {
 	display: inline-flex;
 }
