@@ -2,6 +2,7 @@
 
 // @ts-check
 
+import { jest } from "@jest/globals";
 import { newScanModal, newPtzField } from "./settings.js";
 
 describe("newScanModal", () => {
@@ -340,7 +341,7 @@ describe("newScanModal", () => {
 
 describe("newPtzField", () => {
 	test("round-trips enable and onvifAddr", () => {
-		const field = newPtzField();
+		const field = newPtzField("tok", () => "m1");
 
 		field.set({ enable: true, onvifAddr: "http://cam/onvif/device_service" });
 		expect(field.value()).toEqual({
@@ -353,7 +354,7 @@ describe("newPtzField", () => {
 	});
 
 	test("validates onvifAddr", () => {
-		const field = newPtzField();
+		const field = newPtzField("tok", () => "m1");
 
 		for (const bad of [
 			"https://cam",
@@ -371,5 +372,343 @@ describe("newPtzField", () => {
 			field.set({ enable: true, onvifAddr: good });
 			expect(field.validate()).toBeUndefined();
 		}
+	});
+});
+
+describe("newPtzField panel", () => {
+	const mkField = () => newPtzField("tok", () => "m1");
+
+	/** Fetch spy; returns a canned 200 JSON. */
+	const mkFetch = (json = {}) => {
+		const calls = [];
+		global.fetch = (url, opts) => {
+			calls.push({ url, body: JSON.parse(opts.body) });
+			return Promise.resolve({ status: 200, json: () => Promise.resolve(json) });
+		};
+		return calls;
+	};
+
+	/** Flush microtasks a few times (fetch chains). */
+	const flush = async () => {
+		for (let i = 0; i < 5; i++) {
+			await Promise.resolve();
+		}
+	};
+
+	test("panel hidden until a persisted enabled config is set", () => {
+		document.body.replaceChildren();
+		const field = mkField();
+		const li = field.elems.find((e) => e.classList.contains("ptz-panel"));
+
+		expect(li.hidden).toBe(true);
+		field.set({ enable: false, onvifAddr: "" });
+		expect(li.hidden).toBe(true);
+		field.set({ enable: true, onvifAddr: "" });
+		expect(li.hidden).toBe(false);
+		field.set(undefined);
+		expect(li.hidden).toBe(true);
+	});
+
+	test("hold sends move, heartbeats, and stop on release", async () => {
+		document.body.replaceChildren();
+		jest.useFakeTimers();
+		const calls = mkFetch();
+		const field = mkField();
+		field.set({ enable: true, onvifAddr: "" });
+		document.body.append(field.elems[2]);
+		await flush();
+
+		const up = [...field.elems[2].querySelectorAll(".ptz-hold")].find(
+			(b) => b.dataset.tilt === "0.5",
+		);
+		up.dispatchEvent(new Event("pointerdown"));
+		await flush();
+		expect(calls.at(-1).body).toEqual({
+			command: "move",
+			tilt: 0.5,
+			pan: 0,
+		});
+
+		const before = calls.length;
+		jest.advanceTimersByTime(1600);
+		await flush();
+		expect(calls).toHaveLength(before + 1);
+		expect(calls.at(-1).body.command).toBe("move");
+
+		up.dispatchEvent(new Event("pointerup"));
+		await flush();
+		expect(calls.at(-1).body).toEqual({ command: "stop" });
+		jest.useRealTimers();
+	});
+
+	test("heartbeat skipped while prior move in-flight", async () => {
+		document.body.replaceChildren();
+		jest.useFakeTimers();
+		const calls = [];
+		let resolveFirst;
+		global.fetch = (url, opts) => {
+			calls.push({ url, body: JSON.parse(opts.body) });
+			if (resolveFirst === undefined) {
+				return new Promise((resolve) => {
+					resolveFirst = resolve;
+				});
+			}
+			return Promise.resolve({ status: 200, json: () => Promise.resolve({}) });
+		};
+		const field = mkField();
+		field.set({ enable: true, onvifAddr: "" });
+		document.body.append(field.elems[2]);
+		await flush();
+		// getPresets call consumed the pending fetch.
+		resolveFirst({ status: 200, json: () => Promise.resolve({}) });
+		await flush();
+		resolveFirst = undefined;
+
+		const up = [...field.elems[2].querySelectorAll(".ptz-hold")].find(
+			(b) => b.dataset.tilt === "0.5",
+		);
+		up.dispatchEvent(new Event("pointerdown"));
+		await flush();
+		const n = calls.length; // move in-flight, not resolved
+
+		jest.advanceTimersByTime(1600);
+		await flush();
+		expect(calls).toHaveLength(n); // beat skipped
+
+		resolveFirst({ status: 200, json: () => Promise.resolve({}) });
+		await flush();
+		jest.advanceTimersByTime(1600);
+		await flush();
+		expect(calls).toHaveLength(n + 1); // beats resume
+		jest.useRealTimers();
+	});
+
+	test("window blur sends stop", async () => {
+		document.body.replaceChildren();
+		const calls = mkFetch();
+		const field = mkField();
+		field.set({ enable: true, onvifAddr: "" });
+		document.body.append(field.elems[2]);
+		await flush();
+
+		const up = [...field.elems[2].querySelectorAll(".ptz-hold")].find(
+			(b) => b.dataset.tilt === "0.5",
+		);
+		up.dispatchEvent(new Event("pointerdown"));
+		await flush();
+		window.dispatchEvent(new Event("blur"));
+		await flush();
+		expect(calls.at(-1).body).toEqual({ command: "stop" });
+	});
+
+	test("panel unmount sends stop", async () => {
+		document.body.replaceChildren();
+		const calls = mkFetch();
+		const field = mkField();
+		field.set({ enable: true, onvifAddr: "" });
+		const li = field.elems[2];
+		document.body.append(li);
+		await flush();
+
+		const up = [...li.querySelectorAll(".ptz-hold")].find(
+			(b) => b.dataset.tilt === "0.5",
+		);
+		up.dispatchEvent(new Event("pointerdown"));
+		await flush();
+		li.remove();
+		await flush();
+		await new Promise((resolve) => {
+				setTimeout(resolve, 0);
+			}); // MutationObserver
+		await flush();
+		expect(calls.some((c) => c.body.command === "stop")).toBe(true);
+	});
+
+	test("home and preset list/recall/delete/save", async () => {
+		document.body.replaceChildren();
+		const calls = mkFetch({
+			presets: [
+				{ token: "1", name: "Gate" },
+				{ token: "2", name: "<img onerror=x>" },
+			],
+		});
+		const field = mkField();
+		field.set({ enable: true, onvifAddr: "" });
+		const li = field.elems[2];
+		document.body.append(li);
+		await flush();
+		expect(calls[0].body).toEqual({ command: "getPresets" });
+
+		// Device names render as text only.
+		const names = [...li.querySelectorAll(".js-ptz-preset-name")].map(
+			(e) => e.textContent,
+		);
+		expect(names).toEqual(["Gate", "<img onerror=x>"]);
+		expect(li.querySelector(".js-ptz-presets img")).toBeNull();
+
+		li.querySelector(".js-ptz-home").click();
+		await flush();
+		expect(calls.at(-1).body).toEqual({ command: "home" });
+
+		li.querySelectorAll(".js-ptz-recall")[0].click();
+		await flush();
+		expect(calls.at(-1).body).toEqual({
+			command: "gotoPreset",
+			presetToken: "1",
+		});
+
+		li.querySelectorAll(".js-ptz-delete")[0].click();
+		await flush();
+		await flush();
+		expect(
+			calls.some(
+				(c) =>
+					c.body.command === "removePreset" && c.body.presetToken === "1",
+			),
+		).toBe(true);
+
+		li.querySelector(".js-ptz-name").value = "My spot";
+		li.querySelector(".js-ptz-save").click();
+		await flush();
+		await flush();
+		expect(
+			calls.some(
+				(c) =>
+					c.body.command === "setPreset" && c.body.presetName === "My spot",
+			),
+		).toBe(true);
+	});
+
+	test("preset save rejects empty and over-64-char names", async () => {
+		document.body.replaceChildren();
+		const calls = mkFetch({ presets: [] });
+		const field = mkField();
+		field.set({ enable: true, onvifAddr: "" });
+		const li = field.elems[2];
+		document.body.append(li);
+		await flush();
+
+		li.querySelector(".js-ptz-save").click();
+		await flush();
+		expect(li.querySelector(".js-ptz-error").textContent).toContain(
+			"required",
+		);
+
+		li.querySelector(".js-ptz-name").value = "x".repeat(65);
+		li.querySelector(".js-ptz-save").click();
+		await flush();
+		expect(li.querySelector(".js-ptz-error").textContent).toContain("64");
+		expect(calls.some((c) => c.body.command === "setPreset")).toBe(false);
+	});
+});
+
+describe("scan pick ptz prefill", () => {
+	const runScan = async (modal, body) => {
+		global.fetch = () =>
+			Promise.resolve({
+				status: 200,
+				json: () => Promise.resolve(body),
+			});
+		modal.open();
+		const scanBtn = [...modal.elem.querySelectorAll("button")].find(
+			(b) => b.textContent.trim() === "Scan",
+		);
+		scanBtn.click();
+		await new Promise((resolve) => {
+			setTimeout(resolve, 0);
+		});
+	};
+
+	test("ptz camera prefills enable and first http xaddr", async () => {
+		document.body.replaceChildren();
+		const modal = newScanModal("token");
+		let picked;
+		modal.onPick = (p) => {
+			picked = p;
+		};
+		await runScan(modal, {
+			cameras: [
+				{
+					ip: "10.0.0.9",
+					name: "Cam",
+					xaddrs: ["https://cam/onvif", "http://cam/onvif/device_service"],
+					ptz: true,
+					backchannel: false,
+					needsAuth: false,
+					streams: [
+						{ role: "main", rtspUrl: "rtsp://10.0.0.9/main", videoCodec: "h264" },
+					],
+				},
+			],
+			truncated: false,
+		});
+		const useBtn = [...modal.elem.querySelectorAll("button")].find(
+			(b) => b.textContent.trim() === "Use",
+		);
+		useBtn.click();
+		expect(picked.ptz).toEqual({
+			enable: true,
+			onvifAddr: "http://cam/onvif/device_service",
+		});
+	});
+
+	test("ptz camera without http xaddr leaves addr empty", async () => {
+		document.body.replaceChildren();
+		const modal = newScanModal("token");
+		let picked;
+		modal.onPick = (p) => {
+			picked = p;
+		};
+		await runScan(modal, {
+			cameras: [
+				{
+					ip: "10.0.0.9",
+					name: "Cam",
+					xaddrs: ["https://cam/onvif"],
+					ptz: true,
+					backchannel: false,
+					needsAuth: false,
+					streams: [
+						{ role: "main", rtspUrl: "rtsp://10.0.0.9/main", videoCodec: "h264" },
+					],
+				},
+			],
+			truncated: false,
+		});
+		const useBtn = [...modal.elem.querySelectorAll("button")].find(
+			(b) => b.textContent.trim() === "Use",
+		);
+		useBtn.click();
+		expect(picked.ptz).toEqual({ enable: true, onvifAddr: "" });
+	});
+
+	test("non-ptz camera adds no ptz prefill", async () => {
+		document.body.replaceChildren();
+		const modal = newScanModal("token");
+		let picked;
+		modal.onPick = (p) => {
+			picked = p;
+		};
+		await runScan(modal, {
+			cameras: [
+				{
+					ip: "10.0.0.9",
+					name: "Cam",
+					xaddrs: ["http://cam/onvif"],
+					ptz: false,
+					backchannel: false,
+					needsAuth: false,
+					streams: [
+						{ role: "main", rtspUrl: "rtsp://10.0.0.9/main", videoCodec: "h264" },
+					],
+				},
+			],
+			truncated: false,
+		});
+		const useBtn = [...modal.elem.querySelectorAll("button")].find(
+			(b) => b.textContent.trim() === "Use",
+		);
+		useBtn.click();
+		expect(picked.ptz).toBeUndefined();
 	});
 });
