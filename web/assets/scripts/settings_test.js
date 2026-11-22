@@ -118,4 +118,39 @@ describe("newScanModal", () => {
 		expect(confirmCalls).toBe(0);
 		expect(picked.sourcertsp.mainStream).toBe("rtsp://10.0.0.9/main");
 	});
+
+	test("extra stream can be assigned to a slot before pick", async () => {
+		document.body.replaceChildren();
+		global.confirm = () => true;
+		const modal = newScanModal("token");
+		let picked;
+		modal.onPick = (p) => {
+			picked = p;
+		};
+
+		const body = scanBody("h264");
+		body.cameras[0].streams.push({
+			role: "extra",
+			rtspUrl: "rtsp://10.0.0.9/extra",
+			videoCodec: "h264",
+		});
+		await runScan(modal, body);
+
+		const extraText = [...modal.elem.querySelectorAll("span")].find((sp) =>
+			sp.textContent.includes("rtsp://10.0.0.9/extra"),
+		);
+		const extraRow = extraText.parentElement;
+		const toSub = [...extraRow.querySelectorAll("button")].find(
+			(b) => b.textContent === "→sub",
+		);
+		toSub.click();
+
+		const useBtn = [...modal.elem.querySelectorAll("button")].find(
+			(b) => b.textContent === "use",
+		);
+		useBtn.click();
+
+		expect(picked.sourcertsp.mainStream).toBe("rtsp://10.0.0.9/main");
+		expect(picked.sourcertsp.subStream).toBe("rtsp://10.0.0.9/extra");
+	});
 });

@@ -350,20 +350,36 @@ function newScanModal(token) {
 			if (badges.length > 0) {
 				row(item, ` [${badges.join(" ")}]`);
 			}
+			// Per-camera slot selection: defaults to the role-derived
+			// assignment; any stream (incl. extras) can be reassigned
+			// into the main or sub slot via its row buttons.
+			const sel = {
+				main: cam.streams.find((st) => st.role === "main"),
+				sub: cam.streams.find((st) => st.role === "sub"),
+			};
 			for (const stream of cam.streams) {
 				const s = document.createElement("div");
-				s.textContent = `${stream.role}: ${stream.rtspUrl}${
+				const text = document.createElement("span");
+				text.textContent = `${stream.role}: ${stream.rtspUrl}${
 					stream.profileName ? ` (${stream.profileName})` : ""
 				}${stream.videoCodec === "h264" ? "" : ` [${stream.videoCodec} — unsupported]`}`;
+				s.append(text);
+				for (const slot of ["main", "sub"]) {
+					const assign = document.createElement("button");
+					assign.textContent = `→${slot}`;
+					assign.onclick = () => {
+						sel[slot] = stream;
+						statusElem.textContent = `${slot} ← ${stream.rtspUrl}`;
+					};
+					s.append(assign);
+				}
 				item.append(s);
 			}
 			if (cam.streams.length > 0) {
 				const pickBtn = document.createElement("button");
 				pickBtn.textContent = "use";
 				pickBtn.onclick = () => {
-					const main = cam.streams.find((st) => st.role === "main");
-					const sub = cam.streams.find((st) => st.role === "sub");
-					const picked = [main, sub].filter((st) => st !== undefined);
+					const picked = [sel.main, sel.sub].filter((st) => st !== undefined);
 					const unsupported = picked.filter((st) => st.videoCodec !== "h264");
 					if (
 						unsupported.length > 0 &&
@@ -379,8 +395,8 @@ function newScanModal(token) {
 						source: "rtsp",
 						sourcertsp: {
 							protocol: "tcp",
-							mainStream: main === undefined ? "" : main.rtspUrl,
-							subStream: sub === undefined ? "" : sub.rtspUrl,
+							mainStream: sel.main === undefined ? "" : sel.main.rtspUrl,
+							subStream: sel.sub === undefined ? "" : sel.sub.rtspUrl,
 						},
 						name: sanitizeMonitorName(cam.name, cam.ip),
 					});
