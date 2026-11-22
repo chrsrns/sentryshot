@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! ONVIF PTZ client — per-command session: endpoint resolution →
-//! device time → service discovery → profile token → one PTZ op,
-//! all inside a shared chain deadline.
+//! ONVIF PTZ client — endpoint resolution → device time → service
+//! discovery → profile token → one PTZ op. The resolved session is
+//! cached on the client and reused across ops; an op fault invalidates
+//! it and triggers one re-resolve + retry.
 
 use async_trait::async_trait;
 use common::monitor::PtzConfig;
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio::sync::Mutex;
 use url::Url;
 
 /// Whole chain (time + services + profiles + op) bound from dispatch.
@@ -133,13 +135,14 @@ pub struct OnvifPtz {
     device: String,
     user: String,
     pass: String,
+    session: Mutex<Option<Session>>,
 }
 
 /// Resolved session: discovered endpoints + profile token.
+#[derive(Clone)]
 struct Session {
     ptz_xaddr: String,
     profile_token: String,
-    deadline: Instant,
 }
 
 impl OnvifPtz {
@@ -150,6 +153,7 @@ impl OnvifPtz {
             device,
             user: creds.0,
             pass: creds.1,
+            session: Mutex::new(None),
         }
     }
 
@@ -186,18 +190,27 @@ impl OnvifPtz {
             .await?)
     }
 
-    /// Runs the full resolution chain and returns the session.
-    /// The chain clock starts here — `Instant::now() + CHAIN_LIMIT`.
-    async fn session(&self) -> Result<Session, Error> {
+    /// Resolved session + the op budget that follows it.
+    ///
+    /// A cached session returns `OP_LIMIT` outright — the chain clock
+    /// only applies to a fresh resolution. `force` bypasses the cache
+    /// (fault retry).
+    async fn session(&self, force: bool) -> Result<(Session, Duration), Error> {
+        let mut guard = self.session.lock().await;
+        if !force && let Some(s) = guard.as_ref() {
+            return Ok((s.clone(), OP_LIMIT));
+        }
         let deadline = Instant::now() + CHAIN_LIMIT;
         self.device_time(deadline).await;
         let (media_xaddr, ptz_xaddr) = self.services(deadline).await?;
         let profile_token = self.ptz_profile_token(&media_xaddr, deadline).await?;
-        Ok(Session {
+        let session = Session {
             ptz_xaddr,
             profile_token,
-            deadline,
-        })
+        };
+        *guard = Some(session.clone());
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        Ok((session, remaining.min(OP_LIMIT)))
     }
 
     /// Best-effort device-time sync for WSSE `Created`.
@@ -359,11 +372,24 @@ impl OnvifPtz {
     }
 
     /// Session + one op inside its own `min(OP_LIMIT, remaining)`
-    /// budget. Returns the reply text for ops that parse one.
+    /// budget. On any failure the cached session is dropped and the op
+    /// retried once against a fresh resolution — covers stale sessions
+    /// after camera reboot/profile change. Returns the reply text for
+    /// ops that parse one.
     async fn op(&self, body_fn: impl Fn(&Session) -> String) -> Result<String, Error> {
-        let session = self.session().await?;
-        let remaining = session.deadline.saturating_duration_since(Instant::now());
-        let dl = Instant::now() + remaining.min(OP_LIMIT);
+        match self.run_op(&body_fn, false).await {
+            Err(e) => self.run_op(&body_fn, true).await.map_err(|_| e),
+            ok => ok,
+        }
+    }
+
+    async fn run_op(
+        &self,
+        body_fn: &impl Fn(&Session) -> String,
+        force: bool,
+    ) -> Result<String, Error> {
+        let (session, budget) = self.session(force).await?;
+        let dl = Instant::now() + budget;
         let (text, status) = self
             .call(&session.ptz_xaddr, &body_fn(&session), dl)
             .await?;
@@ -561,7 +587,7 @@ mod tests {
         port: std::sync::atomic::AtomicU16,
         caps_faults: bool,
         no_ptz_profile: bool,
-        fault_ops: bool,
+        fault_ops: std::sync::atomic::AtomicBool,
     }
 
     async fn handle(
@@ -620,7 +646,7 @@ mod tests {
             "GetProfiles" => (axum::http::StatusCode::OK, PROFILES_RESP.into()),
             "GetPresets" => (axum::http::StatusCode::OK, PRESETS_RESP.into()),
             "SetPreset" => (axum::http::StatusCode::OK, SET_PRESET_RESP.into()),
-            _ if stub.fault_ops => (
+            _ if stub.fault_ops.load(std::sync::atomic::Ordering::Relaxed) => (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 FAULT_NO_PTZ_PROFILE.into(),
             ),
@@ -649,7 +675,7 @@ mod tests {
             port: std::sync::atomic::AtomicU16::new(0),
             caps_faults: false,
             no_ptz_profile: false,
-            fault_ops: false,
+            fault_ops: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -770,12 +796,73 @@ mod tests {
 
     #[tokio::test]
     async fn op_fault_maps_no_ptz_profile() {
-        let mut stub = new_stub();
-        Arc::get_mut(&mut stub).unwrap().fault_ops = true;
+        let stub = new_stub();
+        stub.fault_ops
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let device = spawn_stub(stub.clone()).await;
         let client = OnvifPtz::new(device, (String::new(), String::new()));
 
         assert!(matches!(client.home().await, Err(Error::NoPtzProfile)));
+    }
+
+    #[tokio::test]
+    async fn session_reused_across_ops() {
+        let stub = new_stub();
+        let device = spawn_stub(stub.clone()).await;
+        let client = OnvifPtz::new(device, (String::new(), String::new()));
+
+        client.move_cam(Some(0.5), None, None).await.unwrap();
+        client.stop().await.unwrap();
+
+        let count = |action: &str| {
+            stub.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|a| a.as_str() == action)
+                .count()
+        };
+        // Chain resolved once; both ops went straight to the PTZ op.
+        assert_eq!(1, count("GetCapabilities"));
+        assert_eq!(1, count("GetProfiles"));
+        assert_eq!(1, count("ContinuousMove"));
+        assert_eq!(1, count("Stop"));
+    }
+
+    #[tokio::test]
+    async fn op_fault_invalidates_and_retries_once() {
+        let stub = new_stub();
+        stub.fault_ops
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let device = spawn_stub(stub.clone()).await;
+        let client = OnvifPtz::new(device, (String::new(), String::new()));
+
+        assert!(matches!(
+            client.move_cam(Some(0.5), None, None).await,
+            Err(Error::NoPtzProfile)
+        ));
+        // First chain + one re-resolve on the fault retry.
+        let profiles = stub
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| a.as_str() == "GetProfiles")
+            .count();
+        assert_eq!(2, profiles);
+
+        // Camera recovers → warm session works without re-resolving.
+        stub.fault_ops
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        client.stop().await.unwrap();
+        let profiles = stub
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|a| a.as_str() == "GetProfiles")
+            .count();
+        assert_eq!(2, profiles);
     }
 
     #[tokio::test]

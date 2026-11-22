@@ -65,7 +65,7 @@ fn scan_error_status_mapping() {
 // ---- ptz_handler ----
 
 mod ptz {
-    use crate::{MonitorIdQuery, PtzRouteState, ptz_handler};
+    use crate::{MonitorIdQuery, PtzRouteState, PtzService, ptz_handler};
     use async_trait::async_trait;
     use axum::{
         Json,
@@ -87,7 +87,7 @@ mod ptz {
     };
 
     struct StubManager {
-        config: Option<MonitorConfig>,
+        config: Mutex<Option<MonitorConfig>>,
     }
 
     #[async_trait]
@@ -117,7 +117,7 @@ mod ptz {
             unimplemented!()
         }
         async fn monitor_config(&self, _monitor_id: MonitorId) -> Option<Option<MonitorConfig>> {
-            Some(self.config.clone())
+            Some(self.config.lock().unwrap().clone())
         }
         async fn monitor_configs(&self) -> Option<MonitorConfigs> {
             unimplemented!()
@@ -200,19 +200,21 @@ mod ptz {
 
     fn harness(
         config: Option<MonitorConfig>,
-        stub: Arc<StubPtz>,
+        stub: ptz::ArcPtzClient,
     ) -> (State<Arc<PtzRouteState>>, Query<MonitorIdQuery>, Captured) {
         let captured: Captured =
             Arc::new(Mutex::new((String::new(), (String::new(), String::new()))));
         let cap = captured.clone();
         (
             State(Arc::new(PtzRouteState {
-                monitors: Arc::new(StubManager { config }),
-                factory: Arc::new(move |endpoint, creds| {
+                monitors: Arc::new(StubManager {
+                    config: Mutex::new(config),
+                }),
+                service: PtzService::new(Arc::new(move |endpoint, creds| {
                     *cap.lock().unwrap() = (endpoint, creds);
                     let client: ptz::ArcPtzClient = stub.clone();
                     client
-                }),
+                })),
             })),
             Query(MonitorIdQuery {
                 id: "m1".to_owned().try_into().unwrap(),
@@ -221,7 +223,7 @@ mod ptz {
         )
     }
 
-    fn stub_client(err: bool) -> Arc<StubPtz> {
+    fn stub_client(err: bool) -> ptz::ArcPtzClient {
         Arc::new(StubPtz {
             err,
             presets: vec![],
@@ -304,5 +306,121 @@ mod ptz {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["presets"][0]["token"], "1");
         assert_eq!(json["presets"][0]["name"], "Gate");
+    }
+
+    // Slow stub client: `move_cam` sleeps before recording — without
+    // per-monitor serialization a following `stop` would land first.
+    struct OrderedStub {
+        ops: Arc<Mutex<Vec<String>>>,
+        delay: std::time::Duration,
+    }
+
+    #[async_trait]
+    impl ptz::PtzClient for OrderedStub {
+        async fn move_cam(
+            &self,
+            _p: Option<f64>,
+            _t: Option<f64>,
+            _z: Option<f64>,
+        ) -> Result<(), ptz::Error> {
+            tokio::time::sleep(self.delay).await;
+            self.ops.lock().unwrap().push("move".to_owned());
+            Ok(())
+        }
+        async fn stop(&self) -> Result<(), ptz::Error> {
+            self.ops.lock().unwrap().push("stop".to_owned());
+            Ok(())
+        }
+        async fn home(&self) -> Result<(), ptz::Error> {
+            Ok(())
+        }
+        async fn get_presets(&self) -> Result<Vec<ptz::Preset>, ptz::Error> {
+            Ok(vec![])
+        }
+        async fn set_preset(&self, _n: &str) -> Result<String, ptz::Error> {
+            Ok("1".into())
+        }
+        async fn goto_preset(&self, _t: &str) -> Result<(), ptz::Error> {
+            Ok(())
+        }
+        async fn remove_preset(&self, _t: &str) -> Result<(), ptz::Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn commands_serialized_per_monitor() {
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        let stub = OrderedStub {
+            ops: ops.clone(),
+            delay: std::time::Duration::from_millis(100),
+        };
+        let (state, query, _) = harness(Some(monitor_config(true)), Arc::new(stub));
+
+        let s1 = state.clone();
+        let t1 = tokio::spawn(async move {
+            let mut c = cmd("move");
+            c.pan = Some(0.5);
+            ptz_handler(s1, query, Json(c)).await
+        });
+        // Let t1 grab the monitor lock first.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let q2 = Query(MonitorIdQuery {
+            id: "m1".to_owned().try_into().unwrap(),
+        });
+        let t2 = tokio::spawn(async move { ptz_handler(state, q2, Json(cmd("stop"))).await });
+
+        t1.await.unwrap();
+        t2.await.unwrap();
+        assert_eq!(
+            vec!["move".to_owned(), "stop".to_owned()],
+            *ops.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn entry_rebuilt_on_config_change() {
+        let calls = Arc::new(Mutex::new(0_usize));
+        let c = calls.clone();
+        let service = PtzService::new(Arc::new(move |_e, _c| {
+            *c.lock().unwrap() += 1;
+            stub_client(false)
+        }));
+        let manager = Arc::new(StubManager {
+            config: Mutex::new(Some(monitor_config(true))),
+        });
+        let state = Arc::new(PtzRouteState {
+            monitors: manager.clone(),
+            service,
+        });
+        let query = || {
+            Query(MonitorIdQuery {
+                id: "m1".to_owned().try_into().unwrap(),
+            })
+        };
+
+        let st = State(state.clone());
+        let resp = ptz_handler(st.clone(), query(), Json(cmd("stop"))).await;
+        assert_eq!(StatusCode::OK, resp.status());
+        let resp = ptz_handler(st, query(), Json(cmd("stop"))).await;
+        assert_eq!(StatusCode::OK, resp.status());
+        // Same config → same entry, factory ran once.
+        assert_eq!(1, *calls.lock().unwrap());
+
+        // Config edit (onvifAddr) → endpoint key changes → entry rebuilt.
+        let edited = monitor_config(true);
+        let mut cfg = edited.config().clone();
+        cfg.ptz = common::monitor::PtzConfig::new(
+            true,
+            "http://cam:8899/onvif/device_service".to_owned(),
+        );
+        *manager.config.lock().unwrap() = Some(MonitorConfig::new(
+            cfg,
+            edited.source().clone(),
+            serde_json::json!({}),
+        ));
+        let resp = ptz_handler(State(state), query(), Json(cmd("stop"))).await;
+        assert_eq!(StatusCode::OK, resp.status());
+        assert_eq!(2, *calls.lock().unwrap());
     }
 }
