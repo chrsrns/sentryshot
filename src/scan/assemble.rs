@@ -191,6 +191,7 @@ pub fn assemble(
                 role,
                 auth: c.auth,
                 video_codec: c.video_codec.unwrap_or_else(|| "unknown".to_owned()),
+                live: true,
             }
         })
         .collect();

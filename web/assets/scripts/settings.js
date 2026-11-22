@@ -350,7 +350,9 @@ function newScanModal(token) {
 	const streamLabel = (st) =>
 		`${st.role}: ${maskUrlPassword(st.rtspUrl)}${
 			st.profileName ? ` (${st.profileName})` : ""
-		}${st.videoCodec === "h264" ? "" : ` [${st.videoCodec} — unsupported]`}`;
+		}${st.live === false ? " [dead — no media]" : ""}${
+			st.videoCodec === "h264" ? "" : ` [${st.videoCodec} — unsupported]`
+		}`;
 
 	const renderResults = (result) => {
 		listElem.replaceChildren();
@@ -480,14 +482,20 @@ function newScanModal(token) {
 				pickBtn.onclick = () => {
 					const picked = [sel.main, sel.sub].filter((st) => st !== undefined);
 					const unsupported = picked.filter((st) => st.videoCodec !== "h264");
-					if (
-						unsupported.length > 0 &&
-						!confirm(
-							`picked stream(s) use ${unsupported
-								.map((st) => st.videoCodec)
-								.join(", ")} — SentryShot only plays h264. Apply anyway?`,
-						)
-					) {
+					const dead = picked.filter((st) => st.live === false);
+					const warnings = [
+						...(unsupported.length > 0
+							? [
+									`picked stream(s) use ${unsupported
+										.map((st) => st.videoCodec)
+										.join(", ")} — SentryShot only plays h264`,
+								]
+							: []),
+						...(dead.length > 0
+							? ["picked stream(s) sent no media during the probe — dead"]
+							: []),
+					];
+					if (warnings.length > 0 && !confirm(`${warnings.join("; ")}. Apply anyway?`)) {
 						return;
 					}
 					onPick({

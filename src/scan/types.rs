@@ -110,6 +110,11 @@ pub struct ScanStream {
     /// `h265`, …). `"none"` when the SDP carries no video stream,
     /// `"unknown"` when the probe did not complete.
     pub video_codec: String,
+
+    /// `false` when the post-dedupe PLAY probe saw zero media inside
+    /// its window — a proven-dead stream. `true` when probed alive or
+    /// never probed (DESCRIBE-failed retained, deadline expired).
+    pub live: bool,
 }
 
 /// Pixel resolution of a profile.
@@ -248,6 +253,7 @@ mod tests {
                     role: ScanRole::Main,
                     auth: Some("digest".into()),
                     video_codec: "h264".into(),
+                    live: true,
                 }],
                 ptz: true,
                 backchannel: false,

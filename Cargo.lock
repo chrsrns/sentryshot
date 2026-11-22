@@ -2247,6 +2247,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "common",
+ "futures-lite",
  "http-body-util",
  "hyper",
  "hyper-util",

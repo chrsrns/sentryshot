@@ -256,6 +256,94 @@ pub async fn describe_codec(
         .map_or_else(|| "none".to_owned(), |s| s.encoding_name().to_owned()))
 }
 
+/// Outcome of a DESCRIBE + PLAY probe.
+pub struct ProbeOutcome {
+    /// SDP video `encoding_name` (`"none"` when the SDP has no video).
+    pub codec: String,
+    /// `true` when ≥1 RTP media packet arrived inside the PLAY window.
+    pub live: bool,
+}
+
+/// `DESCRIBE` then `PLAY`: codec from the SDP, then at most
+/// `play_window` (also bounded by `budget`) awaiting the first RTP
+/// media packet — early-exit on first packet, RTCP ⊥ counts. A stream
+/// answering the full handshake yet sending nothing is `live = false`.
+pub async fn describe_play_probe(
+    url: url::Url,
+    creds: &Creds,
+    budget: Duration,
+    play_window: Duration,
+) -> Result<ProbeOutcome, ScanError> {
+    let deadline = std::time::Instant::now() + budget;
+    let rcreds = if creds.is_empty() {
+        None
+    } else {
+        Some(retina::client::Credentials {
+            username: creds.username.clone(),
+            password: creds.password.clone(),
+        })
+    };
+    let group = std::sync::Arc::new(retina::client::SessionGroup::default());
+    let fut = retina::client::Session::describe(
+        url,
+        retina::client::SessionOptions::default()
+            .creds(rcreds)
+            .session_group(group)
+            .teardown(retina::client::TeardownPolicy::Always),
+    );
+    let session = tokio::time::timeout(budget, fut)
+        .await
+        .map_err(|_| ScanError::Timeout)?
+        .map_err(|e| ScanError::Malformed(e.to_string()))?;
+    let mut session = session;
+    let codec = session
+        .streams()
+        .iter()
+        .find(|s| s.media() == "video")
+        .map_or_else(|| "none".to_owned(), |s| s.encoding_name().to_owned());
+
+    let window = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .min(play_window);
+    if window.is_zero() {
+        return Err(ScanError::Timeout);
+    }
+    let mut playing = match tokio::time::timeout(window, async {
+        for i in 0..session.streams().len() {
+            session
+                .setup(
+                    i,
+                    retina::client::SetupOptions::default().transport(
+                        retina::client::Transport::Tcp(
+                            retina::client::TcpTransportOptions::default(),
+                        ),
+                    ),
+                )
+                .await?;
+        }
+        session.play(retina::client::PlayOptions::default()).await
+    })
+    .await
+    {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => return Err(ScanError::Malformed(e.to_string())),
+        Err(_) => return Ok(ProbeOutcome { codec, live: false }),
+    };
+    let live = tokio::time::timeout(window, async {
+        while let Some(item) = futures_lite::StreamExt::next(&mut playing).await {
+            match item {
+                Ok(retina::client::PacketItem::Rtp(_)) => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or_default();
+    Ok(ProbeOutcome { codec, live })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +416,106 @@ mod tests {
     const SDP_H264: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=x\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\nm=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1;profile-level-id=42001f\r\na=control:trackID=0\r\n";
 
     const SDP_AUDIO_ONLY: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=x\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\nm=audio 0 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\na=control:trackID=0\r\n";
+
+    /// Full-handshake fake: DESCRIBE serves `sdp`, SETUP echoes
+    /// Transport + issues a Session, PLAY replies 200 then sends one
+    /// interleaved RTP packet when `send_rtp`. Returns on peer close.
+    async fn fake_play_server(sdp: &'static str, send_rtp: bool) -> url::Url {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                loop {
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    match s.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf).into_owned();
+                let cseq = header(&req, "cseq").unwrap_or("0").to_owned();
+                buf.clear();
+                let resp = if req.starts_with("DESCRIBE") {
+                    format!(
+                        "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{sdp}",
+                        sdp.len()
+                    )
+                } else if req.starts_with("SETUP") {
+                    let transport = header(&req, "transport").unwrap_or("");
+                    format!(
+                        "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nSession: abc123;timeout=60\r\nTransport: {transport}\r\n\r\n"
+                    )
+                } else {
+                    format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nSession: abc123\r\n\r\n")
+                };
+                if s.write_all(resp.as_bytes()).await.is_err() {
+                    return;
+                }
+                if req.starts_with("PLAY") && send_rtp {
+                    // Interleaved RTP on channel 0: 12B header + payload.
+                    let mut rtp = vec![
+                        0x24, 0x00, 0x00, 0x00, // $, chan, len (filled below)
+                        0x80, 0xE0, 0x00, 0x01, // V2+marker+PT96, seq
+                        0x00, 0x00, 0x03, 0x84, // ts
+                        0xDE, 0xAD, 0xBE, 0xEF, // ssrc
+                        0x67, 0x42, 0x00, 0x1f, // payload
+                    ];
+                    let len = u16::try_from(rtp.len() - 4).unwrap();
+                    rtp[2..4].copy_from_slice(&len.to_be_bytes());
+                    let _ = s.write_all(&rtp).await;
+                }
+            }
+        });
+        url::Url::parse(&format!("rtsp://{}:{}/x", addr.ip(), addr.port())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn play_probe_alive_when_rtp_flows() {
+        let url = fake_play_server(SDP_H264, true).await;
+        let out = describe_play_probe(
+            url,
+            &Creds::default(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!("h264", out.codec);
+        assert!(out.live);
+    }
+
+    #[tokio::test]
+    async fn play_probe_dead_when_no_media_in_window() {
+        let url = fake_play_server(SDP_H264, false).await;
+        let out = describe_play_probe(
+            url,
+            &Creds::default(),
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
+        assert_eq!("h264", out.codec);
+        assert!(!out.live);
+    }
+
+    #[tokio::test]
+    async fn play_probe_errs_on_describe_failure() {
+        let url = url::Url::parse("rtsp://127.0.0.1:1/x").unwrap();
+        let r = describe_play_probe(
+            url,
+            &Creds::default(),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(r.is_err());
+    }
 
     #[tokio::test]
     async fn describe_codec_reads_video_encoding() {

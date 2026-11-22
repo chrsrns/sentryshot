@@ -29,6 +29,7 @@ describe("newScanModal", () => {
 						role: "main",
 						rtspUrl: "rtsp://10.0.0.9/main",
 						videoCodec,
+						live: true,
 					},
 				],
 			},
@@ -163,6 +164,41 @@ describe("newScanModal", () => {
 		);
 		useBtn.click();
 
+		expect(picked.sourcertsp.mainStream).toBe("rtsp://10.0.0.9/main");
+	});
+
+	test("marks dead streams in the list", async () => {
+		document.body.replaceChildren();
+		const modal = newScanModal("token");
+
+		const body = scanBody("h264");
+		body.cameras[0].streams[0].live = false;
+		await runScan(modal, body);
+
+		expect(modal.elem.textContent).toContain("dead");
+	});
+
+	test("picking a dead stream requires confirmation", async () => {
+		document.body.replaceChildren();
+		const modal = newScanModal("token");
+		let picked;
+		modal.onPick = (p) => {
+			picked = p;
+		};
+
+		const body = scanBody("h264");
+		body.cameras[0].streams[0].live = false;
+		await runScan(modal, body);
+
+		global.confirm = () => false;
+		const useBtn = [...modal.elem.querySelectorAll("button")].find(
+			(b) => b.textContent.trim() === "Use",
+		);
+		useBtn.click();
+		expect(picked).toBeUndefined();
+
+		global.confirm = () => true;
+		useBtn.click();
 		expect(picked.sourcertsp.mainStream).toBe("rtsp://10.0.0.9/main");
 	});
 

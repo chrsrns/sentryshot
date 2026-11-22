@@ -18,6 +18,7 @@ doctest = false
 common.path = "../common"
 
 bytes.workspace = true
+futures-lite.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }

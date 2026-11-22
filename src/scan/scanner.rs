@@ -238,24 +238,34 @@ async fn scan_one(
     cam
 }
 
-/// DESCRIBE every emitted stream still codec-unknown, once post-dedupe.
-/// Enumeration-evidenced URIs stay on failure as `"unknown"`;
-/// evidence-less path candidates were already dropped pre-assembly.
+/// DESCRIBE+PLAY-probe every emitted stream once post-dedupe: fill
+/// codec when still unknown and mark `live = false` when the PLAY
+/// window sees zero media. Enumeration-evidenced URIs stay on probe
+/// failure (codec `"unknown"`, `live` untouched); evidence-less path
+/// candidates were already dropped pre-assembly.
 async fn fill_codecs(cam: &mut DiscoveredCamera, creds: &Creds, deadline: Instant) {
     for s in &mut cam.streams {
-        if s.video_codec != "unknown" || remaining(deadline).is_zero() {
-            continue;
+        if remaining(deadline).is_zero() {
+            break;
         }
         let Ok(mut u) = url::Url::parse(&s.rtsp_url) else {
             continue;
         };
         let _ = u.set_username("");
         let _ = u.set_password(None);
-        if let Ok(codec) = rtsp::describe_codec(u, creds, remaining(deadline)).await {
-            s.video_codec = codec;
+        let Ok(outcome) =
+            rtsp::describe_play_probe(u, creds, remaining(deadline), PLAY_PROBE_WINDOW).await
+        else {
+            continue;
+        };
+        if s.video_codec == "unknown" {
+            s.video_codec = outcome.codec;
         }
+        s.live = outcome.live;
     }
 }
+
+const PLAY_PROBE_WINDOW: Duration = Duration::from_secs(5);
 
 fn vendor_timeout() -> Duration {
     Duration::from_millis(1500)
