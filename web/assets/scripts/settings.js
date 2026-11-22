@@ -1305,22 +1305,35 @@ function newPtzField(csrfToken, getMonitorId) {
  * @param {() => string} getMonitorId
  */
 function newPtzPanel(csrfToken, getMonitorId) {
+	const glyphBtn = "ptz-glyph px-2 rounded-lg bg-color2 hover:bg-color3";
 	const elem = /** @type {HTMLElement} */ (htmlToElem(/* HTML */ `
 		<li class="ptz-panel form-item" hidden>
 			<div class="flex flex-col gap-1 p-2 border border-color3 rounded-lg w-max">
-				<div class="flex gap-1 items-center">
-					<button type="button" class="ptz-hold px-2 rounded-lg bg-color2 hover:bg-color3" data-pan="0" data-tilt="0.5">↑</button>
-					<button type="button" class="ptz-hold px-2 rounded-lg bg-color2 hover:bg-color3" data-pan="0" data-tilt="-0.5">↓</button>
-					<button type="button" class="ptz-hold px-2 rounded-lg bg-color2 hover:bg-color3" data-pan="-0.5" data-tilt="0">←</button>
-					<button type="button" class="ptz-hold px-2 rounded-lg bg-color2 hover:bg-color3" data-pan="0.5" data-tilt="0">→</button>
-					<button type="button" class="ptz-hold px-2 rounded-lg bg-color2 hover:bg-color3" data-zoom="0.5">zoom+</button>
-					<button type="button" class="ptz-hold px-2 rounded-lg bg-color2 hover:bg-color3" data-zoom="-0.5">zoom−</button>
-					<button type="button" class="js-ptz-home px-2 rounded-lg bg-color2 hover:bg-color3">home</button>
+				<div class="flex gap-2 items-center">
+					<div class="ptz-grid">
+						<span class="js-ptz-wrap"><button type="button" class="ptz-hold ${glyphBtn}" data-pan="-0.5" data-tilt="0.5">↖</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="ptz-hold ${glyphBtn}" data-pan="0" data-tilt="0.5">↑</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="ptz-hold ${glyphBtn}" data-pan="0.5" data-tilt="0.5">↗</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="ptz-hold ${glyphBtn}" data-pan="-0.5" data-tilt="0">←</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="js-ptz-stop ${glyphBtn}">■</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="ptz-hold ${glyphBtn}" data-pan="0.5" data-tilt="0">→</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="ptz-hold ${glyphBtn}" data-pan="-0.5" data-tilt="-0.5">↙</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="ptz-hold ${glyphBtn}" data-pan="0" data-tilt="-0.5">↓</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="ptz-hold ${glyphBtn}" data-pan="0.5" data-tilt="-0.5">↘</button></span>
+					</div>
+					<div class="flex flex-col gap-1">
+						<span class="js-ptz-wrap"><button type="button" class="ptz-hold ${glyphBtn}" data-zoom="0.5">+</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="ptz-hold ${glyphBtn}" data-zoom="-0.5">−</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="js-ptz-home ${glyphBtn}">⌂</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="js-ptz-presets-btn ${glyphBtn}">★</button></span>
+					</div>
 				</div>
-				<div class="js-ptz-presets flex flex-col gap-1"></div>
-				<div class="flex gap-1 items-center">
-					<input type="text" class="js-ptz-name px-1 bg-color1" placeholder="preset name" maxlength="64" />
-					<button type="button" class="js-ptz-save px-2 rounded-lg bg-color2 hover:bg-color3">save</button>
+				<div class="js-ptz-presets-pop ptz-popover-panel" hidden>
+					<div class="js-ptz-presets flex flex-col gap-1"></div>
+					<div class="flex gap-1 items-center mt-1">
+						<span class="js-ptz-wrap"><input type="text" class="js-ptz-name px-1 bg-color1" placeholder="preset name" maxlength="64" /></span>
+						<span class="js-ptz-wrap"><button type="button" class="js-ptz-save px-2 rounded-lg bg-color2 hover:bg-color3">save</button></span>
+					</div>
 				</div>
 				<div class="js-ptz-error text-red"></div>
 			</div>
@@ -1331,11 +1344,21 @@ function newPtzPanel(csrfToken, getMonitorId) {
 	const presetsElem = /** @type {HTMLElement} */ (elem.querySelector(".js-ptz-presets"));
 	const nameInput = /** @type {HTMLInputElement} */ (elem.querySelector(".js-ptz-name"));
 
+	const popover = /** @type {HTMLElement} */ (elem.querySelector(".js-ptz-presets-pop"));
+
 	const controller = newPtzController(csrfToken, getMonitorId, errorElem);
 	controller.bindHold(elem);
 	// @ts-ignore
+	elem.querySelector(".js-ptz-stop").onclick = () => {
+		controller.stop();
+	};
+	// @ts-ignore
 	elem.querySelector(".js-ptz-home").onclick = () => {
 		controller.send({ command: "home" });
+	};
+	// @ts-ignore
+	elem.querySelector(".js-ptz-presets-btn").onclick = () => {
+		popover.hidden = !popover.hidden;
 	};
 	controller.bindPresetSave(nameInput, /** @type {Element} */ (elem.querySelector(".js-ptz-save")), () =>
 		controller.loadPresets(presetsElem),
@@ -1351,23 +1374,34 @@ function newPtzPanel(csrfToken, getMonitorId) {
 			controller.attach();
 			controller
 				.capabilities()
-				.then((unsupported) =>
-					applyPtzCapabilities(elem, unsupported)
-						? Promise.resolve()
-						: controller.loadPresets(presetsElem),
-				)
+				.then((res) => {
+					if (!res.ok) {
+						return res; // Failed query — keep prior marks.
+					}
+					const skip = applyPtzCapabilities(elem, res.unsupported, () =>
+						controller.release(),
+					);
+					return skip ? res : controller.loadPresets(presetsElem);
+				})
 				.catch(() => {});
-			// Unmount/navigation-away: cancel the heartbeat + stop. The
-			// camera-side Timeout still bounds a stop lost on unload.
-			observer = new MutationObserver(() => {
-				if (!elem.isConnected) {
-					controller.release();
-				}
-			});
-			observer.observe(document.body, { childList: true, subtree: true });
+			if (observer === undefined) {
+				// Unmount/navigation-away: cancel the heartbeat + stop. The
+				// camera-side Timeout still bounds a stop lost on unload.
+				observer = new MutationObserver(() => {
+					if (!elem.isConnected) {
+						controller.detach();
+						if (observer !== undefined) {
+							observer.disconnect();
+							observer = undefined;
+						}
+					}
+				});
+				observer.observe(document.body, { childList: true, subtree: true });
+			}
 		},
 		hide() {
 			elem.hidden = true;
+			popover.hidden = true;
 			controller.detach();
 			if (observer !== undefined) {
 				observer.disconnect();
