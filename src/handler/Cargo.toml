@@ -18,6 +18,8 @@ common.path = "../common"
 eventdb.path = "../eventdb"
 hls.path = "../hls"
 scan.path = "../scan"
+onvif.path = "../onvif"
+ptz.path = "../ptz"
 log.path = "../log"
 monitor_groups.path = "../monitor_groups"
 recdb.path = "../recdb"
@@ -40,5 +42,6 @@ tokio-util.workspace = true
 
 
 [dev-dependencies]
+async-trait.workspace = true
 pretty_assertions.workspace = true
 test-case.workspace = true

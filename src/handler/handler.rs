@@ -670,3 +670,104 @@ fn scan_error_response(e: &scan::ScanError) -> Response {
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "scan failed").into_response(),
     }
 }
+
+/// Route state for `POST /api/monitor/ptz` — the client factory is a
+/// seam so tests can inject a stub camera.
+pub struct PtzRouteState {
+    pub monitors: ArcMonitorManager,
+    pub factory: Arc<dyn Fn(String, (String, String)) -> ptz::ArcPtzClient + Send + Sync>,
+}
+
+/// `POST /api/monitor/ptz?id=` — relay one PTZ command to the
+/// monitor's camera. Admin + CSRF via `route_admin`.
+///
+/// Credentials come only from the stored monitor `mainStream`
+/// userinfo — never the request body.
+pub async fn ptz_handler(
+    State(state): State<Arc<PtzRouteState>>,
+    Query(query): Query<MonitorIdQuery>,
+    Json(cmd): Json<ptz::PtzCommand>,
+) -> Response {
+    // Command validation before any camera traffic.
+    let bad = |msg: &'static str| (StatusCode::BAD_REQUEST, msg).into_response();
+    match cmd.command.as_str() {
+        "move" => {
+            if cmd.pan.is_none() && cmd.tilt.is_none() && cmd.zoom.is_none() {
+                return bad("move requires at least one velocity");
+            }
+            for v in [cmd.pan, cmd.tilt, cmd.zoom].into_iter().flatten() {
+                if !(-1.0..=1.0).contains(&v) {
+                    return bad("velocity out of range −1.0..=1.0");
+                }
+            }
+        }
+        "gotoPreset" | "removePreset" => {
+            if cmd.preset_token.is_none() {
+                return bad("presetToken required");
+            }
+        }
+        "setPreset" => match &cmd.preset_name {
+            Some(name) if !name.is_empty() && name.chars().count() <= 64 => {}
+            _ => return bad("presetName required, 1..=64 chars"),
+        },
+        "stop" | "home" | "getPresets" => {}
+        _ => return bad("unknown command"),
+    }
+
+    let Some(Some(config)) = state.monitors.monitor_config(query.id.clone()).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !config.config().ptz.enable() {
+        return (StatusCode::CONFLICT, "ptz disabled").into_response();
+    }
+
+    let common::monitor::SourceConfig::Rtsp(rtsp) = config.source();
+    let creds = onvif::creds_from_url(rtsp.main_stream.as_str());
+    let endpoint =
+        match ptz::resolve_endpoint(rtsp.main_stream.as_str(), config.config().ptz.onvif_addr()) {
+            Ok(e) => e,
+            Err(e) => return ptz_error_response(&e),
+        };
+    let client = (state.factory)(endpoint, creds);
+
+    let result = match cmd.command.as_str() {
+        "move" => client.move_cam(cmd.pan, cmd.tilt, cmd.zoom).await,
+        "stop" => client.stop().await,
+        "home" => client.home().await,
+        "getPresets" => {
+            return match client.get_presets().await {
+                Ok(presets) => Json(ptz::PtzResponse {
+                    presets: Some(presets),
+                })
+                .into_response(),
+                Err(e) => ptz_error_response(&e),
+            };
+        }
+        "setPreset" => {
+            // Validated above.
+            client
+                .set_preset(cmd.preset_name.as_deref().unwrap_or_default())
+                .await
+                .map(|_| ())
+        }
+        "gotoPreset" => {
+            client
+                .goto_preset(cmd.preset_token.as_deref().unwrap_or_default())
+                .await
+        }
+        "removePreset" => {
+            client
+                .remove_preset(cmd.preset_token.as_deref().unwrap_or_default())
+                .await
+        }
+        _ => unreachable!("validated above"),
+    };
+    match result {
+        Ok(()) => Json(ptz::PtzResponse { presets: None }).into_response(),
+        Err(e) => ptz_error_response(&e),
+    }
+}
+
+fn ptz_error_response(e: &ptz::Error) -> Response {
+    (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
+}

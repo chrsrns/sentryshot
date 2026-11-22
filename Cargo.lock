@@ -963,6 +963,7 @@ dependencies = [
 name = "handler"
 version = "0.3.11"
 dependencies = [
+ "async-trait",
  "axum 0.8.1",
  "common",
  "eventdb",
@@ -972,7 +973,9 @@ dependencies = [
  "log 0.3.11",
  "mime_guess",
  "monitor_groups",
+ "onvif",
  "pretty_assertions",
+ "ptz",
  "recdb",
  "recording",
  "rust-embed",
