@@ -3,17 +3,14 @@
 //! Vendor HTTP fast-paths for per-IP mode: one-shot channel
 //! enumeration before RTSP path probing (Hikvision ISAPI, Dahua CGI).
 
-use crate::{
-    ScanError,
-    onvif::{digest_authorization, parse_digest_challenge},
-    types::Creds,
-};
+use crate::{ScanError, types::Creds};
 use http_body_util::{BodyExt, Empty};
 use hyper::{Method, Request, body::Bytes};
 use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::TokioExecutor,
 };
+use onvif::{digest_authorization, parse_digest_challenge};
 use std::{net::Ipv4Addr, time::Duration};
 
 const VENDOR_TIMEOUT: Duration = Duration::from_millis(1500);
