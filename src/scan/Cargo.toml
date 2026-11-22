@@ -16,6 +16,7 @@ doctest = false
 
 [dependencies]
 common.path = "../common"
+onvif.path = "../onvif"
 
 bytes.workspace = true
 futures-lite.workspace = true
@@ -26,8 +27,6 @@ if-addrs = "0.13"
 rand.workspace = true
 retina.workspace = true
 roxmltree = "0.20"
-sha1 = "0.10"
-md5 = "0.8"
 base64 = "0.22"
 socket2 = "0.6"
 serde.workspace = true

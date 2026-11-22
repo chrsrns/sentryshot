@@ -35,6 +35,16 @@ pub enum ScanError {
     NotAuthorized,
 }
 
+impl From<onvif::Error> for ScanError {
+    fn from(e: onvif::Error) -> Self {
+        match e {
+            onvif::Error::Timeout => Self::Timeout,
+            onvif::Error::Http(e) => Self::Http(e),
+            onvif::Error::Malformed(m) => Self::Malformed(m),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
