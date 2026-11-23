@@ -9,8 +9,10 @@
 //! - `Require: www.onvif.org/ver20/backchannel` rides DESCRIBE,
 //!   the sendonly SETUP, PLAY, and TEARDOWN — never the recvonly
 //!   SETUP;
-//! - `551`/Require rejection or absent sendonly ⇒ untagged
-//!   re-DESCRIBE → listen-only + talk mark candidate;
+//! - `551`/Require rejection ⇒ untagged re-DESCRIBE →
+//!   listen-only + talk mark candidate; a tagged 2xx SDP is
+//!   authoritative and reused (some firmwares allow one
+//!   DESCRIBE per connection);
 //! - `a=sendonly` = talk, `a=recvonly` = listen, `a=sendrecv` =
 //!   both, directionless = listen-only, `a=inactive` = session-only.
 
@@ -290,8 +292,9 @@ async fn release(client: &RtspClient, control: &str, session_id: &str) {
     client.close();
 }
 
-/// DESCRIBE (+`Require` when `want_talk`) with the `551`/absent-
-/// sendonly untagged retry.
+/// DESCRIBE (+`Require` when `want_talk`); a tagged 2xx SDP is
+/// reused, the `551`/Require-rejection carries no SDP and retries
+/// untagged.
 async fn describe(
     client: &RtspClient,
     base: &url::Url,
@@ -307,16 +310,17 @@ async fn describe(
         }
         if resp.status / 100 == 2 {
             let sdp = parse_body(&resp, base)?;
-            let has_talk = sdp
+            // A 2xx SDP is authoritative — a missing sendonly means
+            // the server ignored Require, so reuse it rather than
+            // re-DESCRIBE: VIGI firmware 400s ANY second DESCRIBE on
+            // a connection (B118).
+            let tagged = sdp
                 .audio
                 .iter()
                 .any(|m| m.direction.talks() && !m.payloads.is_empty());
-            if has_talk {
-                return Ok(Described { sdp, tagged: true });
-            }
-            // Absent sendonly — fall through to the untagged pass.
+            return Ok(Described { sdp, tagged });
         }
-        // 551 / Require rejection / absent sendonly → untagged pass.
+        // 551 / Require rejection carries no SDP → untagged pass.
     }
     let resp = timed(client.request("DESCRIBE", client.base(), &[accept])).await?;
     if resp.status == 429 {
@@ -1036,7 +1040,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn want_talk_absent_sendonly_retries_untagged() {
+    async fn want_talk_absent_sendonly_reuses_tagged_sdp() {
+        // VIGI firmware 400s ANY second DESCRIBE on a connection —
+        // a tagged 2xx SDP that merely lacks sendonly must be reused
+        // for the untagged session, not re-described (B118).
         const RECV_SDP: &str =
             "v=0\r\nm=audio 0 RTP/AVP 8\r\na=recvonly\r\na=control:trackID=1\r\n";
         let _port_guard = VIGI_PORT.lock().await;
@@ -1059,6 +1066,38 @@ mod tests {
             "{:?}",
             sess.marks()
         );
+        sess.close().await;
+        let mut describes = Vec::new();
+        while let Ok(r) = st.got.try_recv() {
+            if r.starts_with("DESCRIBE") {
+                describes.push(r);
+            }
+        }
+        assert_eq!(describes.len(), 1);
+        assert!(describes[0].contains("Require:"));
+    }
+
+    #[tokio::test]
+    async fn want_talk_551_retries_untagged() {
+        // Require genuinely rejected (551) carries no SDP — the
+        // untagged DESCRIBE still runs on the same connection.
+        const RECV_SDP: &str =
+            "v=0\r\nm=audio 0 RTP/AVP 8\r\na=recvonly\r\na=control:trackID=1\r\n";
+        let mut st = stub_scripted(
+            |head| {
+                if head.starts_with("DESCRIBE") && head.contains("Require:") {
+                    "551"
+                } else {
+                    "200"
+                }
+            },
+            RECV_SDP,
+            10,
+        )
+        .await;
+        let client = RtspAudioClient::new(url(st.port), None);
+        let sess = client.open(true).await.unwrap();
+        assert!(sess.caps().listen);
         sess.close().await;
         let mut describes = Vec::new();
         while let Ok(r) = st.got.try_recv() {
