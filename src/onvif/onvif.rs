@@ -18,6 +18,7 @@ use hyper_util::{
 };
 use roxmltree::Document;
 use sha1::Digest as _;
+use std::fmt::Write as _;
 use std::{
     net::IpAddr,
     sync::atomic::{AtomicBool, AtomicI64, Ordering},
@@ -457,18 +458,19 @@ fn digest_authorization_with(
         challenge.realm, challenge.nonce
     );
     if let Some(a) = &challenge.algorithm {
-        out.push_str(&format!(", algorithm={a}"));
+        write!(out, ", algorithm={a}").ok();
     }
     if let Some(o) = &challenge.opaque {
-        out.push_str(&format!(", opaque=\"{o}\""));
+        write!(out, ", opaque=\"{o}\"").ok();
     }
     if let Some(q) = qop {
-        out.push_str(&format!(", qop={q}, nc={nc}, cnonce=\"{cnonce}\""));
+        write!(out, ", qop={q}, nc={nc}, cnonce=\"{cnonce}\"").ok();
     }
     out
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
@@ -575,10 +577,10 @@ mod tests {
             creds_from_url("rtsp://admin:p%40ss@cam/x")
         );
         assert_eq!(
-            ("".to_owned(), "".to_owned()),
+            (String::new(), String::new()),
             creds_from_url("rtsp://cam/x")
         );
-        assert_eq!(("".to_owned(), "".to_owned()), creds_from_url("not a url"));
+        assert_eq!((String::new(), String::new()), creds_from_url("not a url"));
     }
 
     #[test]

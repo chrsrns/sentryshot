@@ -15,6 +15,12 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use thiserror::Error;
 
+mod rtsp;
+mod sdp;
+
+pub use rtsp::{Interleaved, Response, RtspClient};
+pub use sdp::{AudioMedia, Codec, PayloadMap, Sdp, SdpDirection, parse as parse_sdp};
+
 /// Decoded PCM frame — Int16 little-endian, 8 kHz, mono.
 pub type PcmChunk = Vec<i16>;
 
