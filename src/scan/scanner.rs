@@ -10,6 +10,9 @@ use crate::{
     vendor, wsd,
 };
 use std::{
+    collections::HashSet,
+    net::Ipv4Addr,
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -20,6 +23,48 @@ const MCAST_WINDOW: Duration = Duration::from_secs(5);
 const UNICAST_WINDOW: Duration = Duration::from_secs(2);
 const FANOUT: usize = 8;
 const ENUM_BUDGET: Duration = Duration::from_secs(6);
+const VIGI_PROBE_BUDGET: Duration = Duration::from_secs(5);
+const MIN_PROBE_BUDGET: Duration = Duration::from_millis(500);
+
+/// Injectable VIGI `:8800` probe — `(target ip, creds, budget)` →
+/// the private talk handshake succeeded. Tests stub the seam; the
+/// production fn runs the real `VigiTalk::connect` handshake.
+type VigiProbeFn = Arc<
+    dyn Fn(Ipv4Addr, Creds, Duration) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync,
+>;
+
+fn default_vigi_probe() -> VigiProbeFn {
+    Arc::new(|ip: Ipv4Addr, creds: Creds, budget: Duration| {
+        Box::pin(async move {
+            let host = ip.to_string();
+            matches!(
+                tokio::time::timeout(
+                    budget,
+                    audio::VigiTalk::connect(&host, &creds.username, &creds.password)
+                )
+                .await,
+                Ok(audio::VigiProbe::Ready(_))
+            )
+        })
+    })
+}
+
+/// The V270 gate — `Some(target)` when the `:8800` probe should
+/// run: ONVIF yielded ⊥ backchannel, creds present, budget left.
+/// Per-IP scans probe the REQUESTED host; mcast scans probe the
+/// responder IP — a stray `ProbeMatch` ⊥ retargets creds.
+fn probe_target(
+    backchannel: bool,
+    creds: &Creds,
+    per_ip: Option<Ipv4Addr>,
+    dev_ip: Ipv4Addr,
+    remaining: Duration,
+) -> Option<Ipv4Addr> {
+    if backchannel || creds.is_empty() || remaining < MIN_PROBE_BUDGET {
+        return None;
+    }
+    Some(per_ip.unwrap_or(dev_ip))
+}
 
 type Outcome = Arc<Result<ScanResult, ScanError>>;
 type Slot = Option<(ScanRequest, watch::Receiver<Option<Outcome>>)>;
@@ -116,6 +161,8 @@ async fn run(req: &ScanRequest) -> Result<ScanResult, ScanError> {
     let mut set = tokio::task::JoinSet::new();
     let mut cams = Vec::new();
     let mut truncated = false;
+    let probe = default_vigi_probe();
+    let probed = Arc::new(Mutex::new(HashSet::new()));
     while !devices.is_empty() || !set.is_empty() {
         while set.len() < FANOUT && !devices.is_empty() {
             if remaining(deadline).is_zero() {
@@ -124,7 +171,9 @@ async fn run(req: &ScanRequest) -> Result<ScanResult, ScanError> {
             }
             let dev = devices.remove(0);
             let creds = creds.clone();
-            set.spawn(async move { scan_one(dev, creds, per_ip, deadline).await });
+            let probe = probe.clone();
+            let probed = probed.clone();
+            set.spawn(async move { scan_one(dev, creds, per_ip, deadline, probe, probed).await });
         }
         if truncated {
             break;
@@ -151,6 +200,8 @@ async fn scan_one(
     creds: Creds,
     per_ip: Option<std::net::Ipv4Addr>,
     deadline: Instant,
+    probe: VigiProbeFn,
+    probed: Arc<Mutex<HashSet<Ipv4Addr>>>,
 ) -> DiscoveredCamera {
     let mut input = assemble::Input {
         onvif: Vec::new(),
@@ -177,6 +228,20 @@ async fn scan_one(
         }
     }
 
+    // VIGI private-audio probe (V270) — before vendor/path/codec
+    // probes can exhaust the deadline, on both scan_one exits.
+    let mut vigi_talk = false;
+    if let Some(target) = probe_target(backchannel, &creds, per_ip, dev.ip, remaining(deadline))
+        && probed.lock().await.insert(target)
+    {
+        vigi_talk = probe(
+            target,
+            creds.clone(),
+            remaining(deadline).min(VIGI_PROBE_BUDGET),
+        )
+        .await;
+    }
+
     // Per-IP probes target the REQUESTED host — a stray or spoofed
     // unicast reply must never retarget probing or creds.
     let Some(probe_ip) = per_ip else {
@@ -187,6 +252,7 @@ async fn scan_one(
             dev.xaddrs,
             ptz,
             backchannel,
+            vigi_talk,
             &input,
         );
         fill_codecs(&mut cam, &creds, deadline).await;
@@ -232,6 +298,7 @@ async fn scan_one(
         dev.xaddrs,
         ptz,
         backchannel,
+        vigi_talk,
         &input,
     );
     fill_codecs(&mut cam, &creds, deadline).await;
@@ -306,6 +373,124 @@ mod tests {
             .unwrap();
         let leader_out = leader.await.unwrap().unwrap();
         assert_eq!(leader_out, joined);
+    }
+
+    fn creds() -> Creds {
+        Creds {
+            username: "u".into(),
+            password: "p".into(),
+        }
+    }
+
+    fn dev(ip: &str, xaddr: &str) -> DiscoveredDevice {
+        DiscoveredDevice {
+            epr: "urn:uuid:t".into(),
+            xaddrs: vec![xaddr.into()],
+            ip: ip.parse().unwrap(),
+            name: None,
+            hardware: None,
+        }
+    }
+
+    fn recording_probe(hits: Arc<Mutex<Vec<Ipv4Addr>>>, out: bool) -> VigiProbeFn {
+        Arc::new(move |ip, _c, _b| {
+            let hits = hits.clone();
+            Box::pin(async move {
+                hits.lock().await.push(ip);
+                out
+            })
+        })
+    }
+
+    // `:1` refuses instantly — enumerate fails fast, so the probe
+    // path under test is the enumerate-failed branch.
+    fn refused_dev() -> DiscoveredDevice {
+        dev("127.0.0.1", "http://127.0.0.1:1/onvif/device_service")
+    }
+
+    #[test]
+    fn probe_target_gates() {
+        let ip: Ipv4Addr = "192.0.2.9".parse().unwrap();
+        let req: Ipv4Addr = "192.0.2.7".parse().unwrap();
+        let budget = Duration::from_secs(3);
+
+        // ONVIF backchannel already advertised → no private probe.
+        assert_eq!(None, probe_target(true, &creds(), None, ip, budget));
+        // Empty creds → skip (V219 posture).
+        assert_eq!(
+            None,
+            probe_target(false, &Creds::default(), None, ip, budget)
+        );
+        // Starved deadline → skip rather than borrow codec budget.
+        assert_eq!(
+            None,
+            probe_target(false, &creds(), None, ip, Duration::from_millis(10))
+        );
+        // Per-IP scans probe the REQUESTED host, never the responder.
+        assert_eq!(
+            Some(req),
+            probe_target(false, &creds(), Some(req), ip, budget)
+        );
+        // Multicast scans probe the responder IP.
+        assert_eq!(Some(ip), probe_target(false, &creds(), None, ip, budget));
+    }
+
+    #[tokio::test]
+    async fn vigi_probe_targets_requested_host_per_ip() {
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let req: Ipv4Addr = "192.0.2.7".parse().unwrap();
+        let cam = scan_one(
+            refused_dev(),
+            creds(),
+            Some(req),
+            Instant::now() + DEADLINE,
+            recording_probe(hits.clone(), true),
+            Arc::new(Mutex::new(HashSet::new())),
+        )
+        .await;
+        assert_eq!(vec![req], *hits.lock().await);
+        assert!(cam.vigi_talk);
+    }
+
+    #[tokio::test]
+    async fn vigi_probe_targets_responder_in_mcast() {
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let cam = scan_one(
+            refused_dev(),
+            creds(),
+            None,
+            Instant::now() + DEADLINE,
+            recording_probe(hits.clone(), true),
+            Arc::new(Mutex::new(HashSet::new())),
+        )
+        .await;
+        assert_eq!(
+            vec!["127.0.0.1".parse::<Ipv4Addr>().unwrap()],
+            *hits.lock().await
+        );
+        assert!(cam.vigi_talk);
+    }
+
+    #[tokio::test]
+    async fn vigi_probe_dedupes_across_devices() {
+        // A second stray responder for the same target must not
+        // re-probe — the shared set suppresses it.
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let probed = Arc::new(Mutex::new(HashSet::new()));
+        let req: Ipv4Addr = "192.0.2.7".parse().unwrap();
+        for _ in 0..2 {
+            let cam = scan_one(
+                refused_dev(),
+                creds(),
+                Some(req),
+                Instant::now() + DEADLINE,
+                recording_probe(hits.clone(), true),
+                probed.clone(),
+            )
+            .await;
+            assert!(cam.vigi_talk || hits.lock().await.len() == 1);
+        }
+        assert_eq!(1, hits.lock().await.len());
     }
 
     #[test]

@@ -2320,6 +2320,7 @@ name = "scan"
 version = "0.3.11"
 dependencies = [
  "async-trait",
+ "audio",
  "axum 0.8.1",
  "base64 0.22.1",
  "bytes",

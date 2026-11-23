@@ -53,6 +53,7 @@ pub struct ScanResult {
 }
 
 /// A discovered camera as returned to the FE.
+#[allow(clippy::struct_excessive_bools)] // serde DTO — flags stay flat on the wire
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveredCamera {
@@ -78,6 +79,11 @@ pub struct DiscoveredCamera {
 
     /// Capability flag, record-only.
     pub backchannel: bool,
+
+    /// VIGI `:8800` private-talk probe outcome flag, record-only —
+    /// `true` records a succeeded handshake, ⊥ capability proof
+    /// (bad creds ∨ a busy talker also read `false`).
+    pub vigi_talk: bool,
 
     /// Any enumerated surface answered `401`/`NotAuthorized`.
     pub needs_auth: bool,
@@ -257,6 +263,7 @@ mod tests {
                 }],
                 ptz: true,
                 backchannel: false,
+                vigi_talk: true,
                 needs_auth: true,
             }],
             truncated: true,
@@ -266,6 +273,7 @@ mod tests {
         let cam = &json["cameras"][0];
         assert_eq!("10.0.0.1", cam["ip"]);
         assert_eq!(true, cam["needsAuth"]);
+        assert_eq!(true, cam["vigiTalk"]);
         let stream = &cam["streams"][0];
         assert_eq!("rtsp://10.0.0.1/x", stream["rtspUrl"]);
         assert_eq!("main", stream["role"]);

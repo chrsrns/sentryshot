@@ -86,7 +86,7 @@ impl VigiTalk {
 
     /// `connect` with an explicit `host:port` — stub-server tests
     /// can't bind :8800.
-    pub(crate) async fn connect_addr(addr: &str, user: &str, pass: &str) -> VigiProbe {
+    pub async fn connect_addr(addr: &str, user: &str, pass: &str) -> VigiProbe {
         let Ok(Ok(stream)) = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await
         else {
             return VigiProbe::Unreachable;
@@ -129,12 +129,7 @@ impl VigiTalk {
                     break;
                 }
                 401 => {
-                    let www = head
-                        .lines()
-                        .find_map(|l| l.strip_prefix("WWW-Authenticate: "))
-                        .unwrap_or("")
-                        .trim();
-                    let Some(challenge) = onvif::parse_digest_challenge(www) else {
+                    let Some(challenge) = digest_challenge(&head) else {
                         return VigiProbe::Refused;
                     };
                     auth = Some(onvif::digest_authorization(
@@ -218,6 +213,21 @@ impl VigiTalk {
 }
 
 /// Read one response head (`\r\n\r\n`-terminated); `None` on EOF.
+/// First Digest challenge among ∀ `WWW-Authenticate` lines,
+/// case-insensitive — VIGI answers `Basic` before `Digest` (B117);
+/// only a Digest challenge is usable here.
+fn digest_challenge(head: &str) -> Option<onvif::DigestChallenge> {
+    head.lines()
+        .filter_map(|l| {
+            l.split_once(':').and_then(|(k, v)| {
+                k.trim()
+                    .eq_ignore_ascii_case("www-authenticate")
+                    .then(|| v.trim())
+            })
+        })
+        .find_map(onvif::parse_digest_challenge)
+}
+
 async fn read_head(
     rd: &mut tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
 ) -> std::io::Result<Option<String>> {
@@ -541,15 +551,20 @@ mod tests {
             };
             tx.send(head.into_bytes()).await.unwrap();
             match mode {
-                "401" => {
-                    wr.write_all(
+                "401" | "401-basic-first" => {
+                    let challenge = if mode == "401-basic-first" {
+                        b"HTTP/1.1 401 Unauthorized\r\n\
+                          WWW-Authenticate: Basic realm=\"vigi\"\r\n\
+                          WWW-Authenticate: Digest realm=\"vigi\", nonce=\"abc123\", qop=\"auth\"\r\n\
+                          Content-Length: 0\r\n\r\n"
+                            .as_slice()
+                    } else {
                         b"HTTP/1.1 401 Unauthorized\r\n\
                           WWW-Authenticate: Digest realm=\"vigi\", nonce=\"abc123\", qop=\"auth\"\r\n\
                           Content-Length: 0\r\n\r\n"
-                            .as_slice(),
-                    )
-                    .await
-                    .unwrap();
+                            .as_slice()
+                    };
+                    wr.write_all(challenge).await.unwrap();
                     let Some(head) = req_head(&mut rd).await else {
                         return;
                     };
@@ -653,6 +668,29 @@ mod tests {
         }
         let (_off, want) = part_shape(&buf);
         assert_eq!(want, TS_SIZE);
+    }
+
+    #[tokio::test]
+    async fn basic_then_digest_vigi_challenge() {
+        // VIGI 401s offer `Basic` before `Digest` (B117) — the
+        // Digest challenge must win regardless of header order.
+        let (addr, mut rx) = stub_vigi("401-basic-first").await;
+        let probe = VigiTalk::connect_addr(&addr, "admin", "admin").await;
+        let talk = match probe {
+            VigiProbe::Ready(t) => t,
+            other => panic!("expected Ready, got {}", probe_name(&other)),
+        };
+        let _ = rx.recv().await.unwrap();
+        let r2 = String::from_utf8(rx.recv().await.unwrap()).unwrap();
+        let auth = r2
+            .lines()
+            .find_map(|l| l.strip_prefix("Authorization: "))
+            .unwrap();
+        assert!(auth.starts_with("Digest"), "{auth}");
+        // Drain the session-open parts so the stub finishes clean.
+        let _ = rx.recv().await;
+        let _ = rx.recv().await;
+        talk.drain.abort();
     }
 
     /// Locate the `\r\n\r\n` boundary and read the part's

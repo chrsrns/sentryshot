@@ -380,7 +380,7 @@ function newScanModal(token) {
 			if (cam.ptz) {
 				badges.push("ptz");
 			}
-			if (cam.backchannel) {
+			if (cam.backchannel || cam.vigiTalk) {
 				badges.push("audio");
 			}
 			if (badges.length > 0) {
@@ -511,9 +511,9 @@ function newScanModal(token) {
 						},
 						name: sanitizeMonitorName(cam.name, cam.ip),
 					};
-					if (cam.backchannel === true) {
-						// ONVIF backchannel advertised → prefill audio;
-						// the user can still un-toggle it.
+					if (cam.backchannel === true || cam.vigiTalk === true) {
+						// ONVIF backchannel or VIGI :8800 probe hit →
+						// prefill audio; the user can still un-toggle it.
 						// @ts-ignore
 						prefill.audio = { enable: true };
 					}

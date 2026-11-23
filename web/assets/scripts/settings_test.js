@@ -1238,6 +1238,38 @@ describe("scan pick ptz prefill", () => {
 		expect(picked.ptz).toEqual({ enable: true, onvifAddr: "" });
 	});
 
+	test("vigiTalk camera prefills audio and shows the badge", async () => {
+		document.body.replaceChildren();
+		const modal = newScanModal("token");
+		let picked;
+		modal.onPick = (p) => {
+			picked = p;
+		};
+		await runScan(modal, {
+			cameras: [
+				{
+					ip: "10.0.0.9",
+					name: "Cam",
+					xaddrs: ["http://cam/onvif"],
+					ptz: false,
+					backchannel: false,
+					vigiTalk: true,
+					needsAuth: false,
+					streams: [
+						{ role: "main", rtspUrl: "rtsp://10.0.0.9/main", videoCodec: "h264" },
+					],
+				},
+			],
+			truncated: false,
+		});
+		expect(modal.elem.textContent).toContain("audio");
+		const useBtn = [...modal.elem.querySelectorAll("button")].find(
+			(b) => b.textContent.trim() === "Use",
+		);
+		useBtn.click();
+		expect(picked.audio).toEqual({ enable: true });
+	});
+
 	test("non-ptz camera adds no ptz prefill", async () => {
 		document.body.replaceChildren();
 		const modal = newScanModal("token");

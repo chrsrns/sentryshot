@@ -123,6 +123,7 @@ fn collect_cands(ip: Ipv4Addr, input: &Input) -> (Vec<Cand>, bool) {
 
 /// Assemble one `DiscoveredCamera` — pure, no I/O.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn assemble(
     ip: Ipv4Addr,
     name: Option<String>,
@@ -130,6 +131,7 @@ pub fn assemble(
     xaddrs: Vec<String>,
     ptz: bool,
     backchannel: bool,
+    vigi_talk: bool,
     input: &Input,
 ) -> DiscoveredCamera {
     let (cands, needs_auth) = collect_cands(ip, input);
@@ -204,6 +206,7 @@ pub fn assemble(
         streams,
         ptz,
         backchannel,
+        vigi_talk,
         needs_auth,
     }
 }
@@ -247,7 +250,7 @@ mod tests {
     fn roles_by_resolution_then_deterministic() {
         let mut i = empty();
         i.onvif = vec![profile("sub", 640, 360), profile("main", 1920, 1080)];
-        let cam = assemble(ip(), None, None, vec![], false, false, &i);
+        let cam = assemble(ip(), None, None, vec![], false, false, false, &i);
         assert_eq!(ScanRole::Main, cam.streams[0].role);
         assert_eq!(
             Some(Resolution {
@@ -271,7 +274,7 @@ mod tests {
             auth: None,
             codec: None,
         }];
-        let cam = assemble(ip(), None, None, vec![], false, false, &i);
+        let cam = assemble(ip(), None, None, vec![], false, false, false, &i);
         assert_eq!(1, cam.streams.len());
     }
 
@@ -296,7 +299,7 @@ mod tests {
                 codec: None,
             },
         ];
-        let cam = assemble(ip(), None, None, vec![], false, false, &i);
+        let cam = assemble(ip(), None, None, vec![], false, false, false, &i);
         assert!(cam.needs_auth);
         assert!(cam.streams[0].rtsp_url.contains("admin"));
         assert!(cam.streams[0].rtsp_url.contains("p%40ss"));
@@ -314,7 +317,16 @@ mod tests {
             },
             "http://x/video".into(),
         )];
-        let cam = assemble(ip(), Some("cam".into()), None, vec![], true, false, &i);
+        let cam = assemble(
+            ip(),
+            Some("cam".into()),
+            None,
+            vec![],
+            true,
+            false,
+            false,
+            &i,
+        );
         assert!(cam.streams.is_empty());
         assert!(cam.ptz);
     }
@@ -331,7 +343,7 @@ mod tests {
             auth: None,
             codec: Some("h264".into()),
         }];
-        let cam = assemble(ip(), None, None, vec![], false, false, &i);
+        let cam = assemble(ip(), None, None, vec![], false, false, false, &i);
         assert_eq!(1, cam.streams.len());
         assert_eq!("h264", cam.streams[0].video_codec);
     }
@@ -340,7 +352,7 @@ mod tests {
     fn onvif_streams_default_unknown_codec() {
         let mut i = empty();
         i.onvif = vec![profile("x", 1920, 1080)];
-        let cam = assemble(ip(), None, None, vec![], false, false, &i);
+        let cam = assemble(ip(), None, None, vec![], false, false, false, &i);
         assert_eq!("unknown", cam.streams[0].video_codec);
     }
 
@@ -357,7 +369,7 @@ mod tests {
                 auth: None,
             },
         ];
-        let cam = assemble(ip(), None, None, vec![], false, false, &i);
+        let cam = assemble(ip(), None, None, vec![], false, false, false, &i);
         assert_eq!(ScanRole::Main, cam.streams[0].role);
         assert_eq!(ScanRole::Sub, cam.streams[1].role);
     }

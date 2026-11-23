@@ -347,7 +347,10 @@ pub struct DigestChallenge {
 /// missing the mandatory `realm`/`nonce`.
 #[must_use]
 pub fn parse_digest_challenge(header: &str) -> Option<DigestChallenge> {
-    let rest = header.strip_prefix("Digest")?;
+    let rest = header
+        .get(..6)
+        .filter(|s| s.eq_ignore_ascii_case("digest"))
+        .map(|_| &header[6..])?;
     let mut c = DigestChallenge {
         realm: String::new(),
         nonce: String::new(),
