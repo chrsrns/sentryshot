@@ -161,10 +161,14 @@ impl VigiTalk {
         if wr.write_all(part.as_bytes()).await.is_err() {
             return VigiProbe::Refused;
         }
-        let Ok(Some(session_id)) =
-            tokio::time::timeout(CONNECT_TIMEOUT, read_session_id(&mut rd)).await
-        else {
-            return VigiProbe::Refused;
+        let session_id = match tokio::time::timeout(CONNECT_TIMEOUT, read_session_id(&mut rd)).await
+        {
+            // EOF/malformed mid-POST — the peer disproved the
+            // protocol; persists (V259 boundary).
+            Ok(Some(id)) => id,
+            Ok(None) => return VigiProbe::Refused,
+            // Answer-then-stall is a transport fault — session-only.
+            Err(_) => return VigiProbe::Unreachable,
         };
         // Muxer header is the first audio part (PAT+PMT).
         let mut talk = Self {

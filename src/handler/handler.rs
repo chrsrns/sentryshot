@@ -1169,10 +1169,12 @@ async fn audio_consumer(
                     let Some(Some(config)) =
                         state.monitors.monitor_config(monitor_id.clone()).await
                     else {
+                        _ = socket.send(close_frame(1000)).await;
                         break;
                     };
                     if !config.config().audio.enable() {
                         state.service.drop_entry(&monitor_id).await;
+                        _ = socket.send(close_frame(1000)).await;
                         break;
                     }
                     match ctrl.kind.as_str() {
@@ -1182,20 +1184,27 @@ async fn audio_consumer(
                                 consumer, audio::Direction::Listen, &drop_tx, &mut socket, &mut ctrl_rx,
                             ).await {
                                 Some(e) => {
-                                    has_interest = true;
-                                    pcm_rx = e.subscribe_pcm().await;
+                                    // Only a granted attach counts —
+                                    // busy/unsupported leaves the
+                                    // directionless clock armed.
+                                    has_interest = e.has_interest(consumer).await;
+                                    if has_interest {
+                                        pcm_rx = e.subscribe_pcm().await;
+                                    }
                                 }
                                 None => break,
                             }
                         }
                         "talk-start" => {
-                            if attach_direction(
+                            match attach_direction(
                                 &state, &monitor_id, &config, &mut entry,
                                 consumer, audio::Direction::Talk, &drop_tx, &mut socket, &mut ctrl_rx,
-                            ).await.is_none() {
-                                break;
+                            ).await {
+                                Some(e) => {
+                                    has_interest = e.has_interest(consumer).await;
+                                }
+                                None => break,
                             }
-                            has_interest = true;
                         }
                         "listen-stop" => {
                             if let Some(e) = &entry {

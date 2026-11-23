@@ -155,8 +155,14 @@ impl RtspAudioClient {
             next_ch += 2;
             let codec = m.payloads[0].codec;
             let pt = m.payloads[0].pt;
-            if let Some(id) =
-                setup(&client, m, ch, described.tagged && is_talk, &session_id).await?
+            if let Some(id) = setup(
+                &client,
+                m,
+                ch,
+                described.tagged && (is_talk || same_media),
+                &session_id,
+            )
+            .await?
             {
                 session_id = id;
             }
