@@ -20,10 +20,12 @@ mod rtp;
 mod rtsp;
 mod sdp;
 mod session;
+mod vigi;
 
 pub use rtsp::{Interleaved, Response, RtspClient};
 pub use sdp::{AudioMedia, Codec, PayloadMap, Sdp, SdpDirection, parse as parse_sdp};
 pub use session::RtspAudioClient;
+pub use vigi::{VigiProbe, VigiTalk};
 
 /// Decoded PCM frame — Int16 little-endian, 8 kHz, mono.
 pub type PcmChunk = Vec<i16>;

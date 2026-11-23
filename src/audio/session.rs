@@ -101,10 +101,35 @@ impl RtspAudioClient {
             .ok_or_else(|| Error::Protocol("media channel already taken".into()))?;
 
         // Track selection + marks.
-        let (listen_sel, talk_sel, marks) = select(&described.sdp, want_talk);
-        if listen_sel.is_none() && talk_sel.is_none() {
+        let (listen_sel, talk_sel, mut marks) = select(&described.sdp, want_talk);
+
+        // VIGI :8800 talk fallback (V259) — ONVIF yielded no talk
+        // track on a want_talk open ⇒ unconditional probe; outcome
+        // decides the talk mark's class.
+        let mut vigi: Option<crate::vigi::VigiTalk> = None;
+        if want_talk && talk_sel.is_none() {
+            let user = self.url.username().to_owned();
+            let pass = self.url.password().unwrap_or("").to_owned();
+            if let Some(host) = self.url.host_str() {
+                match crate::vigi::VigiTalk::connect(host, &user, &pass).await {
+                    crate::vigi::VigiProbe::Ready(v) => {
+                        vigi = Some(v);
+                        marks.retain(|(d, _)| *d != Direction::Talk);
+                    }
+                    crate::vigi::VigiProbe::Unreachable => {}
+                    crate::vigi::VigiProbe::Refused => {
+                        for (d, c) in &mut marks {
+                            if *d == Direction::Talk {
+                                *c = FaultClass::Capability;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if listen_sel.is_none() && talk_sel.is_none() && vigi.is_none() {
             client.close();
-            return Err(Error::Protocol("no usable audio m= line".into()));
+            return Err(Error::Protocol("no usable audio path".into()));
         }
 
         // SETUP each selected track on fresh channel pairs.
@@ -139,17 +164,22 @@ impl RtspAudioClient {
             }
         }
 
-        // PLAY the aggregate control URL.
-        let session_hdr = ("Session", session_id.as_str());
-        let require_hdr = ("Require", REQUIRE);
-        let mut extra = vec![session_hdr];
-        if described.tagged {
-            extra.push(require_hdr);
-        }
-        let resp = timed(client.request("PLAY", &described.sdp.control, &extra)).await?;
-        if resp.status / 100 != 2 {
-            client.close();
-            return Err(Error::Protocol(format!("PLAY status {}", resp.status)));
+        // PLAY the aggregate control URL — only when a track was
+        // SETUP'd; a pure-VIGI talk session owns no RTSP session.
+        let mut keepalive = DEFAULT_SESSION_TIMEOUT;
+        if listen.is_some() || talk.is_some() {
+            let session_hdr = ("Session", session_id.as_str());
+            let require_hdr = ("Require", REQUIRE);
+            let mut extra = vec![session_hdr];
+            if described.tagged {
+                extra.push(require_hdr);
+            }
+            let resp = timed(client.request("PLAY", &described.sdp.control, &extra)).await?;
+            if resp.status / 100 != 2 {
+                client.close();
+                return Err(Error::Protocol(format!("PLAY status {}", resp.status)));
+            }
+            keepalive = session_timeout(&resp);
         }
 
         Ok(RtspSession::start(
@@ -157,9 +187,10 @@ impl RtspAudioClient {
             session_id,
             described.sdp.control,
             described.tagged,
-            session_timeout(&resp),
+            keepalive,
             listen,
             talk,
+            vigi,
             media_rx,
             marks,
         ))
@@ -317,13 +348,19 @@ struct ListenState {
     rx: Mutex<broadcast::Receiver<PcmChunk>>,
 }
 
+/// Where the pacer writes talk media — RTSP interleaved or the
+/// VIGI `:8800` multipart writer (V259 composition).
+enum TalkOut {
+    Rtsp { ch: u8, pt: u8 },
+    Vigi(Mutex<crate::vigi::VigiTalk>),
+}
+
 /// Talk-path state — bounded PCM queue shared with the pacer.
 struct TalkShared {
     queue: Mutex<VecDeque<PcmChunk>>,
     notify: Notify,
-    ch: u8,
     codec: sdp::Codec,
-    pt: u8,
+    out: TalkOut,
 }
 
 /// A live audio session.
@@ -352,6 +389,7 @@ impl RtspSession {
         keepalive: Duration,
         listen: Option<Binding>,
         talk: Option<Binding>,
+        vigi: Option<crate::vigi::VigiTalk>,
         media_rx: mpsc::Receiver<Interleaved>,
         marks: Vec<(Direction, FaultClass)>,
     ) -> ArcAudioSession {
@@ -366,18 +404,28 @@ impl RtspSession {
             ListenState { rx: Mutex::new(rx) }
         });
 
-        // Talk pacer — 20 ms ticks, one ≤160-sample RTP per tick.
-        let talk_state = talk.map(|b| {
-            let t = Arc::new(TalkShared {
-                queue: Mutex::new(VecDeque::with_capacity(TALK_QUEUE)),
-                notify: Notify::new(),
-                ch: b.channel,
-                codec: b.codec,
-                pt: b.pt,
+        // Talk pacer — 20 ms ticks, one ≤160-sample frame per tick.
+        let talk_state = talk
+            .map(|b| {
+                (
+                    b.codec,
+                    TalkOut::Rtsp {
+                        ch: b.channel,
+                        pt: b.pt,
+                    },
+                )
+            })
+            .or_else(|| vigi.map(|v| (sdp::Codec::Pcma, TalkOut::Vigi(Mutex::new(v)))))
+            .map(|(codec, out)| {
+                let t = Arc::new(TalkShared {
+                    queue: Mutex::new(VecDeque::with_capacity(TALK_QUEUE)),
+                    notify: Notify::new(),
+                    codec,
+                    out,
+                });
+                tasks.push(tokio::spawn(pacer(client.clone(), t.clone())));
+                t
             });
-            tasks.push(tokio::spawn(pacer(client.clone(), t.clone())));
-            t
-        });
 
         let session = Arc::new(Self {
             client,
@@ -477,12 +525,17 @@ async fn pacer(client: Arc<RtspClient>, state: Arc<TalkShared>) {
             q.push_front(rest);
         }
         drop(q);
-        let payload = g711::encode(state.codec, &chunk);
-        if client
-            .send_interleaved(state.ch, &rtp::build(state.pt, seq, ts, ssrc, &payload))
-            .await
-            .is_err()
-        {
+        let sent = match &state.out {
+            TalkOut::Rtsp { ch, pt } => {
+                let payload = g711::encode(state.codec, &chunk);
+                client
+                    .send_interleaved(*ch, &rtp::build(*pt, seq, ts, ssrc, &payload))
+                    .await
+                    .is_ok()
+            }
+            TalkOut::Vigi(v) => v.lock().await.send(&chunk, ts).await.is_ok(),
+        };
+        if !sent {
             return;
         }
         seq = seq.wrapping_add(1);
@@ -546,6 +599,10 @@ impl AudioSession for RtspSession {
 mod tests {
     use super::*;
     use crate::{Codec, Direction};
+
+    /// Serializes tests that can hit the fixed VIGI `:8800` port —
+    /// a bound stub would answer *any* test's probe.
+    static VIGI_PORT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     use pretty_assertions::assert_eq;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -740,6 +797,7 @@ mod tests {
     async fn want_talk_absent_sendonly_retries_untagged() {
         const RECV_SDP: &str =
             "v=0\r\nm=audio 0 RTP/AVP 8\r\na=recvonly\r\na=control:trackID=1\r\n";
+        let _port_guard = VIGI_PORT.lock().await;
         let mut st = stub(RECV_SDP).await;
         let client = RtspAudioClient::new(url(st.port));
         let sess = client.open(true).await.unwrap();
@@ -794,6 +852,7 @@ mod tests {
     #[tokio::test]
     async fn inactive_only_sdp_opens_nothing() {
         const INACT: &str = "v=0\r\nm=audio 0 RTP/AVP 0\r\na=inactive\r\na=control:trackID=1\r\n";
+        let _port_guard = VIGI_PORT.lock().await;
         let st = stub(INACT).await;
         let client = RtspAudioClient::new(url(st.port));
         let Err(err) = client.open(true).await else {
@@ -975,6 +1034,84 @@ mod tests {
             }
         }
         assert_eq!(n_opts, 1); // the initial probe only
+    }
+
+    /// VIGI composition (V259): recvonly-only SDP on a `want_talk`
+    /// open → `:8800` probe answers → talk rides the VIGI writer.
+    /// Skips silently when `:8800` is already bound locally.
+    #[tokio::test]
+    async fn vigi_fallback_composes_duplex() {
+        const RECV_SDP_V: &str =
+            "v=0\r\nm=audio 0 RTP/AVP 8\r\na=recvonly\r\na=control:trackID=1\r\n";
+        let _port_guard = VIGI_PORT.lock().await;
+        let Ok(lis8800) = TcpListener::bind("127.0.0.1:8800").await else {
+            return; // port held — skip
+        };
+        let (tx, mut parts) = tmpsc::channel::<Vec<u8>>(32);
+        tokio::spawn(async move {
+            let Ok((stream, _)) = lis8800.accept().await else {
+                return;
+            };
+            let (rd, mut wr) = stream.into_split();
+            let mut rd = tokio::io::BufReader::new(rd);
+            // 200 immediately (no auth challenge — stub posture).
+            let _ = read_head(&mut rd).await;
+            wr.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/mixed\r\n\r\n")
+                .await
+                .unwrap();
+            let mut buf = vec![0_u8; 4096];
+            // Talk-request part → session_id reply.
+            let _ = rd.read(&mut buf).await.unwrap();
+            let body = r#"{"params":{"session_id":"s1"}}"#;
+            let sid = format!(
+                "--device-stream-boundary--\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            wr.write_all(sid.as_bytes()).await.unwrap();
+            loop {
+                let n = rd.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                if tx.send(buf[..n].to_vec()).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let mut st = stub(RECV_SDP_V).await;
+        let client = RtspAudioClient::new(url(st.port));
+        let sess = client.open(true).await.unwrap();
+        assert_eq!(
+            sess.caps(),
+            AudioCaps {
+                listen: true,
+                talk: true
+            }
+        );
+        // The talk mark candidate cleared on VIGI success.
+        assert!(
+            !sess.marks().iter().any(|(d, _)| *d == Direction::Talk),
+            "{:?}",
+            sess.marks()
+        );
+        sess.talk(&[1000_i16; 160]).await.unwrap();
+        // The pacer emits an audio/mp2t part within a tick.
+        let mut got = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+            let Ok(Some(chunk)) = tokio::time::timeout_at(deadline, parts.recv()).await else {
+                break;
+            };
+            got.extend_from_slice(&chunk);
+        }
+        let text = String::from_utf8_lossy(&got);
+        assert!(
+            text.contains("audio/mp2t") || got.windows(4).any(|w| w == b"\r\n\r\n"),
+            "{text}"
+        );
+        sess.close().await;
+        let _ = &mut st;
     }
 
     #[tokio::test]
