@@ -282,7 +282,9 @@ impl App {
 
         let persist_monitors = self.monitor_manager.clone();
         let audio_service = Arc::new(audio::AudioService::new(
-            Arc::new(|url| -> audio::ArcAudioClient { Arc::new(audio::RtspAudioClient::new(url)) }),
+            Arc::new(|url, alt| -> audio::ArcAudioClient {
+                Arc::new(audio::RtspAudioClient::new(url, alt))
+            }),
             Arc::new(move |monitor_id, marks| {
                 let monitors = persist_monitors.clone();
                 Box::pin(persist_audio_marks(monitors, monitor_id, marks))

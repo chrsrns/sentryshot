@@ -709,7 +709,9 @@ mod audio_tests {
         let p = persisted.clone();
         (
             Arc::new(audio::AudioService::new(
-                Arc::new(|url| Arc::new(audio::RtspAudioClient::new(url)) as audio::ArcAudioClient),
+                Arc::new(|url, alt| {
+                    Arc::new(audio::RtspAudioClient::new(url, alt)) as audio::ArcAudioClient
+                }),
                 Arc::new(move |id: MonitorId, marks: Vec<String>| {
                     let p = p.clone();
                     Box::pin(async move {
@@ -855,6 +857,32 @@ mod audio_tests {
             panic!("expected close frame");
         };
         assert_eq!(frame.code, 1008);
+    }
+
+    #[test]
+    fn audio_entry_key_covers_sub_stream() {
+        let base = monitor_config_audio(true, &[]);
+        let k1 = crate::audio_key(&base);
+        assert!(!k1.contains('|'), "{k1}");
+
+        // Same mainStream, different subStream → different key —
+        // the 429-retry URL must force an entry rebuild.
+        let with_sub: MonitorConfig = serde_json::from_value(serde_json::json!({
+            "id": "m1", "name": "m", "enable": true,
+            "source": "rtsp",
+            "sourcertsp": {
+                "protocol": "tcp",
+                "mainStream": "rtsp://u%40x:p%40ss@cam/main",
+                "subStream": "rtsp://u%40x:p%40ss@cam/sub",
+            },
+            "alwaysRecord": false, "videoLength": 0.0,
+            "ptz": {"enable": false, "onvifAddr": ""},
+            "audio": {"enable": true, "unsupported": []},
+        }))
+        .unwrap();
+        let k2 = crate::audio_key(&with_sub);
+        assert_ne!(k1, k2);
+        assert!(k2.contains("sub"), "{k2}");
     }
 }
 // SPDX-SnippetEnd

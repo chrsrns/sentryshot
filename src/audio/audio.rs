@@ -115,6 +115,12 @@ pub enum Error {
     #[error("authentication failed")]
     Auth,
 
+    /// Camera declined for stream/session budget (`429`) —
+    /// retryable on an alternate URL or later. Payload-free:
+    /// the `Display` rides `error` ctrls (V258 creds rule).
+    #[error("stream limit reached")]
+    StreamLimit,
+
     /// The direction is unsupported by the device/session —
     /// absent m=audio, codec outside PCMU/PCMA, `a=inactive`,
     /// or peer-declared non-support.
@@ -129,7 +135,7 @@ impl Error {
     #[must_use]
     pub fn class(&self) -> FaultClass {
         match self {
-            Self::Timeout(_) | Self::Transport(_) => FaultClass::Transport,
+            Self::Timeout(_) | Self::Transport(_) | Self::StreamLimit => FaultClass::Transport,
             Self::Protocol(_) | Self::Auth | Self::Unsupported(_) => FaultClass::Capability,
         }
     }

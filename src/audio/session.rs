@@ -47,14 +47,27 @@ const PCM_BROADCAST: usize = 16;
 /// `AudioClient` over a raw RTSP session.
 pub struct RtspAudioClient {
     url: url::Url,
+    /// V265 fallback — `subStream`; `None` when it names the same
+    /// endpoint as `url`.
+    alt_url: Option<url::Url>,
+}
+
+/// Creds-free endpoint identity — host, effective port, path,
+/// query. A `subStream` equal to `mainStream` is no fallback.
+fn same_endpoint(a: &url::Url, b: &url::Url) -> bool {
+    a.host_str() == b.host_str()
+        && a.port_or_known_default().unwrap_or(554) == b.port_or_known_default().unwrap_or(554)
+        && a.path() == b.path()
+        && a.query() == b.query()
 }
 
 impl RtspAudioClient {
-    /// New client for a monitor's `mainStream` URL (creds ride the
-    /// userinfo).
+    /// New client for a monitor's stream URLs (creds ride each
+    /// URL's own userinfo); `alt` retries the open on a `429`.
     #[must_use]
-    pub fn new(url: url::Url) -> Self {
-        Self { url }
+    pub fn new(url: url::Url, alt: Option<url::Url>) -> Self {
+        let alt_url = alt.filter(|a| !same_endpoint(&url, a));
+        Self { url, alt_url }
     }
 
     /// Camera host for the VIGI `:8800` probe (T142).
@@ -67,10 +80,21 @@ impl RtspAudioClient {
 #[async_trait]
 impl AudioClient for RtspAudioClient {
     async fn open(&self, want_talk: bool) -> Result<ArcAudioSession, Error> {
-        match tokio::time::timeout(OPEN_BUDGET, self.open_inner(want_talk)).await {
-            Ok(r) => r,
-            Err(_) => Err(Error::Timeout("session open")),
+        for (attempt, url) in std::iter::once(&self.url)
+            .chain(self.alt_url.iter())
+            .enumerate()
+        {
+            match tokio::time::timeout(OPEN_BUDGET, self.open_inner(url, want_talk, attempt > 0))
+                .await
+            {
+                // A saturated primary fully released → retry once on
+                // the alternate; a 429 there propagates as-is.
+                Ok(Err(Error::StreamLimit)) if attempt == 0 && self.alt_url.is_some() => {}
+                Ok(r) => return r,
+                Err(_) => return Err(Error::Timeout("session open")),
+            }
         }
+        unreachable!()
     }
 }
 
@@ -91,12 +115,23 @@ struct Described {
 }
 
 impl RtspAudioClient {
-    async fn open_inner(&self, want_talk: bool) -> Result<ArcAudioSession, Error> {
-        let mut client = RtspClient::connect(&self.url).await?;
-        // Liveness probe — any response proves the RTSP stack.
-        let _ = timed(client.request("OPTIONS", client.base(), &[])).await?;
+    /// One full negotiate on `url` — `alt` marks the V265 retry,
+    /// whose capability observations stay session-only (V266).
+    async fn open_inner(
+        &self,
+        url: &url::Url,
+        want_talk: bool,
+        alt: bool,
+    ) -> Result<ArcAudioSession, Error> {
+        let mut client = RtspClient::connect(url).await?;
+        // Liveness probe — any response proves the RTSP stack;
+        // a `429` is the saturation signal the retry acts on.
+        let resp = timed(client.request("OPTIONS", client.base(), &[])).await?;
+        if resp.status == 429 {
+            return Err(Error::StreamLimit);
+        }
 
-        let described = describe(&client, &self.url, want_talk).await?;
+        let described = describe(&client, url, want_talk).await?;
         let media_rx = client
             .take_media()
             .ok_or_else(|| Error::Protocol("media channel already taken".into()))?;
@@ -109,9 +144,9 @@ impl RtspAudioClient {
         // decides the talk mark's class.
         let mut vigi: Option<crate::vigi::VigiTalk> = None;
         if want_talk && talk_sel.is_none() {
-            let user = self.url.username().to_owned();
-            let pass = self.url.password().unwrap_or("").to_owned();
-            if let Some(host) = self.url.host_str() {
+            let user = url.username().to_owned();
+            let pass = url.password().unwrap_or("").to_owned();
+            if let Some(host) = url.host_str() {
                 match crate::vigi::VigiTalk::connect(host, &user, &pass).await {
                     crate::vigi::VigiProbe::Ready(v) => {
                         vigi = Some(v);
@@ -155,16 +190,21 @@ impl RtspAudioClient {
             next_ch += 2;
             let codec = m.payloads[0].codec;
             let pt = m.payloads[0].pt;
-            if let Some(id) = setup(
+            match setup(
                 &client,
                 m,
                 ch,
                 described.tagged && (is_talk || same_media),
                 &session_id,
             )
-            .await?
+            .await
             {
-                session_id = id;
+                Ok(Some(id)) => session_id = id,
+                Ok(None) => {}
+                Err(e) => {
+                    release(&client, &described.sdp.control, &session_id).await;
+                    return Err(e);
+                }
             }
             if is_talk {
                 talk = Some(Binding {
@@ -192,11 +232,26 @@ impl RtspAudioClient {
                 extra.push(require_hdr);
             }
             let resp = timed(client.request("PLAY", &described.sdp.control, &extra)).await?;
+            if resp.status == 429 {
+                release(&client, &described.sdp.control, &session_id).await;
+                return Err(Error::StreamLimit);
+            }
             if resp.status / 100 != 2 {
-                client.close();
+                release(&client, &described.sdp.control, &session_id).await;
                 return Err(Error::Protocol(format!("PLAY status {}", resp.status)));
             }
             keepalive = session_timeout(&resp);
+        }
+
+        // V266 — capability faults learned on the alternate URL
+        // disprove that URL only; downgrade them session-only so
+        // they never persist `audio.unsupported`.
+        if alt {
+            for (_, class) in &mut marks {
+                if *class == FaultClass::Capability {
+                    *class = FaultClass::Session;
+                }
+            }
         }
 
         Ok(RtspSession::start(
@@ -225,6 +280,16 @@ where
     }
 }
 
+/// Best-effort release — `TEARDOWN` when a `Session` was issued,
+/// then socket close. The reader aborts on drop regardless; this
+/// adds the graceful peer notification where possible.
+async fn release(client: &RtspClient, control: &str, session_id: &str) {
+    if !session_id.is_empty() {
+        _ = timed(client.request("TEARDOWN", control, &[("Session", session_id)])).await;
+    }
+    client.close();
+}
+
 /// DESCRIBE (+`Require` when `want_talk`) with the `551`/absent-
 /// sendonly untagged retry.
 async fn describe(
@@ -237,6 +302,9 @@ async fn describe(
         let resp =
             timed(client.request("DESCRIBE", client.base(), &[accept, ("Require", REQUIRE)]))
                 .await?;
+        if resp.status == 429 {
+            return Err(Error::StreamLimit);
+        }
         if resp.status / 100 == 2 {
             let sdp = parse_body(&resp, base)?;
             let has_talk = sdp
@@ -251,6 +319,9 @@ async fn describe(
         // 551 / Require rejection / absent sendonly → untagged pass.
     }
     let resp = timed(client.request("DESCRIBE", client.base(), &[accept])).await?;
+    if resp.status == 429 {
+        return Err(Error::StreamLimit);
+    }
     if resp.status / 100 != 2 {
         return Err(Error::Protocol(format!("DESCRIBE status {}", resp.status)));
     }
@@ -338,6 +409,9 @@ async fn setup(
         extra.push(("Session", session_id));
     }
     let resp = timed(client.request("SETUP", &m.control, &extra)).await?;
+    if resp.status == 429 {
+        return Err(Error::StreamLimit);
+    }
     if resp.status / 100 != 2 {
         return Err(Error::Protocol(format!("SETUP status {}", resp.status)));
     }
@@ -489,14 +563,17 @@ impl RtspSession {
                     break;
                 }
                 let extra = [("Session", this.session_id.as_str())];
-                if this
+                let ok = this
                     .client
                     .request("OPTIONS", &this.control, &extra)
                     .await
-                    .is_err()
-                {
+                    .map(|r| r.status / 100 == 2)
+                    .unwrap_or(false);
+                if !ok {
+                    // Socket fault ∨ non-2xx (`429`/`454`) — the
+                    // camera dropped the session; teardown follows.
                     _ = this.dead_tx.send(true);
-                    break; // reader dead / socket gone — session teardown follows
+                    break;
                 }
             }
         });
@@ -773,13 +850,140 @@ mod tests {
         url::Url::parse(&format!("rtsp://127.0.0.1:{port}/live")).unwrap()
     }
 
+    /// Scripted stub — `status_of` picks the reply per request
+    /// head; `session_timeout` rides SETUP replies. Logs every
+    /// request + an `EOF` marker when the client socket closes.
+    async fn stub_scripted(
+        status_of: impl Fn(&str) -> &'static str + Send + 'static,
+        sdp_body: &'static str,
+        session_timeout: u32,
+    ) -> Stub {
+        let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = lis.local_addr().unwrap().port();
+        let (tx, got) = tmpsc::channel::<String>(64);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let h = tokio::spawn(async move {
+            let Ok((stream, _)) = lis.accept().await else {
+                return;
+            };
+            let (rd, mut wr) = stream.into_split();
+            let mut rd = tokio::io::BufReader::new(rd);
+            loop {
+                if stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let mut peek = [0_u8; 1];
+                let Ok(Ok(n)) =
+                    tokio::time::timeout(Duration::from_millis(3000), rd.read(&mut peek)).await
+                else {
+                    break;
+                };
+                if n == 0 {
+                    tx.send("EOF".to_owned()).await.ok();
+                    break;
+                }
+                if peek[0] == b'$' {
+                    let mut rest = [0_u8; 3];
+                    if rd.read_exact(&mut rest).await.is_err() {
+                        break;
+                    }
+                    let len = usize::from(u16::from_be_bytes([rest[1], rest[2]]));
+                    let mut p = vec![0_u8; len];
+                    if rd.read_exact(&mut p).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                let mut head = String::from_utf8(vec![peek[0]]).unwrap();
+                loop {
+                    let mut line = String::new();
+                    if rd.read_line(&mut line).await.is_err() {
+                        return;
+                    }
+                    head.push_str(&line);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                let status = status_of(&head);
+                let is_describe = head.starts_with("DESCRIBE") && status.starts_with('2');
+                let body = if is_describe { sdp_body } else { "" };
+                let extra = if (head.starts_with("SETUP") || head.starts_with("PLAY"))
+                    && status.starts_with('2')
+                {
+                    format!("Session: s1;timeout={session_timeout}\r\n")
+                } else {
+                    String::new()
+                };
+                if tx.send(head.clone()).await.is_err() {
+                    break;
+                }
+                let r = reply(&head, status, &extra, body);
+                if wr.write_all(r.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Stub {
+            port,
+            _stop: stop,
+            got,
+            _task: h,
+        }
+    }
+
+    /// Stub replying `429` to requests starting with `fail_on`.
+    async fn stub_429(fail_on: &'static str, sdp_body: &'static str) -> Stub {
+        stub_scripted(
+            move |head| {
+                if head.starts_with(fail_on) {
+                    "429 Too Many Requests"
+                } else {
+                    "200 OK"
+                }
+            },
+            sdp_body,
+            60,
+        )
+        .await
+    }
+
+    fn drain(rx: &mut tmpsc::Receiver<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(r) = rx.try_recv() {
+            out.push(r);
+        }
+        out
+    }
+
+    /// Drain entries until the `EOF` marker arrives (or `ms`
+    /// elapses) — socket-close detection is asynchronous.
+    async fn collect(rx: &mut tmpsc::Receiver<String>, ms: u64) -> Vec<String> {
+        let mut out = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+        while let Ok(Some(r)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            let eof = r == "EOF";
+            out.push(r);
+            if eof {
+                break;
+            }
+        }
+        out
+    }
+
     const DUPLEX_SDP: &str = "v=0\r\nm=audio 0 RTP/AVP 0\r\na=recvonly\r\na=control:trackID=1\r\n\
          m=audio 0 RTP/AVP 0\r\na=sendonly\r\na=control:trackID=2\r\n";
+
+    /// Usable recvonly PCMU + sendonly AAC — the sendonly line is
+    /// offered but codec-less after filtering ⇒ capability mark.
+    const ALT_AAC_TALK_SDP: &str = "v=0\r\nm=audio 0 RTP/AVP 0\r\na=recvonly\r\na=control:trackID=1\r\n\
+         m=audio 0 RTP/AVP 96\r\na=rtpmap:96 AAC/16000\r\na=sendonly\r\na=control:trackID=2\r\n";
 
     #[tokio::test]
     async fn open_duplex_negotiates_backchannel() {
         let mut st = stub(DUPLEX_SDP).await;
-        let client = RtspAudioClient::new(url(st.port));
+        let client = RtspAudioClient::new(url(st.port), None);
         let sess = client.open(true).await.unwrap();
         assert_eq!(
             sess.caps(),
@@ -814,7 +1018,7 @@ mod tests {
         const RECV_SDP: &str =
             "v=0\r\nm=audio 0 RTP/AVP 8\r\na=recvonly\r\na=control:trackID=1\r\n";
         let mut st = stub(RECV_SDP).await;
-        let client = RtspAudioClient::new(url(st.port));
+        let client = RtspAudioClient::new(url(st.port), None);
         let sess = client.open(false).await.unwrap();
         assert_eq!(
             sess.caps(),
@@ -837,7 +1041,7 @@ mod tests {
             "v=0\r\nm=audio 0 RTP/AVP 8\r\na=recvonly\r\na=control:trackID=1\r\n";
         let _port_guard = VIGI_PORT.lock().await;
         let mut st = stub(RECV_SDP).await;
-        let client = RtspAudioClient::new(url(st.port));
+        let client = RtspAudioClient::new(url(st.port), None);
         let sess = client.open(true).await.unwrap();
         assert_eq!(
             sess.caps(),
@@ -872,7 +1076,7 @@ mod tests {
         const TALK_SDP: &str =
             "v=0\r\nm=audio 0 RTP/AVP 0\r\na=sendonly\r\na=control:trackID=9\r\n";
         let mut st = stub(TALK_SDP).await;
-        let client = RtspAudioClient::new(url(st.port));
+        let client = RtspAudioClient::new(url(st.port), None);
         let sess = client.open(true).await.unwrap();
         assert_eq!(
             sess.caps(),
@@ -892,7 +1096,7 @@ mod tests {
         const INACT: &str = "v=0\r\nm=audio 0 RTP/AVP 0\r\na=inactive\r\na=control:trackID=1\r\n";
         let _port_guard = VIGI_PORT.lock().await;
         let st = stub(INACT).await;
-        let client = RtspAudioClient::new(url(st.port));
+        let client = RtspAudioClient::new(url(st.port), None);
         let Err(err) = client.open(true).await else {
             panic!("expected open failure")
         };
@@ -949,7 +1153,7 @@ mod tests {
                 .unwrap();
             tokio::time::sleep(Duration::from_secs(2)).await;
         });
-        let client = RtspAudioClient::new(url(port));
+        let client = RtspAudioClient::new(url(port), None);
         let sess = client.open(false).await.unwrap();
         let first = sess.recv().await.unwrap();
         assert_eq!(first.len(), 4);
@@ -1014,7 +1218,7 @@ mod tests {
                     .unwrap();
             }
         });
-        let client = RtspAudioClient::new(url(port));
+        let client = RtspAudioClient::new(url(port), None);
         let sess = client.open(true).await.unwrap();
         sess.talk(&[1000_i16; 160]).await.unwrap();
         let f1 = tokio::time::timeout(Duration::from_secs(2), got.recv())
@@ -1044,7 +1248,7 @@ mod tests {
         const RECV_SDP: &str =
             "v=0\r\nm=audio 0 RTP/AVP 8\r\na=recvonly\r\na=control:trackID=1\r\n";
         let mut st = stub(RECV_SDP).await;
-        let client = RtspAudioClient::new(url(st.port));
+        let client = RtspAudioClient::new(url(st.port), None);
         let sess = client.open(false).await.unwrap();
         let Err(err) = sess.talk(&[0; 160]).await else {
             panic!("expected talk failure")
@@ -1059,7 +1263,7 @@ mod tests {
         const RECV_SDP: &str =
             "v=0\r\nm=audio 0 RTP/AVP 8\r\na=recvonly\r\na=control:trackID=1\r\n";
         let mut st = stub(RECV_SDP).await;
-        let client = RtspAudioClient::new(url(st.port));
+        let client = RtspAudioClient::new(url(st.port), None);
         let sess = client.open(false).await.unwrap();
         // Session timeout negotiated 60s → keepalive at 30s — too
         // long to observe; assert the plumbing only via OPTIONS
@@ -1118,7 +1322,7 @@ mod tests {
         });
 
         let mut st = stub(RECV_SDP_V).await;
-        let client = RtspAudioClient::new(url(st.port));
+        let client = RtspAudioClient::new(url(st.port), None);
         let sess = client.open(true).await.unwrap();
         assert_eq!(
             sess.caps(),
@@ -1157,7 +1361,7 @@ mod tests {
         const RECV_SDP: &str =
             "v=0\r\nm=audio 0 RTP/AVP 8\r\na=recvonly\r\na=control:trackID=1\r\n";
         let mut st = stub(RECV_SDP).await;
-        let client = RtspAudioClient::new(url(st.port));
+        let client = RtspAudioClient::new(url(st.port), None);
         let sess = client.open(false).await.unwrap();
         sess.close().await;
         let mut saw_teardown = false;
@@ -1168,5 +1372,189 @@ mod tests {
             }
         }
         assert!(saw_teardown);
+    }
+
+    #[tokio::test]
+    async fn play_429_retries_alternate() {
+        let mut primary = stub_429("PLAY", DUPLEX_SDP).await;
+        let mut alt = stub_scripted(|_| "200 OK", DUPLEX_SDP, 60).await;
+        let client = RtspAudioClient::new(url(primary.port), Some(url(alt.port)));
+        let sess = client.open(true).await.unwrap();
+        assert_eq!(
+            sess.caps(),
+            AudioCaps {
+                listen: true,
+                talk: true
+            }
+        );
+        sess.close().await;
+
+        let reqs = collect(&mut primary.got, 500).await;
+        assert!(reqs.iter().any(|r| r.starts_with("PLAY")), "{reqs:?}");
+        // Session id already issued at SETUP → TEARDOWN, then EOF.
+        assert!(reqs.iter().any(|r| r.starts_with("TEARDOWN")), "{reqs:?}");
+        assert!(reqs.iter().any(|r| r == "EOF"), "{reqs:?}");
+        let alt_reqs = drain(&mut alt.got);
+        assert!(
+            alt_reqs.iter().any(|r| r.starts_with("PLAY")),
+            "{alt_reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn describe_429_retries_alternate() {
+        let mut primary = stub_429("DESCRIBE", DUPLEX_SDP).await;
+        let alt = stub_scripted(|_| "200 OK", DUPLEX_SDP, 60).await;
+        let client = RtspAudioClient::new(url(primary.port), Some(url(alt.port)));
+        let sess = client.open(false).await.unwrap();
+        assert!(sess.caps().listen);
+        sess.close().await;
+        let reqs = collect(&mut primary.got, 500).await;
+        assert!(reqs.iter().any(|r| r.starts_with("DESCRIBE")), "{reqs:?}");
+        assert!(reqs.iter().any(|r| r == "EOF"), "{reqs:?}");
+    }
+
+    #[tokio::test]
+    async fn options_429_retries_alternate() {
+        let mut primary = stub_429("OPTIONS", DUPLEX_SDP).await;
+        let alt = stub_scripted(|_| "200 OK", DUPLEX_SDP, 60).await;
+        let client = RtspAudioClient::new(url(primary.port), Some(url(alt.port)));
+        let sess = client.open(false).await.unwrap();
+        assert!(sess.caps().listen);
+        sess.close().await;
+        let reqs = collect(&mut primary.got, 500).await;
+        assert!(reqs.iter().any(|r| r.starts_with("OPTIONS")), "{reqs:?}");
+        // OPTIONS was the first request — no Session id → no TEARDOWN.
+        assert!(!reqs.iter().any(|r| r.starts_with("TEARDOWN")), "{reqs:?}");
+        assert!(reqs.iter().any(|r| r == "EOF"), "{reqs:?}");
+    }
+
+    #[tokio::test]
+    async fn setup_429_retries_alternate() {
+        let primary = stub_429("SETUP", DUPLEX_SDP).await;
+        let mut alt = stub_scripted(|_| "200 OK", DUPLEX_SDP, 60).await;
+        let client = RtspAudioClient::new(url(primary.port), Some(url(alt.port)));
+        let sess = client.open(false).await.unwrap();
+        assert!(sess.caps().listen);
+        sess.close().await;
+        let alt_reqs = drain(&mut alt.got);
+        assert!(
+            alt_reqs.iter().any(|r| r.starts_with("PLAY")),
+            "{alt_reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn play_429_without_alternate_is_stream_limit() {
+        let _g = VIGI_PORT.lock().await;
+        let mut primary = stub_429("PLAY", DUPLEX_SDP).await;
+        let client = RtspAudioClient::new(url(primary.port), None);
+        let Err(err) = client.open(false).await else {
+            panic!("expected StreamLimit");
+        };
+        assert!(matches!(err, Error::StreamLimit), "{err:?}");
+        assert_eq!(err.class(), FaultClass::Transport);
+        // Payload-free — no URL can leak into error ctrls (V258).
+        assert!(!format!("{err}").contains("rtsp"), "{err}");
+        let reqs = collect(&mut primary.got, 500).await;
+        assert!(reqs.iter().any(|r| r == "EOF"), "{reqs:?}");
+    }
+
+    #[tokio::test]
+    async fn both_urls_429_propagates_stream_limit() {
+        let _g = VIGI_PORT.lock().await;
+        let primary = stub_429("PLAY", DUPLEX_SDP).await;
+        let alt = stub_429("PLAY", DUPLEX_SDP).await;
+        let client = RtspAudioClient::new(url(primary.port), Some(url(alt.port)));
+        let Err(err) = client.open(false).await else {
+            panic!("expected StreamLimit");
+        };
+        assert!(matches!(err, Error::StreamLimit), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn same_endpoint_alternate_not_retried() {
+        let _g = VIGI_PORT.lock().await;
+        let mut primary = stub_429("PLAY", DUPLEX_SDP).await;
+        // Same endpoint, different userinfo → deduped at construction.
+        let creds = url::Url::parse(&format!(
+            "rtsp://u%40x:p%40ss@127.0.0.1:{}/live",
+            primary.port
+        ))
+        .unwrap();
+        let client = RtspAudioClient::new(url(primary.port), Some(creds));
+        let Err(err) = client.open(false).await else {
+            panic!("expected StreamLimit");
+        };
+        assert!(matches!(err, Error::StreamLimit), "{err:?}");
+        let reqs = drain(&mut primary.got);
+        // A self-retry would re-run the whole handshake on a second
+        // connection — got holds exactly one DESCRIBE + one PLAY.
+        assert_eq!(
+            1,
+            reqs.iter().filter(|r| r.starts_with("DESCRIBE")).count(),
+            "{reqs:?}"
+        );
+        assert_eq!(
+            1,
+            reqs.iter().filter(|r| r.starts_with("PLAY")).count(),
+            "{reqs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn alternate_capability_marks_stay_session_only() {
+        let _g = VIGI_PORT.lock().await;
+        let primary = stub_429("PLAY", DUPLEX_SDP).await;
+        // Alt SDP: sendonly AAC → talk capability mark (codec-less);
+        // 127.0.0.1:8800 refused → mark survives, downgraded alt-side.
+        let mut alt = stub_scripted(|_| "200 OK", ALT_AAC_TALK_SDP, 60).await;
+        let client = RtspAudioClient::new(url(primary.port), Some(url(alt.port)));
+        let sess = client.open(true).await.unwrap();
+        assert_eq!(
+            sess.caps(),
+            AudioCaps {
+                listen: true,
+                talk: false
+            }
+        );
+        for (d, class) in sess.marks() {
+            assert_eq!(
+                FaultClass::Session,
+                class,
+                "alt-learned {d:?} mark must not persist as capability"
+            );
+        }
+        sess.close().await;
+        let _ = &mut alt;
+    }
+
+    #[tokio::test]
+    async fn keepalive_non_2xx_kills_session() {
+        let _g = VIGI_PORT.lock().await;
+        // First OPTIONS answers the handshake probe; later ones 500.
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = count.clone();
+        let mut st = stub_scripted(
+            move |head| {
+                if head.starts_with("OPTIONS")
+                    && c.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0
+                {
+                    "500 Internal Server Error"
+                } else {
+                    "200 OK"
+                }
+            },
+            DUPLEX_SDP,
+            2,
+        )
+        .await;
+        let client = RtspAudioClient::new(url(st.port), None);
+        let sess = client.open(false).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), sess.wait_dead())
+            .await
+            .expect("session must die on keepalive 500");
+        sess.close().await;
+        let _ = &mut st;
     }
 }

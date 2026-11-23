@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 /// Cap on a response head (status line + headers).
 const MAX_HEAD: usize = 16 * 1024;
@@ -84,6 +84,9 @@ struct Shared {
     user: String,
     /// Password from the RTSP URL userinfo.
     pass: String,
+    /// Set when the demux reader exits — fails requests that
+    /// register `pending` after the once-at-exit clear.
+    dead: watch::Sender<bool>,
 }
 
 /// Persistent RTSP connection. Inbound interleaved frames are
@@ -101,6 +104,15 @@ pub struct RtspClient {
     base: String,
 }
 
+impl Drop for RtspClient {
+    /// Abort the demux reader — covers every release path incl.
+    /// open-budget cancellation, where no error arm exists to
+    /// call `close()`.
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
 impl RtspClient {
     /// TCP-connect to the URL's host:port (default 554) and spawn
     /// the demux reader.
@@ -114,11 +126,13 @@ impl RtspClient {
         let (rd, wr) = stream.into_split();
 
         let (media_tx, media_rx) = mpsc::channel(MEDIA_DEPTH);
+        let (dead_tx, _) = watch::channel(false);
         let shared = Arc::new(Shared {
             pending: Mutex::new(HashMap::new()),
             auth: Mutex::new(Auth::None),
             user: url.username().to_owned(),
             pass: url.password().unwrap_or("").to_owned(),
+            dead: dead_tx,
         });
         let reader = tokio::spawn(read_loop(rd, shared.clone(), media_tx));
 
@@ -180,7 +194,23 @@ impl RtspClient {
                 }
             }
 
-            let Ok(resp) = rx.await else {
+            // Race the response against reader death: a reader
+            // exit clears `pending` once — a request registered
+            // after that clear would wait forever without this.
+            let mut dead = self.shared.dead.subscribe();
+            let resp = tokio::select! {
+                biased;
+                r = rx => r,
+                // `Ref` isn't Send — drop it inside the arm.
+                () = async { let _ = dead.wait_for(|d| *d).await; } => {
+                    self.shared.pending.lock().await.remove(&cseq);
+                    return Err(Error::Transport(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "rtsp reader terminated",
+                    )));
+                }
+            };
+            let Ok(resp) = resp else {
                 // Reader task died — socket-level failure.
                 return Err(Error::Transport(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -268,7 +298,7 @@ async fn read_loop(
     media_tx: mpsc::Sender<Interleaved>,
 ) {
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
-    loop {
+    'reader: loop {
         let mut chunk = [0_u8; 4096];
         match rd.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
@@ -283,7 +313,7 @@ async fn read_loop(
                     match msg {
                         Message::Interleaved(f) => {
                             if media_tx.send(f).await.is_err() {
-                                return;
+                                break 'reader;
                             }
                         }
                         Message::Response(r) => {
@@ -301,7 +331,10 @@ async fn read_loop(
             }
         }
     }
-    // EOF — fail all pending waiters.
+    // EOF — signal death so future `request`s fail fast, then
+    // fail all pending waiters. `send_replace` stores the value
+    // even with zero subscribers.
+    shared.dead.send_replace(true);
     shared.pending.lock().await.clear();
 }
 
@@ -662,5 +695,49 @@ mod tests {
         let err = c.request("OPTIONS", c.base(), &[]).await.unwrap_err();
         assert!(matches!(err, Error::Transport(_)), "{err:?}");
         srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drop_aborts_reader_and_closes_socket() {
+        // The release path for open-budget cancellation — the
+        // future is dropped mid-request, so only `Drop` can free
+        // the connection; the stub must observe EOF.
+        let (url, srv) = stub(|s| async move {
+            use tokio::io::AsyncReadExt as _;
+            let (mut rd, _wr) = s.into_split();
+            let mut buf = [0_u8; 64];
+            loop {
+                match rd.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await;
+        let c = RtspClient::connect(&url).await.unwrap();
+        drop(c);
+        tokio::time::timeout(Duration::from_secs(3), srv)
+            .await
+            .expect("stub must see EOF once the client drops")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_after_reader_death_fails_fast() {
+        // Server accepts then closes immediately — the reader's
+        // once-at-exit pending clear has already run when the
+        // request registers; without the dead-watch the oneshot
+        // would wait forever.
+        let (url, srv) = stub(|s| async move {
+            drop(s);
+        })
+        .await;
+        let c = RtspClient::connect(&url).await.unwrap();
+        srv.await.unwrap();
+        // Let the reader observe EOF first.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let r = tokio::time::timeout(Duration::from_secs(3), c.request("TEARDOWN", c.base(), &[]))
+            .await;
+        assert!(matches!(r, Ok(Err(Error::Transport(_)))), "{r:?}");
     }
 }

@@ -334,7 +334,7 @@ pub type PersistFn =
     Arc<dyn Fn(MonitorId, Vec<String>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Session factory — `RtspAudioClient` in production, a mock in tests.
-pub type ClientFactory = Arc<dyn Fn(url::Url) -> ArcAudioClient + Send + Sync>;
+pub type ClientFactory = Arc<dyn Fn(url::Url, Option<url::Url>) -> ArcAudioClient + Send + Sync>;
 
 /// Per-monitor session registry + WS token store. Lives in route
 /// state; built once at startup.
@@ -417,9 +417,10 @@ impl AudioService {
     }
 
     /// Build a client via the injected factory — route layer extracts
-    /// endpoint+creds from monitor config.
-    pub fn make_client(&self, url: url::Url) -> ArcAudioClient {
-        (self.factory)(url)
+    /// endpoint+creds from monitor config. `alt` = the `subStream`
+    /// URL the session retries on a `429`.
+    pub fn make_client(&self, url: url::Url, alt: Option<url::Url>) -> ArcAudioClient {
+        (self.factory)(url, alt)
     }
 
     /// Drop the entry — TEARDOWN + consumer closes. Called when the
@@ -809,7 +810,7 @@ mod tests {
         let c = client.clone();
         (
             Arc::new(AudioService::new(
-                Arc::new(move |_| c.clone()),
+                Arc::new(move |_, _| c.clone()),
                 Arc::new(move |id, marks| {
                     let p = p.clone();
                     Box::pin(async move { p.lock().await.push((id, marks)) })

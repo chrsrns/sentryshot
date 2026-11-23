@@ -406,10 +406,15 @@ pub struct MonitorLifecycleState {
     pub audio: Arc<audio::AudioService>,
 }
 
-/// Endpoint+creds key — mirrors the attach key in `attach_direction`.
+/// Endpoint+creds key — covers `mainStream` ∪ `subStream`; mirrors
+/// the attach key in `attach_direction`.
 fn audio_key(config: &MonitorConfig) -> String {
     let common::monitor::SourceConfig::Rtsp(rtsp) = config.source();
-    (*rtsp.main_stream).to_string()
+    let main = (*rtsp.main_stream).to_string();
+    match &rtsp.sub_stream {
+        Some(sub) => format!("{main}|{}", (**sub)),
+        None => main,
+    }
 }
 
 pub async fn monitor_delete_handler(
@@ -1237,6 +1242,16 @@ async fn audio_consumer(
                         }
                         _ => {} // unknown/client-sent server types: ignored
                     }
+                    // Any direction-ctrl receipt re-arms the clock —
+                    // a denied attach keeps its retry window.
+                    if matches!(
+                        ctrl.kind.as_str(),
+                        "listen" | "listen-stop" | "talk-start" | "talk-end"
+                    ) {
+                        directionless.as_mut().reset(
+                            tokio::time::Instant::now() + audio::DIRECTIONLESS_TIMEOUT,
+                        );
+                    }
                 }
                 Some(Ok(Message::Binary(bytes))) => {
                     // Non-owner/negotiation-less frames drop inside
@@ -1323,14 +1338,19 @@ async fn attach_direction(
     socket: &mut axum::extract::ws::WebSocket,
     ctrl_rx: &mut Option<tokio::sync::broadcast::Receiver<String>>,
 ) -> Option<Arc<audio::AudioEntry>> {
-    // Endpoint+creds key — mainStream URL carries userinfo.
+    // Endpoint+creds key — both stream URLs carry their userinfo;
+    // `subStream` is the session's 429 fallback.
     let common::monitor::SourceConfig::Rtsp(rtsp) = config.source();
     let url: url::Url = (*rtsp.main_stream).clone();
-    let key = url.to_string();
+    let alt: Option<url::Url> = rtsp.sub_stream.as_ref().map(|u| (**u).clone());
+    let key = match &alt {
+        Some(a) => format!("{url}|{a}"),
+        None => url.to_string(),
+    };
 
-    // Every attach re-keys — a mainStream/creds change rebuilds the
-    // entry and drops the stale session's consumers.
-    let client = state.service.make_client(url);
+    // Every attach re-keys — a mainStream/subStream/creds change
+    // rebuilds the entry and drops the stale session's consumers.
+    let client = state.service.make_client(url, alt);
     *entry = Some(state.service.entry(monitor_id, key, client).await);
     let e = entry.as_ref().expect("entry resolved above");
 
