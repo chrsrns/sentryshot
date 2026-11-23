@@ -136,6 +136,72 @@ Response `200`:
 | `502` | camera fault or timeout, or a command the camera marked unsupported |
 
 
+### POST /api/monitor/audio-session?id=<MONITOR_ID>
+
+##### Auth: admin + CSRF
+
+Mint the single-use WebSocket token for the monitor's two-way audio
+channel. No camera contact happens here — the audio session opens
+lazily on the first direction ctrl sent over the socket. The monitor
+must have `audio.enable` saved `true`.
+
+Response `200` carries `Cache-Control: no-store`:
+
+```json
+{ "token": "e01ec7944e1413ba48e41269c6bc30d0" }
+```
+
+- The token is ≥128-bit random, bound to the monitor id, single-use,
+  and expires 30 s after mint.
+- `404` monitor does not exist; `409` `audio.enable` is not `true`,
+  or both directions are marked in `audio.unsupported`.
+- Camera faults never surface here — they arrive as `error` ctrls on
+  the socket.
+
+
+### GET /api/monitor/audio?token=<TOKEN>
+
+##### Auth: token (see below)
+
+WebSocket upgrade carrying the two-way audio channel. A browser
+`WebSocket` can't set the `X-CSRF-TOKEN` header, so the handshake
+authenticates on the consumed single-use token and the `Origin`
+header must match the request `Host` (host:port, port-normalized) —
+a mismatch or missing `Origin` gets `403` *before* the token is
+consumed; an unknown or expired token gets `401`.
+
+Text frames carry JSON ctrls. Client→server direction verbs:
+
+```json
+{ "type": "listen" | "listen-stop" | "talk-start" | "talk-end" }
+```
+
+Server→client messages:
+
+```json
+{ "type": "caps", "listen": true, "talk": true, "talkFree": false, "unsupported": ["talk"] }
+{ "type": "busy", "command": "talk" }
+{ "type": "error", "message": "talk unavailable in session" }
+```
+
+- `caps` is sent on attach and on grant — `talkFree` is false while
+  another consumer holds the talk lock; a `busy`-marked client must
+  wait for a `caps` carrying `talkFree: true` before re-marking the
+  control usable.
+- Binary frames are PCM Int16 little-endian, 8 kHz mono, ≤20 ms per
+  frame — server→client is decoded camera audio, client→server is
+  mic audio for encoding to the negotiated G.711 codec. Binary frames
+  from a connection that does not hold the talk lock are dropped.
+- Attach is lazy: upgrade alone subscribes nothing — a socket with no
+  direction ctrl for 10 s is closed, at most 8 consumers per monitor.
+- The session is single-flight per monitor: the first direction ctrl
+  opens it, the last detach sends `TEARDOWN`. A session opened
+  listen-only stays listen-only — talk capability joins at the next
+  open. Monitor delete, `audio.enable` flipping false, or an
+  endpoint/credential change tears the session down and closes its
+  consumers.
+
+
 ### POST /api/scan
 
 ##### Auth: admin + CSRF
