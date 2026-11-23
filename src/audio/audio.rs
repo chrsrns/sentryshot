@@ -15,11 +15,15 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use thiserror::Error;
 
+mod g711;
+mod rtp;
 mod rtsp;
 mod sdp;
+mod session;
 
 pub use rtsp::{Interleaved, Response, RtspClient};
 pub use sdp::{AudioMedia, Codec, PayloadMap, Sdp, SdpDirection, parse as parse_sdp};
+pub use session::RtspAudioClient;
 
 /// Decoded PCM frame — Int16 little-endian, 8 kHz, mono.
 pub type PcmChunk = Vec<i16>;
@@ -70,14 +74,17 @@ pub struct AudioCaps {
 }
 
 /// Capability vs transport split — persisted `audio.unsupported`
-/// marks are written for capability faults only; transport faults
-/// mark session-only (V260).
+/// marks are written for capability faults only; transport and
+/// session-bound faults mark session-only (V260).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FaultClass {
     /// Peer answered and disproved support — persists.
     Capability,
     /// Connect timeout/RST/EOF/overrun — session-only, retried.
     Transport,
+    /// Session-scoped non-persistence — e.g. an `a=inactive`
+    /// track: unusable for this open but not a permanent defect.
+    Session,
 }
 
 /// Failures across RTSP negotiation, media IO, and the VIGI
@@ -127,6 +134,11 @@ impl Error {
 pub trait AudioSession: Send + Sync {
     /// Negotiated capabilities of this open session.
     fn caps(&self) -> AudioCaps;
+
+    /// Direction marks discovered while negotiating —
+    /// `(direction, class)`; `Capability` persists to
+    /// `audio.unsupported`, the rest stay session-only.
+    fn marks(&self) -> Vec<(Direction, FaultClass)>;
 
     /// Next decoded camera→client PCM chunk; `None` at EOS or
     /// session teardown. Driven by the service's broadcast task.

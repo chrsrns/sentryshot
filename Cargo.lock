@@ -131,6 +131,7 @@ dependencies = [
  "md5",
  "onvif",
  "pretty_assertions",
+ "rand 0.9.0",
  "serde",
  "serde_json",
  "sha2",
