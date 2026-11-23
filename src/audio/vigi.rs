@@ -7,8 +7,10 @@
 //! inbound multipart is drained and discarded (V259 — listen rides
 //! the RTSP session; undrained back-pressure stalls the writer).
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -19,6 +21,93 @@ use crate::{Codec, Error, g711};
 /// `:8800` probe + negotiate budget — sits inside the caller's open
 /// deadline.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Per-host backoff gate — consecutive `:8800` failures space out
+/// later dials so a degraded VIGI daemon isn't hammered (V273).
+struct GateEntry {
+    failures: u32,
+    last_dial: Instant,
+}
+
+static GATE: OnceLock<Mutex<HashMap<String, GateEntry>>> = OnceLock::new();
+
+/// Entries idle past this are swept on the next insert — bounds the
+/// map for one-shot scan targets.
+const GATE_STALE: Duration = Duration::from_secs(3600);
+
+/// Gate-settle classification — internal outcome `connect` consults
+/// before the `VigiProbe` collapse (V273).
+#[derive(Clone, Copy)]
+enum Settle {
+    /// `Ready` or a `Refused` produced by a complete protocol answer —
+    /// the host is healthy; clear the failure record.
+    Reset,
+    /// Transport-class fault — keep the cooldown written at dial
+    /// initiation.
+    Keep,
+}
+
+fn gate() -> &'static Mutex<HashMap<String, GateEntry>> {
+    GATE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Cooldown after `failures` consecutive failures: 30 s·2^(n−1),
+/// capped at 10 min.
+fn gate_cooldown(failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(5);
+    Duration::from_secs(30 << shift).min(Duration::from_secs(600))
+}
+
+/// Gate consult — `true` permits the dial (the attempt is recorded
+/// at initiation, so a dropped future still counts); `false` means
+/// suppressed inside the cooldown window — the caller must return
+/// `Unreachable` without dialing or counting.
+fn gate_pass(key: &str) -> bool {
+    let now = Instant::now();
+    let mut map = gate()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    map.retain(|_, e| now.saturating_duration_since(e.last_dial) < GATE_STALE);
+    match map.get_mut(key) {
+        Some(e) if now < e.last_dial + gate_cooldown(e.failures) => false,
+        Some(e) => {
+            e.failures = e.failures.saturating_add(1);
+            e.last_dial = now;
+            true
+        }
+        None => {
+            map.insert(
+                key.to_owned(),
+                GateEntry {
+                    failures: 1,
+                    last_dial: now,
+                },
+            );
+            true
+        }
+    }
+}
+
+/// Test hook — drop one host's gate state (cross-suite isolation:
+/// stub-server tests share `127.0.0.1` keys).
+#[cfg(test)]
+pub(crate) fn gate_reset_for_test(key: &str) {
+    gate()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&key.to_lowercase());
+}
+
+/// Completion settle — `Reset` clears the failure record; `Keep`
+/// leaves the cooldown written at initiation untouched.
+fn gate_settle(key: &str, settle: Settle) {
+    if matches!(settle, Settle::Reset) {
+        gate()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key);
+    }
+}
 
 const KEY_SHORT: &[u8] = b"RDpbLfCPsJZ7fiv";
 #[rustfmt::skip]
@@ -80,16 +169,30 @@ pub enum VigiProbe {
 impl VigiTalk {
     /// TCP probe → `POST /stream` (Digest retry on 401) → talk
     /// request part → device `session_id`. Fixed `:8800` (V259).
+    /// Consults the per-host backoff gate — a suppressed call returns
+    /// `Unreachable` without dialing (V273).
     pub async fn connect(host: &str, user: &str, pass: &str) -> VigiProbe {
-        Self::connect_addr(&format!("{host}:8800"), user, pass).await
+        let key = host.to_lowercase();
+        if !gate_pass(&key) {
+            return VigiProbe::Unreachable;
+        }
+        let (probe, settle) = Self::connect_inner(&format!("{host}:8800"), user, pass).await;
+        gate_settle(&key, settle);
+        probe
     }
 
     /// `connect` with an explicit `host:port` — stub-server tests
-    /// can't bind :8800.
+    /// can't bind :8800. Bypasses the backoff gate (V273 test seam).
     pub async fn connect_addr(addr: &str, user: &str, pass: &str) -> VigiProbe {
+        Self::connect_inner(addr, user, pass).await.0
+    }
+
+    /// The handshake, with the gate-settle classification attached —
+    /// `connect` settles against it before the `VigiProbe` collapse.
+    async fn connect_inner(addr: &str, user: &str, pass: &str) -> (VigiProbe, Settle) {
         let Ok(Ok(stream)) = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await
         else {
-            return VigiProbe::Unreachable;
+            return (VigiProbe::Unreachable, Settle::Keep);
         };
         let (rd, mut wr) = stream.into_split();
         let mut rd = tokio::io::BufReader::new(rd);
@@ -108,14 +211,14 @@ impl VigiTalk {
             }
             req.push_str("\r\n");
             if wr.write_all(req.as_bytes()).await.is_err() {
-                return VigiProbe::Unreachable;
+                return (VigiProbe::Unreachable, Settle::Keep);
             }
             let Ok(Ok(head)) = tokio::time::timeout(CONNECT_TIMEOUT, read_head(&mut rd)).await
             else {
-                return VigiProbe::Unreachable;
+                return (VigiProbe::Unreachable, Settle::Keep);
             };
             let Some(head) = head else {
-                return VigiProbe::Unreachable;
+                return (VigiProbe::Unreachable, Settle::Keep);
             };
             let status = head
                 .lines()
@@ -130,7 +233,7 @@ impl VigiTalk {
                 }
                 401 => {
                     let Some(challenge) = digest_challenge(&head) else {
-                        return VigiProbe::Refused;
+                        return (VigiProbe::Refused, Settle::Reset);
                     };
                     auth = Some(onvif::digest_authorization(
                         &challenge,
@@ -140,11 +243,14 @@ impl VigiTalk {
                         "POST",
                     ));
                 }
-                _ => return VigiProbe::Refused,
+                // Garbage head — no status line — is transport-class
+                // for the gate even though the caller sees `Refused`.
+                0 => return (VigiProbe::Refused, Settle::Keep),
+                _ => return (VigiProbe::Refused, Settle::Reset),
             }
         }
         if !answered {
-            return VigiProbe::Refused;
+            return (VigiProbe::Refused, Settle::Reset);
         }
         // Talk session open — JSON part then read device parts until
         // the session_id arrives.
@@ -154,16 +260,16 @@ impl VigiTalk {
         );
         // Mid-POST fault after the peer answered — persists (V259).
         if wr.write_all(part.as_bytes()).await.is_err() {
-            return VigiProbe::Refused;
+            return (VigiProbe::Refused, Settle::Keep);
         }
         let session_id = match tokio::time::timeout(CONNECT_TIMEOUT, read_session_id(&mut rd)).await
         {
             // EOF/malformed mid-POST — the peer disproved the
             // protocol; persists (V259 boundary).
             Ok(Some(id)) => id,
-            Ok(None) => return VigiProbe::Refused,
+            Ok(None) => return (VigiProbe::Refused, Settle::Keep),
             // Answer-then-stall is a transport fault — session-only.
-            Err(_) => return VigiProbe::Unreachable,
+            Err(_) => return (VigiProbe::Unreachable, Settle::Keep),
         };
         // Muxer header is the first audio part (PAT+PMT).
         let mut talk = Self {
@@ -182,9 +288,9 @@ impl VigiTalk {
         };
         let hdr = talk.mux.header();
         if talk.send_part(&hdr).await.is_err() {
-            return VigiProbe::Refused;
+            return (VigiProbe::Refused, Settle::Keep);
         }
-        VigiProbe::Ready(talk)
+        (VigiProbe::Ready(talk), Settle::Reset)
     }
 
     /// One `audio/mp2t` multipart part onto the wire.
@@ -536,6 +642,7 @@ mod tests {
 
     /// Stub `:8800`: canned status path → `session_id` → log parts.
     /// `tx` ships every client→device byte block for assertions.
+    #[allow(clippy::too_many_lines)]
     async fn stub_vigi(mode: &'static str) -> (String, tmpsc::Receiver<Vec<u8>>) {
         let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = lis.local_addr().unwrap().to_string();
@@ -579,6 +686,41 @@ mod tests {
                 "malformed" => {
                     wr.write_all(b"not-http-at-all\r\n\r\n").await.unwrap();
                     return;
+                }
+                "401-loop" => {
+                    let challenge = b"HTTP/1.1 401 Unauthorized\r\n\
+                      WWW-Authenticate: Digest realm=\"vigi\", nonce=\"abc123\", qop=\"auth\"\r\n\
+                      Content-Length: 0\r\n\r\n"
+                        .as_slice();
+                    wr.write_all(challenge).await.unwrap();
+                    let Some(head) = req_head(&mut rd).await else {
+                        return;
+                    };
+                    tx.send(head.into_bytes()).await.unwrap();
+                    wr.write_all(challenge).await.unwrap();
+                    let Some(head) = req_head(&mut rd).await else {
+                        return;
+                    };
+                    tx.send(head.into_bytes()).await.unwrap();
+                    return;
+                }
+                "eof-after-200" => {
+                    wr.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/mixed\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let mut buf = vec![0_u8; 4096];
+                    let n = rd.read(&mut buf).await.unwrap();
+                    tx.send(buf[..n].to_vec()).await.unwrap();
+                    return;
+                }
+                "stall-after-200" => {
+                    wr.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/mixed\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let mut buf = vec![0_u8; 4096];
+                    let n = rd.read(&mut buf).await.unwrap();
+                    tx.send(buf[..n].to_vec()).await.unwrap();
+                    std::future::pending::<()>().await;
                 }
                 _ => {}
             }
@@ -738,5 +880,190 @@ mod tests {
         let probe = VigiTalk::connect_addr(&addr, "a", "b").await;
         assert!(matches!(probe, VigiProbe::Refused));
         let _ = rx.recv().await;
+    }
+
+    // --- backoff gate (V273) ---
+
+    fn gate_seed(key: &str, failures: u32, dial_age: Duration) {
+        gate()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                key.to_lowercase(),
+                GateEntry {
+                    failures,
+                    last_dial: Instant::now().checked_sub(dial_age).unwrap(),
+                },
+            );
+    }
+
+    fn gate_failures(key: &str) -> Option<u32> {
+        gate()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key.to_lowercase())
+            .map(|e| e.failures)
+    }
+
+    #[test]
+    fn gate_cooldown_grows_then_caps() {
+        let seq: Vec<u64> = (1..=8).map(gate_cooldown).map(|d| d.as_secs()).collect();
+        assert_eq!(seq, vec![30, 60, 120, 240, 480, 600, 600, 600]);
+    }
+
+    #[test]
+    fn gate_pass_marks_then_suppresses() {
+        let key = "zz-gate-h.invalid";
+        assert!(gate_pass(key));
+        assert!(!gate_pass(key));
+        assert!(!gate_pass(key));
+        // Suppressed consultations never increment (no self-perpetuating lockout).
+        assert_eq!(gate_failures(key), Some(1));
+    }
+
+    #[test]
+    fn gate_sweeps_stale_entries_on_insert() {
+        gate_seed("zz-gate-old.invalid", 5, Duration::from_secs(7200));
+        assert!(gate_pass("zz-gate-new.invalid"));
+        assert_eq!(gate_failures("zz-gate-old.invalid"), None);
+        assert_eq!(gate_failures("zz-gate-new.invalid"), Some(1));
+    }
+
+    #[test]
+    fn gate_settle_reset_clears() {
+        gate_seed("zz-gate-i.invalid", 4, Duration::ZERO);
+        gate_settle("zz-gate-i.invalid", Settle::Reset);
+        assert_eq!(gate_failures("zz-gate-i.invalid"), None);
+        gate_seed("zz-gate-i.invalid", 4, Duration::ZERO);
+        gate_settle("zz-gate-i.invalid", Settle::Keep);
+        assert_eq!(gate_failures("zz-gate-i.invalid"), Some(4));
+    }
+
+    #[tokio::test]
+    async fn suppressed_call_neither_dials_nor_counts() {
+        let key = "zz-gate-a.invalid";
+        gate_seed(key, 3, Duration::ZERO);
+        let probe = VigiTalk::connect(key, "u", "p").await;
+        assert!(matches!(probe, VigiProbe::Unreachable));
+        // `n` unchanged ⇒ no dial-initiation ⇒ no dial.
+        assert_eq!(gate_failures(key), Some(3));
+    }
+
+    #[tokio::test]
+    async fn gate_key_is_lowercased() {
+        gate_seed("zz-gate-b.invalid", 2, Duration::ZERO);
+        let probe = VigiTalk::connect("ZZ-Gate-B.INVALID", "u", "p").await;
+        assert!(matches!(probe, VigiProbe::Unreachable));
+        assert_eq!(gate_failures("zz-gate-b.invalid"), Some(2));
+    }
+
+    #[tokio::test]
+    async fn first_dial_records_failure_and_suppresses() {
+        let key = "zz-gate-c.invalid";
+        let probe = VigiTalk::connect(key, "u", "p").await;
+        assert!(matches!(probe, VigiProbe::Unreachable));
+        assert_eq!(gate_failures(key), Some(1));
+        let probe = VigiTalk::connect(key, "u", "p").await;
+        assert!(matches!(probe, VigiProbe::Unreachable));
+        assert_eq!(gate_failures(key), Some(1));
+    }
+
+    #[tokio::test]
+    async fn cooldown_expiry_preserves_failures() {
+        let key = "zz-gate-d.invalid";
+        // n=2 cooldown = 60 s; a dial 61 s ago is past the window but
+        // under the stale TTL — the count survives and grows.
+        gate_seed(key, 2, Duration::from_secs(61));
+        let probe = VigiTalk::connect(key, "u", "p").await;
+        assert!(matches!(probe, VigiProbe::Unreachable));
+        assert_eq!(gate_failures(key), Some(3));
+    }
+
+    #[tokio::test]
+    async fn concurrent_connects_dial_once() {
+        let key = "zz-gate-e.invalid";
+        let first = tokio::spawn(VigiTalk::connect(key, "u", "p"));
+        let second = VigiTalk::connect(key, "u", "p").await;
+        first.await.unwrap();
+        assert!(matches!(second, VigiProbe::Unreachable));
+        assert_eq!(gate_failures(key), Some(1));
+    }
+
+    #[tokio::test]
+    async fn cancelled_attempt_still_counts() {
+        let key = "zz-gate-f.invalid";
+        let task = tokio::spawn(VigiTalk::connect(key, "u", "p"));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        task.abort();
+        let _ = task.await;
+        assert_eq!(gate_failures(key), Some(1));
+    }
+
+    // Internal-outcome classification — settled before the
+    // `VigiProbe` collapse so the gate sees transport vs answered.
+
+    #[tokio::test]
+    async fn inner_ready_resets() {
+        let (addr, mut rx) = stub_vigi("401").await;
+        let (probe, settle) = VigiTalk::connect_inner(&addr, "admin", "admin").await;
+        assert!(matches!(probe, VigiProbe::Ready(_)));
+        assert!(matches!(settle, Settle::Reset));
+        drop(probe);
+        let _ = rx.recv().await;
+    }
+
+    #[tokio::test]
+    async fn inner_answered_refusal_resets() {
+        let (addr, mut rx) = stub_vigi("refuse").await;
+        let (probe, settle) = VigiTalk::connect_inner(&addr, "a", "b").await;
+        assert!(matches!(probe, VigiProbe::Refused));
+        assert!(matches!(settle, Settle::Reset));
+        let _ = rx.recv().await;
+    }
+
+    #[tokio::test]
+    async fn inner_double_challenge_resets() {
+        let (addr, mut rx) = stub_vigi("401-loop").await;
+        let (probe, settle) = VigiTalk::connect_inner(&addr, "a", "b").await;
+        assert!(matches!(probe, VigiProbe::Refused));
+        assert!(matches!(settle, Settle::Reset));
+        let _ = rx.recv().await;
+    }
+
+    #[tokio::test]
+    async fn inner_garbage_head_keeps() {
+        let (addr, mut rx) = stub_vigi("malformed").await;
+        let (probe, settle) = VigiTalk::connect_inner(&addr, "a", "b").await;
+        assert!(matches!(probe, VigiProbe::Refused));
+        assert!(matches!(settle, Settle::Keep));
+        let _ = rx.recv().await;
+    }
+
+    #[tokio::test]
+    async fn inner_eof_after_answer_keeps() {
+        let (addr, mut rx) = stub_vigi("eof-after-200").await;
+        let (probe, settle) = VigiTalk::connect_inner(&addr, "a", "b").await;
+        assert!(matches!(probe, VigiProbe::Refused));
+        assert!(matches!(settle, Settle::Keep));
+        let _ = rx.recv().await;
+    }
+
+    #[tokio::test]
+    async fn inner_stall_after_answer_keeps() {
+        let (addr, mut rx) = stub_vigi("stall-after-200").await;
+        let (probe, settle) = VigiTalk::connect_inner(&addr, "a", "b").await;
+        assert!(matches!(probe, VigiProbe::Unreachable));
+        assert!(matches!(settle, Settle::Keep));
+        let _ = rx.recv().await;
+    }
+
+    #[tokio::test]
+    async fn inner_unreachable_keeps() {
+        let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = lis.local_addr().unwrap().to_string();
+        drop(lis);
+        let (probe, settle) = VigiTalk::connect_inner(&addr, "a", "b").await;
+        assert!(matches!(probe, VigiProbe::Unreachable));
+        assert!(matches!(settle, Settle::Keep));
     }
 }

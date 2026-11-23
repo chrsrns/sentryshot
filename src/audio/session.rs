@@ -1339,6 +1339,9 @@ mod tests {
         let Ok(lis8800) = TcpListener::bind("127.0.0.1:8800").await else {
             return; // port held — skip
         };
+        // Other want_talk tests may have failed a real `127.0.0.1`
+        // dial earlier in this process — clear the gate entry.
+        crate::vigi::gate_reset_for_test("127.0.0.1");
         let (tx, mut parts) = tmpsc::channel::<Vec<u8>>(32);
         tokio::spawn(async move {
             let Ok((stream, _)) = lis8800.accept().await else {
