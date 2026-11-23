@@ -612,6 +612,13 @@ impl AudioService {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::as_conversions,
+    clippy::needless_pass_by_value,
+    clippy::type_complexity,
+    clippy::unseparated_literal_suffix,
+    clippy::unwrap_used
+)]
 mod tests {
     use super::*;
     use crate::{AudioSession, FaultClass};
