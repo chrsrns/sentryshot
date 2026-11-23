@@ -1390,6 +1390,10 @@ async fn attach_direction(
             _ = socket.send(busy_ctrl()).await;
             Some(e.clone())
         }
+        audio::Attach::Retryable(msg) => {
+            _ = socket.send(error_ctrl(&msg)).await;
+            Some(e.clone())
+        }
         audio::Attach::Unsupported => {
             _ = socket
                 .send(error_ctrl(&format!("{} unsupported", direction.name())))

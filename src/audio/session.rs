@@ -18,7 +18,7 @@
 
 use crate::{
     ArcAudioSession, AudioCaps, AudioClient, AudioSession, Direction, Error, FaultClass, PcmChunk,
-    g711, rtp,
+    TalkClaim, g711, rtp,
     rtsp::{Interleaved, RtspClient},
     sdp::{self, AudioMedia},
 };
@@ -143,29 +143,16 @@ impl RtspAudioClient {
 
         // VIGI :8800 talk fallback (V259) — ONVIF yielded no talk
         // track on a want_talk open ⇒ unconditional probe; outcome
-        // decides the talk mark's class.
-        let mut vigi: Option<crate::vigi::VigiTalk> = None;
-        if want_talk && talk_sel.is_none() {
-            let user = url.username().to_owned();
-            let pass = url.password().unwrap_or("").to_owned();
-            if let Some(host) = url.host_str() {
-                match crate::vigi::VigiTalk::connect(host, &user, &pass).await {
-                    crate::vigi::VigiProbe::Ready(v) => {
-                        vigi = Some(v);
-                        marks.retain(|(d, _)| *d != Direction::Talk);
-                    }
-                    crate::vigi::VigiProbe::Unreachable => {}
-                    crate::vigi::VigiProbe::Refused => {
-                        for (d, c) in &mut marks {
-                            if *d == Direction::Talk {
-                                *c = FaultClass::Capability;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if listen_sel.is_none() && talk_sel.is_none() && vigi.is_none() {
+        // decides the talk mark's class. Capability-only under V275:
+        // a `Ready` talker is dropped immediately (the slot frees —
+        // claims happen per hold), a `-52405` grant still proves the
+        // protocol.
+        let vigi_claim = if want_talk && talk_sel.is_none() {
+            probe_vigi(url, &mut marks).await
+        } else {
+            None
+        };
+        if listen_sel.is_none() && talk_sel.is_none() && vigi_claim.is_none() {
             client.close();
             return Err(Error::Protocol("no usable audio path".into()));
         }
@@ -174,54 +161,8 @@ impl RtspAudioClient {
         // `sendrecv` line serving both directions is SETUP'd once —
         // one control URL owns both bindings.
         let client = Arc::new(client);
-        let mut session_id = String::new();
-        let mut next_ch: u8 = 0;
-        let mut listen: Option<Binding> = None;
-        let mut talk: Option<Binding> = None;
-        let same_media = match (listen_sel, talk_sel) {
-            (Some(a), Some(b)) => a.control == b.control,
-            _ => false,
-        };
-        for (sel, is_talk) in [(listen_sel, false), (talk_sel, true)] {
-            let Some(m) = sel else { continue };
-            if is_talk && same_media {
-                talk.clone_from(&listen);
-                continue;
-            }
-            let ch = next_ch;
-            next_ch += 2;
-            let codec = m.payloads[0].codec;
-            let pt = m.payloads[0].pt;
-            match setup(
-                &client,
-                m,
-                ch,
-                described.tagged && (is_talk || same_media),
-                &session_id,
-            )
-            .await
-            {
-                Ok(Some(id)) => session_id = id,
-                Ok(None) => {}
-                Err(e) => {
-                    release(&client, &described.sdp.control, &session_id).await;
-                    return Err(e);
-                }
-            }
-            if is_talk {
-                talk = Some(Binding {
-                    channel: ch,
-                    codec,
-                    pt,
-                });
-            } else {
-                listen = Some(Binding {
-                    channel: ch,
-                    codec,
-                    pt,
-                });
-            }
-        }
+        let (session_id, listen, talk) =
+            setup_tracks(&client, &described, listen_sel, talk_sel).await?;
 
         // PLAY the aggregate control URL — only when a track was
         // SETUP'd; a pure-VIGI talk session owns no RTSP session.
@@ -264,7 +205,7 @@ impl RtspAudioClient {
             keepalive,
             listen,
             talk,
-            vigi,
+            vigi_claim,
             media_rx,
             marks,
         ))
@@ -395,6 +336,64 @@ fn select(
     (listen_sel, talk_sel, marks)
 }
 
+/// SETUP each selected track on fresh channel pairs — a
+/// `sendrecv` line serving both directions binds once (one
+/// control URL owns both bindings). On failure the caller's
+/// release is handled inside via the aggregate control URL.
+async fn setup_tracks(
+    client: &RtspClient,
+    described: &Described,
+    listen_sel: Option<&AudioMedia>,
+    talk_sel: Option<&AudioMedia>,
+) -> Result<(String, Option<Binding>, Option<Binding>), Error> {
+    let mut session_id = String::new();
+    let mut next_ch: u8 = 0;
+    let mut listen: Option<Binding> = None;
+    let mut talk: Option<Binding> = None;
+    let same_media = match (listen_sel, talk_sel) {
+        (Some(a), Some(b)) => a.control == b.control,
+        _ => false,
+    };
+    for (sel, is_talk) in [(listen_sel, false), (talk_sel, true)] {
+        let Some(m) = sel else { continue };
+        if is_talk && same_media {
+            talk.clone_from(&listen);
+            continue;
+        }
+        let ch = next_ch;
+        next_ch += 2;
+        let codec = m.payloads[0].codec;
+        let pt = m.payloads[0].pt;
+        match setup(
+            client,
+            m,
+            ch,
+            described.tagged && (is_talk || same_media),
+            &session_id,
+        )
+        .await
+        {
+            Ok(Some(id)) => session_id = id,
+            Ok(None) => {}
+            Err(e) => {
+                release(client, &described.sdp.control, &session_id).await;
+                return Err(e);
+            }
+        }
+        let b = Binding {
+            channel: ch,
+            codec,
+            pt,
+        };
+        if is_talk {
+            talk = Some(b);
+        } else {
+            listen = Some(b);
+        }
+    }
+    Ok((session_id, listen, talk))
+}
+
 /// One track's SETUP — TCP-interleaved channel pair; `Require`
 /// only on the sendonly SETUP of a tagged session.
 async fn setup(
@@ -447,7 +446,69 @@ struct ListenState {
 /// VIGI `:8800` multipart writer (V259 composition).
 enum TalkOut {
     Rtsp { ch: u8, pt: u8 },
-    Vigi(Mutex<crate::vigi::VigiTalk>),
+    Vigi(Box<LazyVigi>),
+}
+
+/// Credentials for a per-hold `:8800` claim (V275).
+struct VigiClaim {
+    host: String,
+    user: String,
+    pass: String,
+}
+
+/// Lazily-claimed `:8800` talker — the slot fills on mic-hold and
+/// empties on release (V275), ⊥ held for session life.
+struct LazyVigi {
+    slot: Mutex<Option<crate::vigi::VigiTalk>>,
+    claim: VigiClaim,
+    /// In-flight claim — `talk()` buffers through it (V275).
+    claiming: std::sync::atomic::AtomicBool,
+    /// Single-flight claim serialization.
+    claim_lock: Mutex<()>,
+    /// Installed-claim generation — bumped per install; pacer
+    /// faults report the dead generation for scoped release.
+    claim_gen: std::sync::atomic::AtomicU64,
+    /// Claim-scoped death signal (the dead generation) — the entry's
+    /// watcher releases the lock on a match (⊥ session death, V275).
+    dead_tx: watch::Sender<u64>,
+}
+
+impl LazyVigi {
+    fn new(claim: VigiClaim) -> Self {
+        Self {
+            slot: Mutex::new(None),
+            claim,
+            claiming: std::sync::atomic::AtomicBool::new(false),
+            claim_lock: Mutex::new(()),
+            claim_gen: std::sync::atomic::AtomicU64::new(0),
+            dead_tx: watch::channel(0).0,
+        }
+    }
+}
+
+/// VIGI `:8800` capability probe (V259/V275) — `Ready` ∨ `Busy`
+/// proves the protocol and yields a lazy-claim descriptor;
+/// `Refused` upgrades the talk mark to capability; `Unreachable`
+/// leaves the class untouched.
+async fn probe_vigi(url: &url::Url, marks: &mut Vec<(Direction, FaultClass)>) -> Option<VigiClaim> {
+    let host = url.host_str()?.to_owned();
+    let user = url.username().to_owned();
+    let pass = url.password().unwrap_or("").to_owned();
+    match crate::vigi::VigiTalk::connect(&host, &user, &pass).await {
+        crate::vigi::VigiProbe::Ready(_) | crate::vigi::VigiProbe::Busy => {
+            marks.retain(|(d, _)| *d != Direction::Talk);
+            Some(VigiClaim { host, user, pass })
+        }
+        crate::vigi::VigiProbe::Unreachable => None,
+        crate::vigi::VigiProbe::Refused => {
+            for (d, c) in marks.iter_mut() {
+                if *d == Direction::Talk {
+                    *c = FaultClass::Capability;
+                }
+            }
+            None
+        }
+    }
 }
 
 /// Talk-path state — bounded PCM queue shared with the pacer.
@@ -488,7 +549,7 @@ impl RtspSession {
         keepalive: Duration,
         listen: Option<Binding>,
         talk: Option<Binding>,
-        vigi: Option<crate::vigi::VigiTalk>,
+        vigi_claim: Option<VigiClaim>,
         media_rx: mpsc::Receiver<Interleaved>,
         marks: Vec<(Direction, FaultClass)>,
     ) -> ArcAudioSession {
@@ -515,7 +576,9 @@ impl RtspSession {
                     },
                 )
             })
-            .or_else(|| vigi.map(|v| (sdp::Codec::Pcma, TalkOut::Vigi(Mutex::new(v)))))
+            .or_else(|| {
+                vigi_claim.map(|c| (sdp::Codec::Pcma, TalkOut::Vigi(Box::new(LazyVigi::new(c)))))
+            })
             .map(|(codec, out)| {
                 let t = Arc::new(TalkShared {
                     queue: Mutex::new(VecDeque::with_capacity(TALK_QUEUE)),
@@ -625,6 +688,37 @@ async fn pacer(client: Arc<RtspClient>, state: Arc<TalkShared>) {
     let ssrc: u32 = rand::random();
     loop {
         tick.tick().await;
+        // VIGI arm — the talker is claimed per hold (V275): ⊥ pop
+        // while unclaimed, the send rides the claim-slot lock (a
+        // release can't interleave mid-send), a send fault is
+        // claim-scoped (drop the talker + signal the generation —
+        // the SESSION survives).
+        if let TalkOut::Vigi(lazy) = &state.out {
+            let mut slot = lazy.slot.lock().await;
+            let Some(talker) = slot.as_mut() else {
+                drop(slot);
+                continue;
+            };
+            let mut q = state.queue.lock().await;
+            let Some(mut chunk) = q.pop_front() else {
+                drop(q);
+                drop(slot);
+                continue;
+            };
+            let rest = (chunk.len() > FRAME_SAMPLES).then(|| chunk.split_off(FRAME_SAMPLES));
+            if let Some(rest) = rest {
+                q.push_front(rest);
+            }
+            drop(q);
+            let claim_gen = lazy.claim_gen.load(Ordering::Relaxed);
+            if talker.send(&chunk, ts).await.is_err() {
+                *slot = None; // drop the dead talker — slot freed
+                drop(slot);
+                _ = lazy.dead_tx.send(claim_gen);
+            }
+            ts = ts.wrapping_add(u32::try_from(chunk.len()).unwrap_or(0));
+            continue;
+        }
         let mut q = state.queue.lock().await;
         let Some(mut chunk) = q.pop_front() else {
             drop(q);
@@ -643,7 +737,7 @@ async fn pacer(client: Arc<RtspClient>, state: Arc<TalkShared>) {
                     .await
                     .is_ok()
             }
-            TalkOut::Vigi(v) => v.lock().await.send(&chunk, ts).await.is_ok(),
+            TalkOut::Vigi(_) => unreachable!("vigi arm handled above"),
         };
         if !sent {
             _ = state.dead_tx.send(true);
@@ -679,6 +773,14 @@ impl AudioSession for RtspSession {
         let Some(t) = &self.talk else {
             return Err(Error::Unsupported(Direction::Talk));
         };
+        // V275 — an unclaimed VIGI talker ⊥ claim-in-flight errors;
+        // frames buffer through an in-flight claim.
+        if let TalkOut::Vigi(lazy) = &t.out {
+            let unclaimed = lazy.slot.lock().await.is_none();
+            if unclaimed && !lazy.claiming.load(Ordering::Relaxed) {
+                return Err(Error::Protocol("vigi talker unclaimed".into()));
+            }
+        }
         let mut q = t.queue.lock().await;
         while q.len() >= TALK_QUEUE {
             q.pop_front(); // drop-oldest
@@ -710,6 +812,88 @@ impl AudioSession for RtspSession {
             task.abort();
         }
         self.client.close();
+        // ACTIVE close of a held `:8800` talker (V275/B122 — the
+        // device slot must free, ⊥ Arc-drop reliance).
+        self.drop_talker().await;
+    }
+
+    fn dead_rx(&self) -> watch::Receiver<bool> {
+        self.dead_tx.subscribe()
+    }
+
+    fn talk_dead_rx(&self) -> Option<watch::Receiver<u64>> {
+        let TalkOut::Vigi(lazy) = &self.talk.as_ref()?.out else {
+            return None;
+        };
+        Some(lazy.dead_tx.subscribe())
+    }
+
+    fn claims_lazily(&self) -> bool {
+        matches!(self.talk.as_ref().map(|t| &t.out), Some(TalkOut::Vigi(_)))
+    }
+
+    /// V275 claim — connect OUTSIDE locks, install under the
+    /// claim-slot lock, single-flight via `claim_lock`.
+    async fn claim_talk(&self) -> TalkClaim {
+        let Some(lazy) = self.lazy_vigi() else {
+            return TalkClaim::Ready;
+        };
+        let _one = lazy.claim_lock.lock().await;
+        if lazy.slot.lock().await.is_some() {
+            return TalkClaim::Ready;
+        }
+        lazy.claiming.store(true, Ordering::Relaxed);
+        let probe =
+            crate::vigi::VigiTalk::connect(&lazy.claim.host, &lazy.claim.user, &lazy.claim.pass)
+                .await;
+        lazy.claiming.store(false, Ordering::Relaxed);
+        match probe {
+            crate::vigi::VigiProbe::Ready(t) => {
+                if self.dead() {
+                    return TalkClaim::Unreachable;
+                }
+                *lazy.slot.lock().await = Some(t);
+                lazy.claim_gen.fetch_add(1, Ordering::Relaxed);
+                TalkClaim::Ready
+            }
+            crate::vigi::VigiProbe::Busy => TalkClaim::Busy,
+            crate::vigi::VigiProbe::Refused => TalkClaim::Refused,
+            crate::vigi::VigiProbe::Unreachable => TalkClaim::Unreachable,
+        }
+    }
+
+    async fn release_talk(&self) {
+        let Some(t) = &self.talk else { return };
+        // Queue flush ∀ paths — ⊥ predecessor audio leaking into
+        // the next hold (V275).
+        t.queue.lock().await.clear();
+        self.drop_talker().await;
+    }
+
+    fn talk_gen(&self) -> u64 {
+        self.lazy_vigi()
+            .map_or(0, |l| l.claim_gen.load(Ordering::Relaxed))
+    }
+
+    fn dead(&self) -> bool {
+        self.closed.load(Ordering::Relaxed) || *self.dead_tx.borrow()
+    }
+}
+
+impl RtspSession {
+    /// The lazy VIGI slot, when this session carries one.
+    fn lazy_vigi(&self) -> Option<&LazyVigi> {
+        match self.talk.as_ref().map(|t| &t.out) {
+            Some(TalkOut::Vigi(lazy)) => Some(lazy),
+            _ => None,
+        }
+    }
+
+    /// Drop the installed `:8800` talker — TCP close frees the
+    /// device-side single-talker slot (R63).
+    async fn drop_talker(&self) {
+        let Some(lazy) = self.lazy_vigi() else { return };
+        lazy.slot.lock().await.take();
     }
 }
 
@@ -1344,33 +1528,40 @@ mod tests {
         crate::vigi::gate_reset_for_test("127.0.0.1");
         let (tx, mut parts) = tmpsc::channel::<Vec<u8>>(32);
         tokio::spawn(async move {
-            let Ok((stream, _)) = lis8800.accept().await else {
-                return;
-            };
-            let (rd, mut wr) = stream.into_split();
-            let mut rd = tokio::io::BufReader::new(rd);
-            // 200 immediately (no auth challenge — stub posture).
-            let _ = read_head(&mut rd).await;
-            wr.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/mixed\r\n\r\n")
-                .await
-                .unwrap();
-            let mut buf = vec![0_u8; 4096];
-            // Talk-request part → session_id reply.
-            let _ = rd.read(&mut buf).await.unwrap();
-            let body = r#"{"params":{"session_id":"s1"}}"#;
-            let sid = format!(
-                "----device-stream-boundary--\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            );
-            wr.write_all(sid.as_bytes()).await.unwrap();
+            // Lazy claim ⇒ one conn for the open-time probe, another
+            // per mic-hold — serve each on its own task.
             loop {
-                let n = rd.read(&mut buf).await.unwrap_or(0);
-                if n == 0 {
+                let Ok((stream, _)) = lis8800.accept().await else {
                     return;
-                }
-                if tx.send(buf[..n].to_vec()).await.is_err() {
-                    return;
-                }
+                };
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let (rd, mut wr) = stream.into_split();
+                    let mut rd = tokio::io::BufReader::new(rd);
+                    // 200 immediately (no auth challenge — stub posture).
+                    let _ = read_head(&mut rd).await;
+                    wr.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/mixed\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let mut buf = vec![0_u8; 4096];
+                    // Talk-request part → session_id reply.
+                    let _ = rd.read(&mut buf).await.unwrap();
+                    let body = r#"{"params":{"session_id":"s1"}}"#;
+                    let sid = format!(
+                        "----device-stream-boundary--\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    wr.write_all(sid.as_bytes()).await.unwrap();
+                    loop {
+                        let n = rd.read(&mut buf).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        if tx.send(buf[..n].to_vec()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
             }
         });
 
@@ -1390,6 +1581,10 @@ mod tests {
             "{:?}",
             sess.marks()
         );
+        // Unclaimed — ⊥ queue, ⊥ send (V275): talk must error.
+        assert!(sess.talk(&[1000_i16; 160]).await.is_err());
+        // Lazy claim — mic-hold acquires the `:8800` talker now.
+        assert!(matches!(sess.claim_talk().await, TalkClaim::Ready));
         sess.talk(&[1000_i16; 160]).await.unwrap();
         // The pacer emits an audio/mp2t part within a tick.
         let mut got = Vec::new();

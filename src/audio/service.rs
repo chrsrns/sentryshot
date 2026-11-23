@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use common::MonitorId;
 use tokio::sync::{Mutex, RwLock, broadcast, watch};
 
-use crate::{ArcAudioClient, ArcAudioSession, AudioCaps, Direction, Error, PcmChunk};
+use crate::{ArcAudioClient, ArcAudioSession, AudioCaps, Direction, Error, PcmChunk, TalkClaim};
 
 /// Attached consumers per monitor — excess attach is refused.
 pub const MAX_CONSUMERS: usize = 8;
@@ -109,6 +109,9 @@ pub struct AudioEntry {
     /// Server→consumer ctrl broadcast (`caps` on lock release /
     /// mark change / session death).
     ctrl_tx: broadcast::Sender<String>,
+    /// Installed-claim generation owned by `talk_owner` — scopes
+    /// claim-death releases (V275).
+    claim_gen: Mutex<Option<u64>>,
     consumers: Mutex<HashMap<ConsumerId, Consumer>>,
 }
 
@@ -124,6 +127,7 @@ impl AudioEntry {
             session_marks: Mutex::new(HashSet::new()),
             persisted: Mutex::new(HashSet::new()),
             ctrl_tx: broadcast::channel(16).0,
+            claim_gen: Mutex::new(None),
             consumers: Mutex::new(HashMap::new()),
         }
     }
@@ -156,6 +160,12 @@ impl AudioEntry {
         let mut owner = self.talk_owner.lock().await;
         if *owner == Some(consumer) {
             *owner = None;
+            *self.claim_gen.lock().await = None;
+            drop(owner);
+            // V275 — active `:8800` release + queue flush ∀ paths.
+            if let SessionSlot::Open(open) = &*self.slot.read().await {
+                open.session.release_talk().await;
+            }
         }
     }
 
@@ -306,6 +316,56 @@ impl AudioEntry {
             _ => None,
         }
     }
+    /// Claim-scoped talker death (V275) — drop the dead claim's
+    /// lock + interest (⊥ mark, ⊥ session-fatal); the RTSP session
+    /// survives for listen. Generation-scoped: a superseded claim's
+    /// late fault ⊥ revokes a new owner.
+    async fn talker_died(&self, claim_gen: u64) {
+        if *self.claim_gen.lock().await != Some(claim_gen) {
+            return;
+        }
+        let Some(owner) = *self.talk_owner.lock().await else {
+            return;
+        };
+        self.release_talk(owner).await;
+        if self.has_interest(owner).await && !self.remove_interest(owner, Direction::Talk).await {
+            self.detach(owner).await;
+        }
+        _ = self.ctrl_tx.send(
+            serde_json::json!({
+                "type": "error",
+                "message": "talk claim lost",
+            })
+            .to_string(),
+        );
+        self.broadcast_caps().await;
+    }
+
+    /// `caps` broadcast to every attached consumer — current session
+    /// caps + persisted ∪ session marks + live lock state (V258).
+    async fn broadcast_caps(&self) {
+        let caps = match &*self.slot.read().await {
+            SessionSlot::Open(open) => open.caps,
+            _ => AudioCaps {
+                listen: false,
+                talk: false,
+            },
+        };
+        let mut marks: Vec<String> = self.persisted.lock().await.iter().cloned().collect();
+        marks.extend(self.session_marks.lock().await.iter().cloned());
+        marks.sort();
+        marks.dedup();
+        _ = self.ctrl_tx.send(
+            serde_json::json!({
+                "type": "caps",
+                "listen": caps.listen,
+                "talk": caps.talk,
+                "talkFree": caps.talk && !self.talk_owned().await,
+                "unsupported": marks,
+            })
+            .to_string(),
+        );
+    }
 }
 
 /// Open decisions a consumer attach can produce.
@@ -320,6 +380,9 @@ pub enum Attach {
     ),
     /// `busy` — talk lock held by another consumer.
     Busy,
+    /// `error` — a claim-time fault (V275): transient, retryable —
+    /// ⊥ mark (⊥ `Unsupported`), ⊥ WS close (⊥ `Fault`).
+    Retryable(String),
     /// `error` — direction marked unsupported (persisted ∪ session).
     Unsupported,
     /// `error` — open fault; joiners share the same message.
@@ -488,6 +551,13 @@ impl AudioService {
                     // `error`; caps ctrl reports the merged set.
                     return Attach::Fault(format!("{name} unavailable in session"));
                 }
+                // V275 — lazily-claimed talker: the exclusive lock
+                // is held; run the `:8800` handshake pre-register.
+                if direction == Direction::Talk && open.session.claims_lazily() {
+                    if let Err(attach) = self.claim_for(entry, consumer, &open).await {
+                        return attach;
+                    }
+                }
                 if !entry.register(consumer, Interest::default(), drop_tx).await {
                     if direction == Direction::Talk {
                         entry.release_talk(consumer).await;
@@ -541,6 +611,12 @@ impl AudioService {
     /// implied `talk-end` on a mid-session talk mark.
     async fn revoke_talk(entry: &Arc<AudioEntry>) {
         let owner = entry.talk_owner.lock().await.take();
+        *entry.claim_gen.lock().await = None;
+        if owner.is_some() {
+            if let SessionSlot::Open(open) = &*entry.slot.read().await {
+                open.session.release_talk().await;
+            }
+        }
         if let Some(owner) = owner {
             // A tentative owner (attach still pre-register) has no
             // interest to strip — detaching it would close the
@@ -556,27 +632,55 @@ impl AudioService {
     /// `caps` broadcast to every attached consumer — current session
     /// caps + persisted ∪ session marks + live lock state.
     async fn broadcast_caps(&self, entry: &Arc<AudioEntry>) {
-        let caps = match &*entry.slot.read().await {
-            SessionSlot::Open(open) => open.caps,
-            _ => AudioCaps {
-                listen: false,
-                talk: false,
-            },
+        entry.broadcast_caps().await;
+    }
+
+    /// Lazy `:8800` claim under the held talk lock (V275) — runs
+    /// the private-protocol handshake pre-register. A claim
+    /// resolving against a closed/replaced session drops its
+    /// talker (⊥ installs); every failure path releases the lock.
+    async fn claim_for(
+        &self,
+        entry: &Arc<AudioEntry>,
+        consumer: ConsumerId,
+        open: &Arc<OpenSession>,
+    ) -> Result<(), Attach> {
+        let outcome = open.session.claim_talk().await;
+        let valid = {
+            let slot = entry.slot.read().await;
+            entry.owns_talk(consumer).await
+                && matches!(&*slot, SessionSlot::Open(o) if Arc::ptr_eq(o, open))
+                && !open.session.dead()
         };
-        let mut marks: Vec<String> = entry.persisted.lock().await.iter().cloned().collect();
-        marks.extend(entry.session_marks.lock().await.iter().cloned());
-        marks.sort();
-        marks.dedup();
-        _ = entry.ctrl_tx.send(
-            serde_json::json!({
-                "type": "caps",
-                "listen": caps.listen,
-                "talk": caps.talk,
-                "talkFree": caps.talk && !entry.talk_owned().await,
-                "unsupported": marks,
-            })
-            .to_string(),
-        );
+        if !valid {
+            open.session.release_talk().await;
+            entry.release_talk(consumer).await;
+            return Err(Attach::Retryable("talk unavailable in session".to_owned()));
+        }
+        match outcome {
+            TalkClaim::Ready => {
+                *entry.claim_gen.lock().await = Some(open.session.talk_gen());
+                Ok(())
+            }
+            TalkClaim::Busy => {
+                entry.release_talk(consumer).await;
+                Err(Attach::Retryable(
+                    "talk busy — another talker active".to_owned(),
+                ))
+            }
+            TalkClaim::Unreachable => {
+                entry.release_talk(consumer).await;
+                Err(Attach::Retryable("talk unavailable in session".to_owned()))
+            }
+            TalkClaim::Refused => {
+                // Claim-time refusal is session-scoped (V275) —
+                // capability was already proven at open.
+                entry.session_marks.lock().await.insert("talk".to_owned());
+                entry.release_talk(consumer).await;
+                self.broadcast_caps(entry).await;
+                Err(Attach::Retryable("talk unavailable in session".to_owned()))
+            }
+        }
     }
 
     /// Open or join the session for `direction`. Joiners during an
@@ -688,14 +792,44 @@ impl AudioService {
                     Self::revoke_talk(entry).await;
                 }
                 self.broadcast_caps(entry).await;
-                // Session-death watcher — transport fault mid-session
-                // ⇒ `error` + teardown to every consumer.
+                // Session-death + claim-death watcher — receiver
+                // clones hold ⊥ the session Arc (B122): sender
+                // drop ends the wait on close.
                 let weak = Arc::downgrade(entry);
-                let dead = session.clone();
+                let mut dead_rx = session.dead_rx();
+                let mut talk_dead_rx = session.talk_dead_rx();
                 let dead_watch = tokio::spawn(async move {
-                    dead.wait_dead().await;
-                    if let Some(e) = weak.upgrade() {
-                        e.session_died().await;
+                    loop {
+                        tokio::select! {
+                            r = async {
+                                dead_rx.wait_for(|d| *d).await.map(|_| ())
+                            } => {
+                                if r.is_ok() {
+                                    if let Some(e) = weak.upgrade() {
+                                        e.session_died().await;
+                                    }
+                                }
+                                return;
+                            }
+                            r = async {
+                                match &mut talk_dead_rx {
+                                    Some(rx) => rx
+                                        .wait_for(|g| *g != 0)
+                                        .await
+                                        .map(|g| *g),
+                                    None => std::future::pending().await,
+                                }
+                            } => {
+                                match r {
+                                    Ok(claim_gen) => {
+                                        if let Some(e) = weak.upgrade() {
+                                            e.talker_died(claim_gen).await;
+                                        }
+                                    }
+                                    Err(_) => talk_dead_rx = None,
+                                }
+                            }
+                        }
                     }
                 });
                 let (pcm_tx, _) = broadcast::channel(64);
@@ -709,13 +843,25 @@ impl AudioService {
                 } else {
                     tokio::spawn(async {})
                 };
-                Ok(Arc::new(OpenSession {
+                let open = Arc::new(OpenSession {
                     session,
                     caps,
                     pcm_tx,
                     _pump: pump,
                     _death_watch: dead_watch,
-                }))
+                });
+                // V275 — a talk owner surviving a session replace
+                // re-claims on the fresh session (defensive; live
+                // drains clear the lock first).
+                if open.session.claims_lazily() {
+                    let owner = *entry.talk_owner.lock().await;
+                    if let Some(owner) = owner {
+                        if entry.has_interest(owner).await && open.session.talk_gen() == 0 {
+                            _ = self.claim_for(entry, owner, &open).await;
+                        }
+                    }
+                }
+                Ok(open)
             }
             Err(e) => Err(OpenError {
                 message: e.to_string(),
@@ -737,12 +883,25 @@ mod tests {
     use crate::{AudioSession, FaultClass};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// Lazy-claim control surface for `StubSession` (V275 tests).
+    struct StubLazy {
+        outcome: Mutex<TalkClaim>,
+        claims: AtomicUsize,
+        releases: AtomicUsize,
+        dead_tx: watch::Sender<u64>,
+        gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    }
+
     struct StubSession {
         caps: AudioCaps,
         marks: Vec<(Direction, FaultClass)>,
         talked: Mutex<Vec<i16>>,
         closed: AtomicUsize,
-        dead: Mutex<Option<watch::Receiver<bool>>>,
+        dead: std::sync::Mutex<Option<watch::Receiver<bool>>>,
+        /// Sender kept alive so the default `dead_rx` never closes —
+        /// mimics a living session (a dropped sender ends the watch).
+        dead_keep: watch::Sender<bool>,
+        lazy: Option<StubLazy>,
     }
 
     #[async_trait::async_trait]
@@ -764,12 +923,51 @@ mod tests {
             self.closed.fetch_add(1, Ordering::SeqCst);
         }
         async fn wait_dead(&self) {
-            match self.dead.lock().await.take() {
-                Some(mut rx) => {
+            let mut rx = self.dead.lock().unwrap().clone();
+            match rx.as_mut() {
+                Some(rx) => {
                     _ = rx.wait_for(|d| *d).await;
                 }
                 None => std::future::pending::<()>().await,
             }
+        }
+        fn dead_rx(&self) -> watch::Receiver<bool> {
+            self.dead
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| self.dead_keep.subscribe())
+        }
+        fn claims_lazily(&self) -> bool {
+            self.lazy.is_some()
+        }
+        async fn claim_talk(&self) -> TalkClaim {
+            let Some(l) = &self.lazy else {
+                return TalkClaim::Ready;
+            };
+            l.claims.fetch_add(1, Ordering::SeqCst);
+            let gate = l.gate.lock().await.clone();
+            if let Some(g) = gate {
+                g.notified().await;
+            }
+            *l.outcome.lock().await
+        }
+        async fn release_talk(&self) {
+            if let Some(l) = &self.lazy {
+                l.releases.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn talk_gen(&self) -> u64 {
+            u64::try_from(
+                self.lazy
+                    .as_ref()
+                    .map(|l| l.claims.load(Ordering::SeqCst))
+                    .unwrap_or(0),
+            )
+            .unwrap_or(0)
+        }
+        fn talk_dead_rx(&self) -> Option<watch::Receiver<u64>> {
+            self.lazy.as_ref().map(|l| l.dead_tx.subscribe())
         }
     }
 
@@ -835,8 +1033,234 @@ mod tests {
             marks: Vec::new(),
             talked: Mutex::new(Vec::new()),
             closed: AtomicUsize::new(0),
-            dead: Mutex::new(None),
+            dead: std::sync::Mutex::new(None),
+            dead_keep: watch::channel(false).0,
+            lazy: None,
         })
+    }
+
+    fn lazy_session(outcome: TalkClaim) -> Arc<StubSession> {
+        Arc::new(StubSession {
+            caps: AudioCaps {
+                listen: true,
+                talk: true,
+            },
+            marks: Vec::new(),
+            talked: Mutex::new(Vec::new()),
+            closed: AtomicUsize::new(0),
+            dead: std::sync::Mutex::new(None),
+            dead_keep: watch::channel(false).0,
+            lazy: Some(StubLazy {
+                outcome: Mutex::new(outcome),
+                claims: AtomicUsize::new(0),
+                releases: AtomicUsize::new(0),
+                dead_tx: watch::channel(0).0,
+                gate: Mutex::new(None),
+            }),
+        })
+    }
+
+    fn stub_client(sess: Arc<StubSession>) -> Arc<StubClient> {
+        Arc::new(StubClient {
+            session: Ok(sess),
+            opens: AtomicUsize::new(0),
+            gate: None,
+            want_talk: Mutex::new(Vec::new()),
+        })
+    }
+
+    #[tokio::test]
+    async fn lazy_claim_busy_is_retryable_listen_survives() {
+        let sess = lazy_session(TalkClaim::Busy);
+        let client = stub_client(sess.clone());
+        let (svc, _) = svc(client.clone());
+        let e = entry_of(&svc, &client);
+        let (drop_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        match svc
+            .attach(&e, &mid(), 1, Direction::Listen, &[], &drop_tx)
+            .await
+        {
+            Attach::Open(..) => {}
+            other => panic!("expected open, got {other:?}"),
+        }
+        match svc
+            .attach(&e, &mid(), 1, Direction::Talk, &[], &drop_tx)
+            .await
+        {
+            Attach::Retryable(msg) => assert!(msg.contains("busy"), "{msg}"),
+            other => panic!("expected Retryable, got {other:?}"),
+        }
+        // Lock released + session alive — retry ⊥ wedge, listen ⊥ harmed.
+        assert!(!e.talk_owned().await);
+        assert_eq!(e.consumer_count().await, 1);
+        assert_eq!(sess.closed.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn lazy_claim_refused_marks_session_only() {
+        let sess = lazy_session(TalkClaim::Refused);
+        let client = stub_client(sess.clone());
+        let (svc, persisted) = svc(client.clone());
+        let e = entry_of(&svc, &client);
+        let (drop_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        match svc
+            .attach(&e, &mid(), 1, Direction::Listen, &[], &drop_tx)
+            .await
+        {
+            Attach::Open(..) => {}
+            other => panic!("expected open, got {other:?}"),
+        }
+        match svc
+            .attach(&e, &mid(), 1, Direction::Talk, &[], &drop_tx)
+            .await
+        {
+            Attach::Retryable(_) => {}
+            other => panic!("expected Retryable, got {other:?}"),
+        }
+        // Claim-time refusal marks the SESSION — capability was
+        // proven at open; nothing persists (V275).
+        assert!(persisted.lock().await.is_empty());
+        assert!(e.session_marks.lock().await.contains("talk"));
+        // The mark gates later attaches on this session.
+        match svc
+            .attach(&e, &mid(), 1, Direction::Talk, &[], &drop_tx)
+            .await
+        {
+            Attach::Unsupported => {}
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn lazy_claim_unreachable_retryable_no_mark() {
+        let sess = lazy_session(TalkClaim::Unreachable);
+        let client = stub_client(sess);
+        let (svc, _) = svc(client.clone());
+        let e = entry_of(&svc, &client);
+        let (drop_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        match svc
+            .attach(&e, &mid(), 1, Direction::Talk, &[], &drop_tx)
+            .await
+        {
+            Attach::Retryable(_) => {}
+            other => panic!("expected Retryable, got {other:?}"),
+        }
+        assert!(!e.talk_owned().await);
+        assert!(!e.session_marks.lock().await.contains("talk"));
+    }
+
+    #[tokio::test]
+    async fn lazy_claim_install_release_reclaim() {
+        let sess = lazy_session(TalkClaim::Ready);
+        let client = stub_client(sess.clone());
+        let (svc, _) = svc(client.clone());
+        let e = entry_of(&svc, &client);
+        let (drop_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        match svc
+            .attach(&e, &mid(), 1, Direction::Talk, &[], &drop_tx)
+            .await
+        {
+            Attach::Open(..) => {}
+            other => panic!("expected open, got {other:?}"),
+        }
+        assert_eq!(sess.lazy.as_ref().unwrap().claims.load(Ordering::SeqCst), 1);
+        // Mic-up drops the claimed talker + frees the lock.
+        svc.remove_direction(&e, 1, Direction::Talk).await;
+        assert_eq!(
+            sess.lazy.as_ref().unwrap().releases.load(Ordering::SeqCst),
+            1
+        );
+        assert!(!e.talk_owned().await);
+        // Second hold claims afresh.
+        match svc
+            .attach(&e, &mid(), 1, Direction::Talk, &[], &drop_tx)
+            .await
+        {
+            Attach::Open(..) => {}
+            other => panic!("expected open, got {other:?}"),
+        }
+        assert_eq!(sess.lazy.as_ref().unwrap().claims.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn lazy_claim_death_releases_owner() {
+        let sess = lazy_session(TalkClaim::Ready);
+        let dead_tx = sess.lazy.as_ref().unwrap().dead_tx.clone();
+        let client = stub_client(sess);
+        let (svc, _) = svc(client.clone());
+        let e = entry_of(&svc, &client);
+        let (drop_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctrl = match svc
+            .attach(&e, &mid(), 1, Direction::Talk, &[], &drop_tx)
+            .await
+        {
+            Attach::Open(_, _, rx) => rx,
+            other => panic!("expected open, got {other:?}"),
+        };
+        // A stale-generation death ⊥ releases (V275 scoping).
+        dead_tx.send(9).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(e.talk_owned().await);
+        // The held claim's death ⇒ lock release + implied talk-end.
+        dead_tx.send(1).unwrap();
+        let mut saw_error = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while let Ok(Ok(msg)) = tokio::time::timeout_at(deadline, ctrl.recv()).await {
+            if msg.contains("talk claim lost") {
+                saw_error = true;
+                break;
+            }
+        }
+        assert!(saw_error);
+        assert!(!e.talk_owned().await);
+    }
+
+    #[tokio::test]
+    async fn stale_claim_drops_talker_no_zombie() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let sess = lazy_session(TalkClaim::Ready);
+        *sess.lazy.as_ref().unwrap().gate.lock().await = Some(gate.clone());
+        let (dead_tx, dead_rx) = watch::channel(false);
+        *sess.dead.lock().unwrap() = Some(dead_rx);
+        let client = stub_client(sess.clone());
+        let (svc, _) = svc(client.clone());
+        let e = entry_of(&svc, &client);
+        let (drop_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        // Consumer 2 holds the session via listen.
+        match svc
+            .attach(&e, &mid(), 2, Direction::Listen, &[], &drop_tx)
+            .await
+        {
+            Attach::Open(..) => {}
+            other => panic!("expected open, got {other:?}"),
+        }
+        // Consumer 1's talk attach claims — the stub blocks on the gate.
+        let (svc2, e2, dt2) = (svc.clone(), e.clone(), drop_tx.clone());
+        let attach_task = tokio::spawn(async move {
+            svc2.attach(&e2, &mid(), 1, Direction::Talk, &[], &dt2)
+                .await
+        });
+        // Wait for the in-flight claim, then kill the session.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while sess.lazy.as_ref().unwrap().claims.load(Ordering::SeqCst) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "claim never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        dead_tx.send(true).unwrap();
+        gate.notify_one();
+        match attach_task.await.unwrap() {
+            Attach::Retryable(_) => {}
+            other => panic!("expected Retryable, got {other:?}"),
+        }
+        // ⊥ zombie — lock released, claim's talker dropped.
+        assert!(!e.talk_owned().await);
+        assert_eq!(
+            sess.lazy.as_ref().unwrap().releases.load(Ordering::SeqCst),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1028,7 +1452,9 @@ mod tests {
             ],
             talked: Mutex::new(Vec::new()),
             closed: AtomicUsize::new(0),
-            dead: Mutex::new(None),
+            dead: std::sync::Mutex::new(None),
+            dead_keep: watch::channel(false).0,
+            lazy: None,
         });
         let client = Arc::new(StubClient {
             session: Ok(sess),
@@ -1160,7 +1586,7 @@ mod tests {
     async fn session_death_drops_consumers_with_error_1000() {
         let (dead_tx, dead_rx) = watch::channel(false);
         let sess = ok_session(true, false);
-        *sess.dead.lock().await = Some(dead_rx);
+        *sess.dead.lock().unwrap() = Some(dead_rx);
         let client = Arc::new(StubClient {
             session: Ok(sess.clone()),
             opens: AtomicUsize::new(0),

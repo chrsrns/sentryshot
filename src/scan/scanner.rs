@@ -43,7 +43,7 @@ fn default_vigi_probe() -> VigiProbeFn {
                     audio::VigiTalk::connect(&host, &creds.username, &creds.password)
                 )
                 .await,
-                Ok(audio::VigiProbe::Ready(_))
+                Ok(audio::VigiProbe::Ready(_) | audio::VigiProbe::Busy)
             )
         })
     })

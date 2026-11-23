@@ -14,6 +14,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::watch;
 
 mod g711;
 mod rtp;
@@ -168,6 +169,58 @@ pub trait AudioSession: Send + Sync {
     /// reader/pump/keepalive task exit. Never resolves for a session
     /// that lives until `close`.
     async fn wait_dead(&self);
+
+    /// Session-death receiver for the entry's watcher — cloned
+    /// receivers hold ⊥ the session `Arc` (B122).
+    fn dead_rx(&self) -> watch::Receiver<bool> {
+        watch::channel(false).1
+    }
+
+    /// Claim-scoped talker-death receiver (V275) — `Some` only on
+    /// lazily-claimed (VIGI) sessions; carries the dead claim's
+    /// generation.
+    fn talk_dead_rx(&self) -> Option<watch::Receiver<u64>> {
+        None
+    }
+
+    /// Whether talk rides a lazily-claimed vendor talker (V275) —
+    /// `false` for negotiated sendonly sessions.
+    fn claims_lazily(&self) -> bool {
+        false
+    }
+
+    /// Connect + install the `:8800` talker for the current hold
+    /// (V275). No-op `Ready` for non-VIGI sessions.
+    async fn claim_talk(&self) -> TalkClaim {
+        TalkClaim::Ready
+    }
+
+    /// Drop any claimed talker (TCP close — the device slot frees)
+    /// + flush the talk queue. Every talk-lock release path (V275).
+    async fn release_talk(&self) {}
+
+    /// Current installed-claim generation — `0` when unclaimed.
+    fn talk_gen(&self) -> u64 {
+        0
+    }
+
+    /// Session dead flag — install-validation input (V275).
+    fn dead(&self) -> bool {
+        false
+    }
+}
+
+/// `claim_talk` outcome — the entry maps to attach outcomes (V275).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TalkClaim {
+    /// Talker installed (or no claim needed).
+    Ready,
+    /// Device reported another active talker (`-52405`, R63).
+    Busy,
+    /// Complete protocol refusal (nonzero `error_code`, auth/proto).
+    Refused,
+    /// Transport unreachable ∨ gate-suppressed.
+    Unreachable,
 }
 
 /// Factory for monitor audio sessions — one instance per monitor

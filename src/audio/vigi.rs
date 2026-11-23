@@ -162,8 +162,12 @@ pub enum VigiProbe {
     /// TCP refused / connect timeout — transport, session-only.
     Unreachable,
     /// Peer answered but refused/failed the exchange (bad creds,
-    /// 4xx, malformed multipart) — capability fault, persists.
+    /// 4xx, malformed multipart, nonzero `error_code` ⊥ `-52405`)
+    /// — capability fault at open, availability fault at claim.
     Refused,
+    /// Device answered `error_code:-52405` — another talker holds
+    /// the single-talker slot (R63). Protocol proven, ⊥ usable.
+    Busy,
 }
 
 impl VigiTalk {
@@ -266,7 +270,11 @@ impl VigiTalk {
         {
             // EOF/malformed mid-POST — the peer disproved the
             // protocol; persists (V259 boundary).
-            Ok(Some(id)) => id,
+            Ok(Some(Grant::Usable(id))) => id,
+            // Busy/refused grants are COMPLETE protocol answers —
+            // the daemon is healthy; the gate resets (V273).
+            Ok(Some(Grant::Busy)) => return (VigiProbe::Busy, Settle::Reset),
+            Ok(Some(Grant::Refused)) => return (VigiProbe::Refused, Settle::Reset),
             Ok(None) => return (VigiProbe::Refused, Settle::Keep),
             // Answer-then-stall is a transport fault — session-only.
             Err(_) => return (VigiProbe::Unreachable, Settle::Keep),
@@ -350,11 +358,20 @@ async fn read_head(
     }
 }
 
-/// Consume device multipart parts until a JSON part carries
-/// `params.session_id`; `None` on EOF/malformed.
+/// Session-grant classification — `params.error_code` decides (R67):
+/// `0` + `session_id` ⇒ usable talker; `-52405` ⇒ busy slot; other
+/// nonzero ⇒ complete refusal.
+enum Grant {
+    Usable(String),
+    Busy,
+    Refused,
+}
+
+/// Consume device multipart parts until a JSON grant part arrives;
+/// `None` on EOF/malformed.
 async fn read_session_id(
     rd: &mut tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
-) -> Option<String> {
+) -> Option<Grant> {
     let mut at_boundary = false;
     let mut content_len: Option<usize> = None;
     loop {
@@ -382,10 +399,20 @@ async fn read_session_id(
                 .await
                 .ok()?;
             let v: serde_json::Value = serde_json::from_slice(&body).ok()?;
+            let code = v
+                .pointer("/params/error_code")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            if code == -52405 {
+                return Some(Grant::Busy);
+            }
+            if code != 0 {
+                return Some(Grant::Refused);
+            }
             return v
                 .pointer("/params/session_id")
                 .and_then(serde_json::Value::as_str)
-                .map(str::to_owned);
+                .map(|id| Grant::Usable(id.to_owned()));
         }
         if let Some(rest) = line.strip_prefix("Content-Length:") {
             content_len = rest.trim().parse().ok();
@@ -735,7 +762,15 @@ mod tests {
             let mut buf = vec![0_u8; 4096];
             let n = rd.read(&mut buf).await.unwrap();
             tx.send(buf[..n].to_vec()).await.unwrap();
-            let body = r#"{"params":{"session_id":"sess42"}}"#;
+            let body = match mode {
+                "busy-grant" => {
+                    r#"{"type":"response", "seq":3, "params":{"error_code":-52405, "session_id":"38"}}"#
+                }
+                "err-grant" => {
+                    r#"{"type":"response", "seq":3, "params":{"error_code":-1, "session_id":"39"}}"#
+                }
+                _ => r#"{"params":{"session_id":"sess42"}}"#,
+            };
             let sid = format!(
                 "----device-stream-boundary--\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
@@ -857,6 +892,7 @@ mod tests {
             VigiProbe::Ready(_) => "Ready",
             VigiProbe::Unreachable => "Unreachable",
             VigiProbe::Refused => "Refused",
+            VigiProbe::Busy => "Busy",
         }
     }
 
@@ -1013,6 +1049,27 @@ mod tests {
         assert!(matches!(probe, VigiProbe::Ready(_)));
         assert!(matches!(settle, Settle::Reset));
         drop(probe);
+        let _ = rx.recv().await;
+    }
+
+    #[tokio::test]
+    async fn inner_busy_grant_resets() {
+        // `-52405` = another talker holds the slot (R63) — a complete
+        // protocol answer ⇒ `Busy` outcome + gate reset (V273).
+        let (addr, mut rx) = stub_vigi("busy-grant").await;
+        let (probe, settle) = VigiTalk::connect_inner(&addr, "admin", "admin").await;
+        assert!(matches!(probe, VigiProbe::Busy));
+        assert!(matches!(settle, Settle::Reset));
+        let _ = rx.recv().await;
+    }
+
+    #[tokio::test]
+    async fn inner_nonbusy_error_grant_resets_refused() {
+        // Other nonzero `error_code` ⇒ complete refusal (R67).
+        let (addr, mut rx) = stub_vigi("err-grant").await;
+        let (probe, settle) = VigiTalk::connect_inner(&addr, "admin", "admin").await;
+        assert!(matches!(probe, VigiProbe::Refused));
+        assert!(matches!(settle, Settle::Reset));
         let _ = rx.recv().await;
     }
 
