@@ -16,6 +16,7 @@ doctest = false
 [dependencies]
 common.path = "../common"
 audio.path = "../audio"
+url.workspace = true
 eventdb.path = "../eventdb"
 hls.path = "../hls"
 scan.path = "../scan"

@@ -280,6 +280,15 @@ impl App {
             self.env.flags(),
         ));
 
+        let persist_monitors = self.monitor_manager.clone();
+        let audio_service = Arc::new(audio::AudioService::new(
+            Arc::new(|url| -> audio::ArcAudioClient { Arc::new(audio::RtspAudioClient::new(url)) }),
+            Arc::new(move |monitor_id, marks| {
+                let monitors = persist_monitors.clone();
+                Box::pin(persist_audio_marks(monitors, monitor_id, marks))
+            }),
+        ));
+
         let mut router = self
             .router
             .clone()
@@ -392,6 +401,23 @@ impl App {
                     service: PtzService::new(Arc::new(|endpoint, creds| {
                         Arc::new(ptz::OnvifPtz::new(endpoint, creds)) as ptz::ArcPtzClient
                     })),
+                })),
+            )
+            // Two-way audio — token mint is admin+CSRF; the WS
+            // upgrade authenticates on the consumed token (browser
+            // WS can't set the CSRF header).
+            .route_admin(
+                "/api/monitor/audio-session",
+                post(audio_session_handler).with_state(Arc::new(AudioRouteState {
+                    monitors: self.monitor_manager.clone(),
+                    service: audio_service.clone(),
+                })),
+            )
+            .route_no_auth(
+                "/api/monitor/audio",
+                get(audio_ws_handler).with_state(Arc::new(AudioRouteState {
+                    monitors: self.monitor_manager.clone(),
+                    service: audio_service.clone(),
                 })),
             )
             // Recording delete.
@@ -609,4 +635,48 @@ pub async fn prune_loop(
             () = tokio::time::sleep(interval) => {}
         }
     }
+}
+
+/// Persist audio capability marks — unions names into the stored
+/// monitor's `audio.unsupported` via `monitor_set` (which itself
+/// unions stored ∪ incoming before the endpoint-change clear).
+/// Best-effort: a monitor deleted mid-open just loses the mark.
+async fn persist_audio_marks(
+    monitors: ArcMonitorManager,
+    monitor_id: common::MonitorId,
+    marks: Vec<String>,
+) {
+    let Some(Some(mut stored)) = monitors.monitor_config(monitor_id).await else {
+        return;
+    };
+    let mut merged: Vec<String> = stored.config().audio.unsupported().to_vec();
+    for mark in &marks {
+        if !merged.contains(mark) {
+            merged.push(mark.clone());
+        }
+    }
+    merged.sort();
+    let audio_obj = stored
+        .raw_mut()
+        .as_object_mut()
+        .and_then(|raw| raw.get_mut("audio"))
+        .and_then(serde_json::Value::as_object_mut);
+    match audio_obj {
+        Some(obj) => {
+            obj.insert("unsupported".to_owned(), serde_json::json!(merged));
+        }
+        None => {
+            stored.raw_mut().as_object_mut().map(|raw| {
+                raw.insert(
+                    "audio".to_owned(),
+                    serde_json::json!({"enable": true, "unsupported": merged}),
+                )
+            });
+        }
+    }
+    let Ok(stored) = serde_json::from_value::<common::monitor::MonitorConfig>(stored.raw().clone())
+    else {
+        return;
+    };
+    drop(monitors.monitor_set(stored).await);
 }

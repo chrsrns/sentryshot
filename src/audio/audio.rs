@@ -19,11 +19,16 @@ mod g711;
 mod rtp;
 mod rtsp;
 mod sdp;
+mod service;
 mod session;
 mod vigi;
 
 pub use rtsp::{Interleaved, Response, RtspClient};
 pub use sdp::{AudioMedia, Codec, PayloadMap, Sdp, SdpDirection, parse as parse_sdp};
+pub use service::{
+    Attach, AudioEntry, AudioService, ConsumerDrop, DIRECTIONLESS_TIMEOUT, MAX_CONSUMERS,
+    TOKEN_TTL, WS_PING_CADENCE,
+};
 pub use session::RtspAudioClient;
 pub use vigi::{VigiProbe, VigiTalk};
 

@@ -33,6 +33,7 @@ streamer.path = "../streamer"
 vod.path = "../vod"
 web.path = "../web"
 rust-embed.path = "../rust-embed"
+serde_json.workspace = true
 
 axum.workspace = true
 bytesize.workspace = true

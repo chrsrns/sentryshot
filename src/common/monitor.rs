@@ -137,6 +137,9 @@ pub struct Config {
 
     #[serde(default)]
     pub ptz: PtzConfig,
+
+    #[serde(default)]
+    pub audio: AudioConfig,
 }
 
 /// PTZ section of a monitor config — persisted under `"ptz"`.
@@ -152,6 +155,41 @@ pub struct PtzConfig {
     /// capability marks (V254). Cleared when the endpoint changes.
     #[serde(default)]
     unsupported: Vec<String>,
+}
+
+/// Two-way audio section of a monitor config — persisted under
+/// `"audio"`. Absent = disabled; pre-feature configs deserialize
+/// unchanged via `#[serde(default)]`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct AudioConfig {
+    #[serde(default)]
+    enable: bool,
+
+    /// Capability names the camera disproved — persisted marks
+    /// written by audio ops on capability faults only; transport
+    /// faults never land here.
+    #[serde(default)]
+    unsupported: Vec<String>,
+}
+
+impl AudioConfig {
+    #[must_use]
+    pub fn new(enable: bool) -> Self {
+        Self {
+            enable,
+            unsupported: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn enable(&self) -> bool {
+        self.enable
+    }
+
+    #[must_use]
+    pub fn unsupported(&self) -> &[String] {
+        &self.unsupported
+    }
 }
 
 impl PtzConfig {

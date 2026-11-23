@@ -994,3 +994,334 @@ async fn persist_mark(state: &Arc<PtzRouteState>, monitor_id: &MonitorId, comman
     };
     drop(state.monitors.monitor_set(stored).await);
 }
+
+// SPDX-SnippetBegin
+// SPDX-Snippet-CopyrightText: two-way audio routes
+
+/// Route state for the audio endpoints — monitor lookups drive the
+/// lazy delete/disable checks; the service owns sessions + tokens.
+pub struct AudioRouteState {
+    pub monitors: ArcMonitorManager,
+    pub service: Arc<audio::AudioService>,
+}
+
+/// `POST /api/monitor/audio-session?id=` — mints the single-use
+/// ≤30 s WS token only; camera contact is lazy per the session
+/// model (opens on the first direction ctrl post-upgrade).
+pub async fn audio_session_handler(
+    State(state): State<Arc<AudioRouteState>>,
+    Query(query): Query<MonitorIdQuery>,
+) -> Response {
+    let Some(Some(config)) = state.monitors.monitor_config(query.id.clone()).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let audio_cfg = &config.config().audio;
+    if !audio_cfg.enable() {
+        return (StatusCode::CONFLICT, "audio disabled").into_response();
+    }
+    // All-directions-marked is the only pre-attach short-circuit —
+    // per-direction marks surface via `error` ctrls post-upgrade.
+    let marks = audio_cfg.unsupported();
+    if marks.iter().any(|m| m == "listen") && marks.iter().any(|m| m == "talk") {
+        return (StatusCode::CONFLICT, "audio unsupported").into_response();
+    }
+
+    let token = state.service.mint_token(query.id.clone()).await;
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({ "token": token })),
+    )
+        .into_response()
+}
+
+/// Query shape for the WS upgrade — token-only, monitor binding
+/// rides inside the stored token record.
+#[derive(Debug, Deserialize)]
+pub struct AudioWsQuery {
+    token: String,
+}
+
+/// `GET /api/monitor/audio?token=` — `route_no_auth` WS upgrade.
+/// `Origin` host:port must match the request `Host` (a browser WS
+/// can't set `X-CSRF-TOKEN`) and is checked BEFORE the token is
+/// consumed so a bad-Origin probe never burns it.
+pub async fn audio_ws_handler(
+    State(state): State<Arc<AudioRouteState>>,
+    Query(query): Query<AudioWsQuery>,
+    headers: HeaderMap,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> Response {
+    if !origin_matches_host(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(monitor_id) = state.service.consume_token(&query.token).await else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    ws.on_upgrade(move |socket| audio_consumer(state, monitor_id, socket))
+        .into_response()
+}
+
+/// `Origin` host:port == request `Host`, port-normalized (absent =
+/// scheme default). Missing `Origin` fails closed.
+fn origin_matches_host(headers: &HeaderMap) -> bool {
+    let (Some(origin), Some(host)) = (
+        headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()),
+        headers.get(header::HOST).and_then(|v| v.to_str().ok()),
+    ) else {
+        return false;
+    };
+    let Ok(origin_url) = url::Url::parse(origin) else {
+        return false;
+    };
+    let Some(origin_host) = origin_url.host_str() else {
+        return false;
+    };
+    let origin_port = origin_url.port().unwrap_or_else(|| {
+        if origin_url.scheme() == "https" {
+            443
+        } else {
+            80
+        }
+    });
+    // `Host` may omit the port — default to the request scheme's.
+    let (host_name, host_port) = match host.rsplit_once(':') {
+        Some((h, p)) => match p.parse::<u16>() {
+            Ok(p) => (h, p),
+            Err(_) => (host, 80),
+        },
+        None => (host, 80),
+    };
+    host_name.eq_ignore_ascii_case(origin_host) && host_port == origin_port
+}
+
+/// Client→server ctrl — only the direction verbs are meaningful;
+/// `caps`/`busy`/`error` from a client are ignored (server emits).
+#[derive(Debug, Deserialize)]
+struct AudioCtrl {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+/// One consumer WS — ctrl dispatch, PCM bridge, keepalive ping, and
+/// the directionless clock. Attach happens on the first direction
+/// ctrl, never at upgrade.
+#[allow(clippy::too_many_lines)]
+async fn audio_consumer(
+    state: Arc<AudioRouteState>,
+    monitor_id: MonitorId,
+    socket: axum::extract::ws::WebSocket,
+) {
+    use axum::extract::ws::Message;
+
+    let consumer = state.service.consumer_id();
+    let (drop_tx, mut drop_rx) = tokio::sync::mpsc::unbounded_channel::<audio::ConsumerDrop>();
+    let mut socket = socket;
+    let mut ping = tokio::time::interval(audio::WS_PING_CADENCE);
+    ping.tick().await; // first tick is immediate — skip it
+
+    let mut entry: Option<Arc<audio::AudioEntry>> = None;
+    let mut attached = false;
+    let mut directionless = Box::pin(tokio::time::sleep(audio::DIRECTIONLESS_TIMEOUT));
+    let mut pcm_rx: Option<tokio::sync::broadcast::Receiver<audio::PcmChunk>> = None;
+
+    loop {
+        tokio::select! {
+            frame = socket.recv() => match frame {
+                Some(Ok(Message::Text(text))) => {
+                    let Ok(ctrl) = serde_json::from_str::<AudioCtrl>(&text) else {
+                        continue;
+                    };
+                    // The lazy monitor check — every op re-reads the
+                    // stored config so delete/disable drops the entry.
+                    let Some(Some(config)) =
+                        state.monitors.monitor_config(monitor_id.clone()).await
+                    else {
+                        break;
+                    };
+                    if !config.config().audio.enable() {
+                        state.service.drop_entry(&monitor_id).await;
+                        break;
+                    }
+                    match ctrl.kind.as_str() {
+                        "listen" => {
+                            match attach_direction(
+                                &state, &monitor_id, &config, &mut entry,
+                                consumer, audio::Direction::Listen, &drop_tx, &mut socket,
+                            ).await {
+                                Some(e) => {
+                                    attached = true;
+                                    pcm_rx = e.subscribe_pcm().await;
+                                }
+                                None => break,
+                            }
+                        }
+                        "talk-start" => {
+                            if attach_direction(
+                                &state, &monitor_id, &config, &mut entry,
+                                consumer, audio::Direction::Talk, &drop_tx, &mut socket,
+                            ).await.is_none() {
+                                break;
+                            }
+                            attached = true;
+                        }
+                        "listen-stop" => {
+                            if let Some(e) = &entry {
+                                state.service.remove_direction(
+                                    e, consumer, audio::Direction::Listen,
+                                ).await;
+                                pcm_rx = None;
+                            }
+                        }
+                        "talk-end" => {
+                            if let Some(e) = &entry {
+                                state.service.remove_direction(
+                                    e, consumer, audio::Direction::Talk,
+                                ).await;
+                            }
+                        }
+                        _ => {} // unknown/client-sent server types: ignored
+                    }
+                }
+                Some(Ok(Message::Binary(bytes))) => {
+                    // Non-owner/negotiation-less frames drop inside
+                    // `entry.talk` — parse is byte-pair decode only.
+                    if let Some(e) = &entry {
+                        let pcm: Vec<i16> = bytes
+                            .chunks_exact(2)
+                            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                            .collect();
+                        if !pcm.is_empty() {
+                            let _ = e.talk(consumer, &pcm).await;
+                        }
+                    }
+                }
+                Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                _ => ()
+            },
+            pcm = async {
+                match &mut pcm_rx {
+                    Some(rx) => rx.recv().await.ok(),
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(chunk) = pcm {
+                    let bytes: Vec<u8> = chunk
+                        .iter()
+                        .flat_map(|s| s.to_le_bytes())
+                        .collect();
+                    _ = socket.send(Message::Binary(bytes.into())).await;
+                }
+            },
+            _ = ping.tick() => {
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            },
+            drop = drop_rx.recv() => match drop {
+                Some(audio::ConsumerDrop::Error(msg)) => {
+                    _ = socket.send(error_ctrl(&msg)).await;
+                    _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+                Some(audio::ConsumerDrop::Close) | None => break,
+            },
+            () = &mut directionless, if !attached => break,
+        }
+    }
+
+    if let Some(e) = &entry {
+        state.service.detach(e, consumer).await;
+    }
+}
+
+/// Resolve entry + run `service.attach` for one direction ctrl;
+/// emits `caps`/`busy`/`error` back. `None` = consumer dropped.
+#[allow(clippy::too_many_arguments)]
+async fn attach_direction(
+    state: &Arc<AudioRouteState>,
+    monitor_id: &MonitorId,
+    config: &MonitorConfig,
+    entry: &mut Option<Arc<audio::AudioEntry>>,
+    consumer: u64,
+    direction: audio::Direction,
+    drop_tx: &tokio::sync::mpsc::UnboundedSender<audio::ConsumerDrop>,
+    socket: &mut axum::extract::ws::WebSocket,
+) -> Option<Arc<audio::AudioEntry>> {
+    // Endpoint+creds key — mainStream URL carries userinfo.
+    let common::monitor::SourceConfig::Rtsp(rtsp) = config.source();
+    let url: url::Url = (*rtsp.main_stream).clone();
+    let key = url.to_string();
+
+    if entry.is_none() {
+        let client = state.service.make_client(url);
+        *entry = Some(state.service.entry(monitor_id, key, client).await);
+    }
+    let e = entry.as_ref().expect("entry resolved above");
+
+    match state
+        .service
+        .attach(
+            e,
+            monitor_id,
+            consumer,
+            direction,
+            config.config().audio.unsupported(),
+            drop_tx,
+        )
+        .await
+    {
+        audio::Attach::Open(caps, _pcm) => {
+            // `caps` — grant/report: merged mark set + lock state.
+            let mut marks: Vec<String> = config.config().audio.unsupported().to_vec();
+            marks.extend(e.session_marks().await);
+            marks.sort();
+            marks.dedup();
+            _ = socket.send(axum::extract::ws::Message::Text(
+                serde_json::json!({
+                    "type": "caps",
+                    "listen": caps.listen,
+                    "talk": caps.talk,
+                    "talkFree": caps.talk && !e.talk_owned().await,
+                    "unsupported": marks,
+                })
+                .to_string()
+                .into(),
+            ));
+            Some(e.clone())
+        }
+        audio::Attach::Busy => {
+            _ = socket
+                .send(axum::extract::ws::Message::Text(
+                    serde_json::json!({"type": "busy", "command": direction.name()})
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+            Some(e.clone())
+        }
+        audio::Attach::Unsupported => {
+            _ = socket
+                .send(error_ctrl(&format!("{} unsupported", direction.name())))
+                .await;
+            Some(e.clone())
+        }
+        audio::Attach::Fault(msg) => {
+            _ = socket.send(error_ctrl(&msg)).await;
+            Some(e.clone())
+        }
+        audio::Attach::Full => {
+            _ = drop_tx.send(audio::ConsumerDrop::Error("consumer bound".to_owned()));
+            None
+        }
+    }
+}
+
+/// `{"type":"error","message":..}` outbound ctrl.
+fn error_ctrl(message: &str) -> axum::extract::ws::Message {
+    axum::extract::ws::Message::Text(
+        serde_json::json!({"type": "error", "message": message})
+            .to_string()
+            .into(),
+    )
+}
+// SPDX-SnippetEnd

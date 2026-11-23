@@ -498,9 +498,37 @@ impl MonitorManagerState {
                     config = fresh;
                 }
             }
+
+            // Same server-owned union for audio capability marks.
+            let mut union: Vec<String> = old.config().audio.unsupported().to_vec();
+            for mark in config.config().audio.unsupported() {
+                if !union.contains(mark) {
+                    union.push(mark.clone());
+                }
+            }
+            if union != config.config().audio.unsupported() {
+                if let Some(audio) = config
+                    .raw_mut()
+                    .get_mut("audio")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    audio.insert("unsupported".to_owned(), serde_json::json!(union));
+                }
+                if let Ok(fresh) = serde_json::from_value::<MonitorConfig>(config.raw().clone()) {
+                    config = fresh;
+                }
+            }
         }
 
         // Endpoint surface changed → stale capability marks are dropped.
+        let endpoint_changed =
+            self.configs
+                .get(&id)
+                .is_some_and(|old| match (old.source(), config.source()) {
+                    (SourceConfig::Rtsp(a), SourceConfig::Rtsp(b)) => {
+                        a.main_stream != b.main_stream
+                    }
+                });
         let stale_marks = self.configs.get(&id).is_some_and(|old| {
             if config.config().ptz.unsupported().is_empty() {
                 return false;
@@ -508,9 +536,7 @@ impl MonitorManagerState {
             if old.config().ptz.onvif_addr() != config.config().ptz.onvif_addr() {
                 return true;
             }
-            match (old.source(), config.source()) {
-                (SourceConfig::Rtsp(a), SourceConfig::Rtsp(b)) => a.main_stream != b.main_stream,
-            }
+            endpoint_changed
         });
         if stale_marks {
             if let Some(ptz) = config
@@ -522,6 +548,21 @@ impl MonitorManagerState {
             }
             // Typed views deserialize once — re-parse so the stored
             // config reflects the patched raw.
+            if let Ok(fresh) = serde_json::from_value::<MonitorConfig>(config.raw().clone()) {
+                config = fresh;
+            }
+        }
+
+        // Audio marks clear on the same mainStream/creds change —
+        // the session endpoint key is the main stream URL itself.
+        if endpoint_changed && !config.config().audio.unsupported().is_empty() {
+            if let Some(audio) = config
+                .raw_mut()
+                .get_mut("audio")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                audio.insert("unsupported".to_owned(), serde_json::json!([]));
+            }
             if let Ok(fresh) = serde_json::from_value::<MonitorConfig>(config.raw().clone()) {
                 config = fresh;
             }
@@ -912,6 +953,7 @@ mod tests {
                 always_record: false,
                 video_length: 0.0,
                 ptz: PtzConfig::default(),
+                audio: common::monitor::AudioConfig::default(),
             },
             SourceConfig::Rtsp(SourceRtspConfig {
                 protocol: Protocol::Tcp,
@@ -967,6 +1009,7 @@ mod tests {
                 always_record: false,
                 video_length: 0.0,
                 ptz: PtzConfig::default(),
+                audio: common::monitor::AudioConfig::default(),
             },
             SourceConfig::Rtsp(SourceRtspConfig {
                 protocol: Protocol::Tcp,
@@ -1053,6 +1096,7 @@ mod tests {
                 always_record: false,
                 video_length: 0.0,
                 ptz: PtzConfig::new(true, "https://cam".to_owned()),
+                audio: common::monitor::AudioConfig::default(),
             },
             SourceConfig::Rtsp(SourceRtspConfig {
                 protocol: Protocol::Tcp,
@@ -1234,6 +1278,7 @@ mod tests {
                         always_record: false,
                         video_length: 0.0,
                         ptz: PtzConfig::default(),
+                        audio: common::monitor::AudioConfig::default(),
                     },
                     SourceConfig::Rtsp(SourceRtspConfig {
                         protocol: Protocol::Tcp,
@@ -1265,6 +1310,7 @@ mod tests {
                         always_record: false,
                         video_length: 0.0,
                         ptz: PtzConfig::default(),
+                        audio: common::monitor::AudioConfig::default(),
                     },
                     SourceConfig::Rtsp(SourceRtspConfig {
                         protocol: Protocol::Udp,
