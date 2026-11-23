@@ -1111,6 +1111,17 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "live probe — needs RTSP_URL env"]
+    async fn live_open_smoke() {
+        let u = std::env::var("RTSP_URL").unwrap();
+        let parsed = url::Url::parse(&u).unwrap();
+        let client = RtspAudioClient::new(parsed, None);
+        let sess = client.open(true).await.unwrap();
+        eprintln!("caps: {:?} marks: {:?}", sess.caps(), sess.marks());
+        sess.close().await;
+    }
+
+    #[tokio::test]
     async fn talk_only_session() {
         const TALK_SDP: &str =
             "v=0\r\nm=audio 0 RTP/AVP 0\r\na=sendonly\r\na=control:trackID=9\r\n";
