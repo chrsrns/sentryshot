@@ -188,7 +188,7 @@ impl RtspClient {
                 )));
             };
             if resp.status == 401 && attempt == 0 {
-                if self.challenge(resp.header("WWW-Authenticate")).await {
+                if self.challenge(&resp).await {
                     continue;
                 }
                 return Err(Error::Auth);
@@ -235,22 +235,29 @@ impl RtspClient {
         }
     }
 
-    /// Consume a `WWW-Authenticate` header from a `401`; `true` when
-    /// a usable scheme was stored and a retry is warranted.
-    async fn challenge(&self, header: Option<&str>) -> bool {
-        let Some(h) = header else { return false };
-        if let Some(rest) = h.strip_prefix("Basic") {
-            let _ = rest;
-            let tok = base64::engine::general_purpose::STANDARD
-                .encode(format!("{}:{}", self.shared.user, self.shared.pass));
-            *self.shared.auth.lock().await = Auth::Basic(format!("Basic {tok}"));
-            return true;
+    /// Consume the `WWW-Authenticate` headers from a `401`; `true`
+    /// when a usable scheme was stored and a retry is warranted.
+    /// `Digest` wins over `Basic` regardless of header order — the
+    /// strongest scheme offered is used.
+    async fn challenge(&self, resp: &Response) -> bool {
+        let mut basic = false;
+        for (k, v) in &resp.headers {
+            if !k.eq_ignore_ascii_case("WWW-Authenticate") {
+                continue;
+            }
+            if let Some(c) = parse_digest_challenge(v) {
+                *self.shared.auth.lock().await = Auth::Digest(c);
+                return true;
+            }
+            basic |= v.strip_prefix("Basic").is_some();
         }
-        if let Some(c) = parse_digest_challenge(h) {
-            *self.shared.auth.lock().await = Auth::Digest(c);
-            return true;
+        if !basic {
+            return false;
         }
-        false
+        let tok = base64::engine::general_purpose::STANDARD
+            .encode(format!("{}:{}", self.shared.user, self.shared.pass));
+        *self.shared.auth.lock().await = Auth::Basic(format!("Basic {tok}"));
+        true
     }
 }
 
@@ -561,6 +568,43 @@ mod tests {
             200
         );
         assert!(got.recv().await.unwrap());
+        srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn basic_then_digest_challenge_prefers_digest() {
+        // VIGI firmwares answer `401` with `WWW-Authenticate: Basic`
+        // *and* `Digest` — the retry must use the strongest scheme
+        // offered regardless of header order.
+        let (url, srv) = stub(|s| async move {
+            let (rd, mut wr) = s.into_split();
+            let mut rd = tokio::io::BufReader::new(rd);
+            let r1 = read_req(&mut rd).await;
+            wr.write_all(
+                reply(
+                    &r1,
+                    "401 Unauthorized",
+                    "WWW-Authenticate: Basic realm=\"cam\"\r\nWWW-Authenticate: Digest realm=\"cam\", nonce=\"n1\", qop=\"auth\"\r\n",
+                    "",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            let r2 = read_req(&mut rd).await;
+            assert!(r2.contains("Authorization: Digest "), "{r2}");
+            assert!(r2.contains("response=\""), "{r2}");
+            wr.write_all(reply(&r2, "200 OK", "", "").as_bytes())
+                .await
+                .unwrap();
+        })
+        .await;
+        let mut url = url;
+        url.set_username("admin").unwrap();
+        url.set_password(Some("pw")).unwrap();
+        let c = RtspClient::connect(&url).await.unwrap();
+        let r = c.request("OPTIONS", c.base(), &[]).await.unwrap();
+        assert_eq!(r.status, 200);
         srv.await.unwrap();
     }
 
