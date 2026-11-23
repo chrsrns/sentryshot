@@ -26,6 +26,7 @@ import {
 } from "./components/form.js";
 import { newModal } from "./components/modal.js";
 import { applyPtzCapabilities, newPtzController } from "./components/ptz.js";
+import { applyAudioMarks, newAudioController } from "./components/audio.js";
 
 /** @typedef {import("./components/form.js").InputRule} InputRule */
 
@@ -510,6 +511,12 @@ function newScanModal(token) {
 						},
 						name: sanitizeMonitorName(cam.name, cam.ip),
 					};
+					if (cam.backchannel === true) {
+						// ONVIF backchannel advertised → prefill audio;
+						// the user can still un-toggle it.
+						// @ts-ignore
+						prefill.audio = { enable: true };
+					}
 					if (cam.ptz === true) {
 						// First http XAddr; none → empty, derived at
 						// command time from the main stream host.
@@ -1245,6 +1252,105 @@ const ptzOnvifAddrRules = [
 	[/[#?]/, "query and fragment not allowed"],
 ];
 
+
+/**
+ * @typedef {Object} AudioConfig
+ * @property {boolean} enable
+ * @property {string[]=} unsupported
+ */
+
+/**
+ * Monitor `audio` section — enable toggle + a test row carrying the
+ * live tile's affordances. The row renders only for a persisted
+ * monitor saved with `audio.enable` true.
+ *
+ * @param {string} csrfToken
+ * @param {() => string} getMonitorId
+ * @returns {Field<AudioConfig>}
+ */
+function newAudioField(csrfToken, getMonitorId) {
+	const fields = {
+		enable: fieldTemplate.toggle("Two-way audio", false),
+	};
+	const panel = newAudioPanel(csrfToken, getMonitorId);
+
+	const form = newForm(fields);
+	/** @type {string[]|undefined} */
+	let unsupported;
+	return {
+		elems: [...fields.enable.elems, panel.elem],
+		value() {
+			/** @type {AudioConfig} */
+			const value = { enable: false };
+			form.get(value);
+			// Server-managed capability marks — round-tripped untouched.
+			if (unsupported !== undefined) {
+				value.unsupported = unsupported;
+			}
+			return value;
+		},
+		set(input) {
+			const value = input === undefined ? {} : input;
+			unsupported = value.unsupported;
+			form.set(value);
+			if (value.enable === true) {
+				panel.show();
+				// Persisted marks disable controls before any `caps`.
+				applyAudioMarks(panel.elem, unsupported || []);
+			} else {
+				panel.hide();
+			}
+		},
+		validate() {
+			return form.validate();
+		},
+	};
+}
+
+/**
+ * Audio test row: speaker listen toggle + mic hold-to-talk against the
+ * stored monitor. Same context gates as the /live cluster — talk
+ * requires `isSecureContext`.
+ *
+ * @param {string} csrfToken
+ * @param {() => string} getMonitorId
+ */
+function newAudioPanel(csrfToken, getMonitorId) {
+	const glyphBtn = "ptz-glyph px-2 rounded-lg bg-color2 hover:bg-color3";
+	const elem = /** @type {HTMLElement} */ (htmlToElem(/* HTML */ `
+		<li class="audio-panel form-item" hidden>
+			<div class="flex gap-2 items-center p-2 border border-color3 rounded-lg w-max">
+				<span class="js-audio-wrap"><button type="button" class="js-audio-listen ${glyphBtn}">listen</button></span>
+				<span class="js-audio-wrap js-audio-talk-wrap"><button type="button" class="js-audio-talk ${glyphBtn}">hold to talk</button></span>
+				<div class="js-audio-error text-red"></div>
+			</div>
+		</li>
+	`));
+	const errorElem = /** @type {HTMLElement} */ (elem.querySelector(".js-audio-error"));
+	const controller = newAudioController(csrfToken, getMonitorId, errorElem);
+	controller.bindListen(elem);
+	controller.bindTalk(elem);
+	controller.attach();
+	if (!window.isSecureContext) {
+		const talk = /** @type {HTMLButtonElement} */ (elem.querySelector(".js-audio-talk"));
+		talk.disabled = true;
+		const wrap = elem.querySelector(".js-audio-talk-wrap");
+		if (wrap !== null) {
+			wrap.setAttribute("title", "requires a secure context");
+		}
+	}
+	return {
+		elem,
+		show() {
+			elem.removeAttribute("hidden");
+		},
+		hide() {
+			controller.detach();
+			elem.setAttribute("hidden", "");
+		},
+	};
+}
+
 /**
  * @param {string} csrfToken
  * @param {() => string} getMonitorId
@@ -1465,6 +1571,7 @@ function init(uiData) {
 	monitorFields.alwaysRecord = fieldTemplate.toggle("Always record", false);
 	monitorFields.videoLength = fieldTemplate.number("Video length (min)", "15", 15);
 	monitorFields.ptz = newPtzField(uiData.csrfToken, getMonitorId);
+	monitorFields.audio = newAudioField(uiData.csrfToken, getMonitorId);
 	//timestampOffset: fieldTemplate.integer("Timestamp offset (ms)", "500", "500"),
 	/* SETTINGS_LAST_MONITOR_FIELD */
 

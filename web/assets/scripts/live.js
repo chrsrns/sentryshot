@@ -10,6 +10,7 @@ import {
 } from "./components/optionsMenu.js";
 import { newStreamer, newStreamerBtn } from "./components/streamer.js";
 import { newLivePtz } from "./components/ptz.js";
+import { applyAudioMarks, newLiveAudio } from "./components/audio.js";
 
 /**
  * @typedef {import("./libs/common.js").MonitorInfo} MonitorInfo
@@ -35,6 +36,8 @@ import { newLivePtz } from "./components/ptz.js";
 function newViewer($parent, monitors, streamer, ptz) {
 	/** @type {string[]} */
 	let selectedMonitors = [];
+	/** @type {Array<{detach(): void}>} */
+	const audioControllers = [];
 	/** @param {MonitorInfo} monitor */
 	const isMonitorSelected = (monitor) => {
 		if (selectedMonitors.length === 0) {
@@ -67,6 +70,10 @@ function newViewer($parent, monitors, streamer, ptz) {
 				feed.destroy();
 			}
 			feeds = [];
+			for (const controller of audioControllers) {
+				controller.detach();
+			}
+			audioControllers.length = 0;
 			for (const monitor of Object.values(sortedMonitors)) {
 				if (!isMonitorSelected(monitor)) {
 					continue;
@@ -90,6 +97,16 @@ function newViewer($parent, monitors, streamer, ptz) {
 						cfg["ptz"]["enable"] === true
 					) {
 						buttons.push(newLivePtz(ptz.csrfToken, monitor.id));
+					}
+					if (
+						cfg !== undefined &&
+						cfg["audio"] !== undefined &&
+						cfg["audio"]["enable"] === true
+					) {
+						const audio = newLiveAudio(ptz.csrfToken, monitor.id);
+						buttons.push({ elem: audio.elem });
+						applyAudioMarks(audio.elem, cfg["audio"]["unsupported"] || []);
+						audioControllers.push(audio.controller);
 					}
 				}
 				feeds.push(newStreamer(monitor, preferLowRes, streamer, buttons));
