@@ -121,6 +121,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio"
+version = "0.3.11"
+dependencies = [
+ "async-trait",
+ "axum 0.8.1",
+ "base64 0.22.1",
+ "common",
+ "md5",
+ "onvif",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "sha2",
+ "test-case",
+ "thiserror 2.0.11",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "auth_basic"
 version = "0.3.11"
 dependencies = [
@@ -964,6 +984,7 @@ name = "handler"
 version = "0.3.11"
 dependencies = [
  "async-trait",
+ "audio",
  "axum 0.8.1",
  "common",
  "eventdb",
@@ -2331,6 +2352,7 @@ dependencies = [
 name = "sentryshot"
 version = "0.3.11"
 dependencies = [
+ "audio",
  "axum 0.8.1",
  "bytesize",
  "common",
