@@ -1359,7 +1359,7 @@ mod tests {
             let _ = rd.read(&mut buf).await.unwrap();
             let body = r#"{"params":{"session_id":"s1"}}"#;
             let sid = format!(
-                "--device-stream-boundary--\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                "----device-stream-boundary--\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
             );
             wr.write_all(sid.as_bytes()).await.unwrap();

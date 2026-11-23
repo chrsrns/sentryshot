@@ -114,7 +114,7 @@ const KEY_SHORT: &[u8] = b"RDpbLfCPsJZ7fiv";
 const KEY_LONG: &[u8] = b"yLwVl0zKqws7LgKPRQ84Mdt708T1qQ3Ha7xv3H7NyU84p21BriUWBU43odz3iP4rBL3cD02KZciXTysVXiV8ngg6vL48rPJyAUw0HurW20xqxv9aYb4M9wK1Ae0wlro510qXeU07kV57fQMc8L6aLgMLwygtc0F10a0Dg70TOoouyFhdysuRMO51yY5ZlOZZLEal1h0t9YQW0Ko7oBwmCAHoic4HYbUyVeU3sfQ1xtXcPcf1aT303wAQhv66qzW";
 
 const CLIENT_BOUNDARY: &str = "----client-stream-boundary--";
-const DEVICE_BOUNDARY: &str = "--device-stream-boundary--";
+const DEVICE_BOUNDARY_NAME: &str = "device-stream-boundary";
 
 const TALK_REQUEST: &str =
     r#"{"params":{"talk":{"mode":"aec"},"method":"get"},"seq":3,"type":"request"}"#;
@@ -363,7 +363,11 @@ async fn read_session_id(
             return None;
         }
         let line = line.trim_end();
-        if line == DEVICE_BOUNDARY || line == format!("{DEVICE_BOUNDARY}--") {
+        // The wire delimiter is `--` + the declared boundary — real
+        // firmware sends `----device-stream-boundary--` (declared
+        // `--device-stream-boundary--` + the `--` prefix). Tolerate
+        // the declared-name form and the `--` closing suffix.
+        if line.starts_with("--") && line.trim_end_matches('-').ends_with(DEVICE_BOUNDARY_NAME) {
             at_boundary = true;
             content_len = None;
             continue;
@@ -733,7 +737,7 @@ mod tests {
             tx.send(buf[..n].to_vec()).await.unwrap();
             let body = r#"{"params":{"session_id":"sess42"}}"#;
             let sid = format!(
-                "{DEVICE_BOUNDARY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                "----device-stream-boundary--\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()
             );
             wr.write_all(sid.as_bytes()).await.unwrap();
