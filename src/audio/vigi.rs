@@ -157,14 +157,14 @@ impl VigiTalk {
             "{CLIENT_BOUNDARY}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{TALK_REQUEST}\r\n",
             TALK_REQUEST.len()
         );
+        // Mid-POST fault after the peer answered — persists (V259).
         if wr.write_all(part.as_bytes()).await.is_err() {
-            return VigiProbe::Unreachable;
+            return VigiProbe::Refused;
         }
-        let session_id = match tokio::time::timeout(CONNECT_TIMEOUT, read_session_id(&mut rd)).await
-        {
-            Ok(Some(id)) => id,
-            Ok(None) => return VigiProbe::Refused,
-            Err(_) => return VigiProbe::Unreachable,
+        let Ok(Some(session_id)) =
+            tokio::time::timeout(CONNECT_TIMEOUT, read_session_id(&mut rd)).await
+        else {
+            return VigiProbe::Refused;
         };
         // Muxer header is the first audio part (PAT+PMT).
         let mut talk = Self {
@@ -183,7 +183,7 @@ impl VigiTalk {
         };
         let hdr = talk.mux.header();
         if talk.send_part(&hdr).await.is_err() {
-            return VigiProbe::Unreachable;
+            return VigiProbe::Refused;
         }
         VigiProbe::Ready(talk)
     }

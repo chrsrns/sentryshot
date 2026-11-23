@@ -623,7 +623,10 @@ mod ptz {
 // SPDX-Snippet-CopyrightText: two-way audio route tests
 #[cfg(test)]
 mod audio_tests {
-    use crate::{AudioRouteState, MonitorIdQuery, audio_session_handler, origin_matches_host};
+    use crate::{
+        AudioRouteState, MonitorIdQuery, audio_session_handler, busy_ctrl, close_frame,
+        origin_matches_host,
+    };
     use async_trait::async_trait;
     use axum::extract::{Query, State};
     use common::{
@@ -834,6 +837,24 @@ mod audio_tests {
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, HeaderValue::from_static("cam.local:8080"));
         assert!(!origin_matches_host(&headers));
+    }
+
+    #[test]
+    fn busy_ctrl_carries_the_denied_verb() {
+        let axum::extract::ws::Message::Text(text) = busy_ctrl() else {
+            panic!("busy must be a text ctrl");
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["type"], "busy");
+        assert_eq!(v["command"], "talk-start");
+    }
+
+    #[test]
+    fn close_frame_carries_code() {
+        let axum::extract::ws::Message::Close(Some(frame)) = close_frame(1008) else {
+            panic!("expected close frame");
+        };
+        assert_eq!(frame.code, 1008);
     }
 }
 // SPDX-SnippetEnd

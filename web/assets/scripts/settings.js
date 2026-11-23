@@ -1268,7 +1268,7 @@ const ptzOnvifAddrRules = [
  * @param {() => string} getMonitorId
  * @returns {Field<AudioConfig>}
  */
-function newAudioField(csrfToken, getMonitorId) {
+function newAudioField(csrfToken, getMonitorId, monitors) {
 	const fields = {
 		enable: fieldTemplate.toggle("Two-way audio", false),
 	};
@@ -1293,7 +1293,16 @@ function newAudioField(csrfToken, getMonitorId) {
 			const value = input === undefined ? {} : input;
 			unsupported = value.unsupported;
 			form.set(value);
-			if (value.enable === true) {
+			// Panel only for a persisted monitor whose *saved* config
+			// has audio.enable true — an unsaved toggle or a scan
+			// prefill on a monitor that doesn't exist yet would mint
+			// tokens against nothing.
+			const persisted = monitors[getMonitorId()];
+			const savedEnable =
+				persisted !== undefined &&
+				persisted.audio !== undefined &&
+				persisted.audio.enable === true;
+			if (value.enable === true && savedEnable) {
 				panel.show();
 				// Persisted marks disable controls before any `caps`.
 				applyAudioMarks(panel.elem, unsupported || []);
@@ -1571,7 +1580,7 @@ function init(uiData) {
 	monitorFields.alwaysRecord = fieldTemplate.toggle("Always record", false);
 	monitorFields.videoLength = fieldTemplate.number("Video length (min)", "15", 15);
 	monitorFields.ptz = newPtzField(uiData.csrfToken, getMonitorId);
-	monitorFields.audio = newAudioField(uiData.csrfToken, getMonitorId);
+	monitorFields.audio = newAudioField(uiData.csrfToken, getMonitorId, uiData.monitors);
 	//timestampOffset: fieldTemplate.integer("Timestamp offset (ms)", "500", "500"),
 	/* SETTINGS_LAST_MONITOR_FIELD */
 
@@ -1615,4 +1624,4 @@ function init(uiData) {
 		.replaceChildren(...rendererCategories([monitor, group, account]));
 }
 
-export { init, newScanModal, newPtzField, newPtzPanel };
+export { init, newScanModal, newPtzField, newPtzPanel, newAudioField };

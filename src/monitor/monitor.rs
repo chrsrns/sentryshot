@@ -499,25 +499,7 @@ impl MonitorManagerState {
                 }
             }
 
-            // Same server-owned union for audio capability marks.
-            let mut union: Vec<String> = old.config().audio.unsupported().to_vec();
-            for mark in config.config().audio.unsupported() {
-                if !union.contains(mark) {
-                    union.push(mark.clone());
-                }
-            }
-            if union != config.config().audio.unsupported() {
-                if let Some(audio) = config
-                    .raw_mut()
-                    .get_mut("audio")
-                    .and_then(serde_json::Value::as_object_mut)
-                {
-                    audio.insert("unsupported".to_owned(), serde_json::json!(union));
-                }
-                if let Ok(fresh) = serde_json::from_value::<MonitorConfig>(config.raw().clone()) {
-                    config = fresh;
-                }
-            }
+            union_audio_marks(old, &mut config);
         }
 
         // Endpoint surface changed → stale capability marks are dropped.
@@ -769,6 +751,39 @@ impl MonitorManagerState {
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::unwrap_used)]
+
+/// Server-owned union for `audio.unsupported` — stored ∪ incoming,
+/// written back through `raw` so a payload lacking the `audio`
+/// object still preserves stored marks (V260).
+fn union_audio_marks(old: &MonitorConfig, config: &mut MonitorConfig) {
+    let mut union: Vec<String> = old.config().audio.unsupported().to_vec();
+    for mark in config.config().audio.unsupported() {
+        if !union.contains(mark) {
+            union.push(mark.clone());
+        }
+    }
+    if union == config.config().audio.unsupported() {
+        return;
+    }
+    let raw = config.raw_mut();
+    if let Some(audio) = raw
+        .get_mut("audio")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        audio.insert("unsupported".to_owned(), serde_json::json!(union));
+    } else if let Some(obj) = raw.as_object_mut() {
+        // Third-party PUT with no `audio` object at all — stored
+        // marks still survive.
+        obj.insert(
+            "audio".to_owned(),
+            serde_json::json!({"unsupported": union}),
+        );
+    }
+    if let Ok(fresh) = serde_json::from_value::<MonitorConfig>(config.raw().clone()) {
+        *config = fresh;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1257,6 +1272,48 @@ mod tests {
             .unwrap();
         let got = manager.monitor_config(m_id("cam")).await.unwrap().unwrap();
         assert!(got.config().ptz.unsupported().is_empty());
+
+        stop_manager(token, tracker).await;
+    }
+
+    #[tokio::test]
+    async fn monitor_set_unions_audio_marks_even_without_audio_key() {
+        let (token, tracker, _temp_dir, _, manager) = new_test_manager().await;
+        let base = || {
+            json!({
+                "id": "cam", "name": "cam", "enable": false,
+                "source": "rtsp",
+                "sourcertsp": {"protocol": "tcp", "mainStream": "rtsp://x1"},
+                "alwaysRecord": false, "videoLength": 0.0,
+                "audio": {"enable": true, "unsupported": ["talk", "listen"]},
+            })
+        };
+
+        manager
+            .monitor_set(serde_json::from_value(base()).unwrap())
+            .await
+            .unwrap();
+
+        // Third-party PUT with no `audio` object at all — stored
+        // marks still survive the union.
+        let mut bare = base();
+        bare.as_object_mut().unwrap().remove("audio");
+        manager
+            .monitor_set(serde_json::from_value(bare).unwrap())
+            .await
+            .unwrap();
+        let got = manager.monitor_config(m_id("cam")).await.unwrap().unwrap();
+        assert_eq!(&["talk", "listen"], got.config().audio.unsupported());
+
+        // Endpoint change still clears the marks.
+        let mut changed = base();
+        changed["sourcertsp"]["mainStream"] = json!("rtsp://x2");
+        manager
+            .monitor_set(serde_json::from_value(changed).unwrap())
+            .await
+            .unwrap();
+        let got = manager.monitor_config(m_id("cam")).await.unwrap().unwrap();
+        assert!(got.config().audio.unsupported().is_empty());
 
         stop_manager(token, tracker).await;
     }

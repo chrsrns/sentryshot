@@ -25,7 +25,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify, broadcast, mpsc};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc, watch};
 
 /// Whole `open` handshake budget (V256 — incl. the VIGI probe the
 /// talk path may add).
@@ -75,6 +75,7 @@ impl AudioClient for RtspAudioClient {
 }
 
 /// One selected track's wire binding.
+#[derive(Clone)]
 struct Binding {
     channel: u8,
     codec: sdp::Codec,
@@ -132,14 +133,24 @@ impl RtspAudioClient {
             return Err(Error::Protocol("no usable audio path".into()));
         }
 
-        // SETUP each selected track on fresh channel pairs.
+        // SETUP each selected track on fresh channel pairs. A
+        // `sendrecv` line serving both directions is SETUP'd once —
+        // one control URL owns both bindings.
         let client = Arc::new(client);
         let mut session_id = String::new();
         let mut next_ch: u8 = 0;
         let mut listen: Option<Binding> = None;
         let mut talk: Option<Binding> = None;
+        let same_media = match (listen_sel, talk_sel) {
+            (Some(a), Some(b)) => a.control == b.control,
+            _ => false,
+        };
         for (sel, is_talk) in [(listen_sel, false), (talk_sel, true)] {
             let Some(m) = sel else { continue };
+            if is_talk && same_media {
+                talk.clone_from(&listen);
+                continue;
+            }
             let ch = next_ch;
             next_ch += 2;
             let codec = m.payloads[0].codec;
@@ -361,6 +372,7 @@ struct TalkShared {
     notify: Notify,
     codec: sdp::Codec,
     out: TalkOut,
+    dead_tx: watch::Sender<bool>,
 }
 
 /// A live audio session.
@@ -375,6 +387,9 @@ pub struct RtspSession {
     talk: Option<Arc<TalkShared>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     closed: AtomicBool,
+    /// Abnormal-task-exit signal — pump/pacer/keepalive send on
+    /// transport death; `close` aborts tasks ⊥ signalling.
+    dead_tx: watch::Sender<bool>,
 }
 
 impl RtspSession {
@@ -394,13 +409,14 @@ impl RtspSession {
         marks: Vec<(Direction, FaultClass)>,
     ) -> ArcAudioSession {
         let mut tasks = Vec::new();
+        let (dead_tx, _) = watch::channel(false);
 
         // Listen pump — interleaved → RTP → seq-check → G.711 → PCM.
         let listen_state = listen.map(|b| {
             let (tx, rx) = broadcast::channel(PCM_BROADCAST);
             let mut channels: HashMap<u8, (u8, sdp::Codec)> = HashMap::new();
             channels.insert(b.channel, (b.pt, b.codec));
-            tasks.push(tokio::spawn(pump(media_rx, channels, tx)));
+            tasks.push(tokio::spawn(pump(media_rx, channels, tx, dead_tx.clone())));
             ListenState { rx: Mutex::new(rx) }
         });
 
@@ -422,6 +438,7 @@ impl RtspSession {
                     notify: Notify::new(),
                     codec,
                     out,
+                    dead_tx: dead_tx.clone(),
                 });
                 tasks.push(tokio::spawn(pacer(client.clone(), t.clone())));
                 t
@@ -441,8 +458,13 @@ impl RtspSession {
             talk: talk_state,
             tasks: Mutex::new(tasks),
             closed: AtomicBool::new(false),
+            dead_tx,
         });
-        session.clone().spawn_keepalive(keepalive);
+        // A pure-VIGI session owns no RTSP session — nothing to keep
+        // alive.
+        if !session.session_id.is_empty() {
+            session.clone().spawn_keepalive(keepalive);
+        }
         session
     }
 
@@ -467,6 +489,7 @@ impl RtspSession {
                     .await
                     .is_err()
                 {
+                    _ = this.dead_tx.send(true);
                     break; // reader dead / socket gone — session teardown follows
                 }
             }
@@ -479,6 +502,7 @@ async fn pump(
     mut media_rx: mpsc::Receiver<Interleaved>,
     channels: HashMap<u8, (u8, sdp::Codec)>,
     tx: broadcast::Sender<PcmChunk>,
+    dead_tx: watch::Sender<bool>,
 ) {
     let mut last_seq: HashMap<u8, u16> = HashMap::new();
     while let Some(f) = media_rx.recv().await {
@@ -499,10 +523,9 @@ async fn pump(
             }
         }
         let pcm = g711::decode(codec, &pkt.payload);
-        if tx.send(pcm).is_err() {
-            break; // no listeners left
-        }
+        _ = tx.send(pcm); // zero listeners ≠ death — keep decoding
     }
+    _ = dead_tx.send(true); // media_rx closed — reader task died
 }
 
 /// Talk pacer — emits at most one ≤160-sample RTP frame per 20 ms
@@ -536,6 +559,7 @@ async fn pacer(client: Arc<RtspClient>, state: Arc<TalkShared>) {
             TalkOut::Vigi(v) => v.lock().await.send(&chunk, ts).await.is_ok(),
         };
         if !sent {
+            _ = state.dead_tx.send(true);
             return;
         }
         seq = seq.wrapping_add(1);
@@ -577,16 +601,24 @@ impl AudioSession for RtspSession {
         Ok(())
     }
 
+    async fn wait_dead(&self) {
+        let mut rx = self.dead_tx.subscribe();
+        _ = rx.wait_for(|d| *d).await;
+    }
+
     async fn close(&self) {
         if self.closed.swap(true, Ordering::Relaxed) {
             return;
         }
-        let extra: Vec<(&str, &str)> = if self.tagged {
-            vec![("Session", &self.session_id), ("Require", REQUIRE)]
-        } else {
-            vec![("Session", &self.session_id)]
-        };
-        let _ = self.client.request("TEARDOWN", &self.control, &extra).await;
+        // Pure-VIGI talk sessions hold no RTSP session — skip.
+        if !self.session_id.is_empty() {
+            let extra: Vec<(&str, &str)> = if self.tagged {
+                vec![("Session", &self.session_id), ("Require", REQUIRE)]
+            } else {
+                vec![("Session", &self.session_id)]
+            };
+            let _ = self.client.request("TEARDOWN", &self.control, &extra).await;
+        }
         for task in self.tasks.lock().await.drain(..) {
             task.abort();
         }

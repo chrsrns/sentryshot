@@ -397,12 +397,30 @@ pub struct MonitorIdQuery {
     id: MonitorId,
 }
 
+/// Route state for monitor lifecycle handlers — the audio service
+/// is needed so delete/disable/key-change tear live audio sessions
+/// down instead of waiting for the next consumer op.
+#[derive(Clone)]
+pub struct MonitorLifecycleState {
+    pub monitors: ArcMonitorManager,
+    pub audio: Arc<audio::AudioService>,
+}
+
+/// Endpoint+creds key — mirrors the attach key in `attach_direction`.
+fn audio_key(config: &MonitorConfig) -> String {
+    let common::monitor::SourceConfig::Rtsp(rtsp) = config.source();
+    (*rtsp.main_stream).to_string()
+}
+
 pub async fn monitor_delete_handler(
-    State(monitor_manager): State<ArcMonitorManager>,
+    State(state): State<MonitorLifecycleState>,
     query: Query<MonitorIdQuery>,
 ) -> Response {
-    match monitor_manager.monitor_delete(query.id.clone()).await {
-        Some(Ok(())) => (StatusCode::OK, String::new()).into_response(),
+    match state.monitors.monitor_delete(query.id.clone()).await {
+        Some(Ok(())) => {
+            state.audio.drop_entry(&query.id).await;
+            (StatusCode::OK, String::new()).into_response()
+        }
         Some(Err(e @ MonitorDeleteError::NotExist(_))) => {
             (StatusCode::NOT_FOUND, e.to_string()).into_response()
         }
@@ -412,12 +430,24 @@ pub async fn monitor_delete_handler(
 }
 
 pub async fn monitor_put_handler(
-    State(monitor_manager): State<ArcMonitorManager>,
+    State(state): State<MonitorLifecycleState>,
     Json(payload): Json<MonitorConfig>,
 ) -> Response {
+    let id = payload.id().clone();
+    let old_key = match state.monitors.monitor_config(id.clone()).await {
+        Some(Some(old)) => Some(audio_key(&old)),
+        _ => None,
+    };
+    let audio_disabled = !payload.config().audio.enable();
+    let new_key = audio_key(&payload);
     tokio::spawn(async move {
-        match monitor_manager.monitor_set(payload).await {
+        match state.monitors.monitor_set(payload).await {
             Some(Ok(created)) => {
+                // Disable ∨ endpoint/creds change ⇒ TEARDOWN + drop
+                // every consumer now, not on the next op.
+                if audio_disabled || old_key.is_some_and(|k| k != new_key) {
+                    state.audio.drop_entry(&id).await;
+                }
                 if created {
                     StatusCode::CREATED.into_response()
                 } else {
@@ -1120,9 +1150,12 @@ async fn audio_consumer(
     ping.tick().await; // first tick is immediate — skip it
 
     let mut entry: Option<Arc<audio::AudioEntry>> = None;
-    let mut attached = false;
+    // Interest-tracking: the directionless clock runs while the WS
+    // holds no direction — on upgrade and re-armed on detach.
+    let mut has_interest = false;
     let mut directionless = Box::pin(tokio::time::sleep(audio::DIRECTIONLESS_TIMEOUT));
     let mut pcm_rx: Option<tokio::sync::broadcast::Receiver<audio::PcmChunk>> = None;
+    let mut ctrl_rx: Option<tokio::sync::broadcast::Receiver<String>> = None;
 
     loop {
         tokio::select! {
@@ -1146,10 +1179,10 @@ async fn audio_consumer(
                         "listen" => {
                             match attach_direction(
                                 &state, &monitor_id, &config, &mut entry,
-                                consumer, audio::Direction::Listen, &drop_tx, &mut socket,
+                                consumer, audio::Direction::Listen, &drop_tx, &mut socket, &mut ctrl_rx,
                             ).await {
                                 Some(e) => {
-                                    attached = true;
+                                    has_interest = true;
                                     pcm_rx = e.subscribe_pcm().await;
                                 }
                                 None => break,
@@ -1158,11 +1191,11 @@ async fn audio_consumer(
                         "talk-start" => {
                             if attach_direction(
                                 &state, &monitor_id, &config, &mut entry,
-                                consumer, audio::Direction::Talk, &drop_tx, &mut socket,
+                                consumer, audio::Direction::Talk, &drop_tx, &mut socket, &mut ctrl_rx,
                             ).await.is_none() {
                                 break;
                             }
-                            attached = true;
+                            has_interest = true;
                         }
                         "listen-stop" => {
                             if let Some(e) = &entry {
@@ -1170,6 +1203,13 @@ async fn audio_consumer(
                                     e, consumer, audio::Direction::Listen,
                                 ).await;
                                 pcm_rx = None;
+                                if !e.has_interest(consumer).await {
+                                    has_interest = false;
+                                    directionless.as_mut().reset(
+                                        tokio::time::Instant::now()
+                                            + audio::DIRECTIONLESS_TIMEOUT,
+                                    );
+                                }
                             }
                         }
                         "talk-end" => {
@@ -1177,6 +1217,13 @@ async fn audio_consumer(
                                 state.service.remove_direction(
                                     e, consumer, audio::Direction::Talk,
                                 ).await;
+                                if !e.has_interest(consumer).await {
+                                    has_interest = false;
+                                    directionless.as_mut().reset(
+                                        tokio::time::Instant::now()
+                                            + audio::DIRECTIONLESS_TIMEOUT,
+                                    );
+                                }
                             }
                         }
                         _ => {} // unknown/client-sent server types: ignored
@@ -1218,14 +1265,33 @@ async fn audio_consumer(
                 }
             },
             drop = drop_rx.recv() => match drop {
-                Some(audio::ConsumerDrop::Error(msg)) => {
+                Some(audio::ConsumerDrop::Error(msg, code)) => {
                     _ = socket.send(error_ctrl(&msg)).await;
-                    _ = socket.send(Message::Close(None)).await;
+                    _ = socket.send(close_frame(code)).await;
                     break;
                 }
-                Some(audio::ConsumerDrop::Close) | None => break,
+                Some(audio::ConsumerDrop::Close(code)) => {
+                    _ = socket.send(close_frame(code)).await;
+                    break;
+                }
+                None => break,
             },
-            () = &mut directionless, if !attached => break,
+            // Server→consumer ctrl broadcast — `caps` on lock
+            // release / mark change / session events.
+            ctrl = async {
+                match &mut ctrl_rx {
+                    Some(rx) => rx.recv().await.ok(),
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(text) = ctrl {
+                    _ = socket.send(Message::Text(text.into())).await;
+                }
+            },
+            () = &mut directionless, if !has_interest => {
+                _ = socket.send(close_frame(1008)).await;
+                break;
+            },
         }
     }
 
@@ -1246,16 +1312,17 @@ async fn attach_direction(
     direction: audio::Direction,
     drop_tx: &tokio::sync::mpsc::UnboundedSender<audio::ConsumerDrop>,
     socket: &mut axum::extract::ws::WebSocket,
+    ctrl_rx: &mut Option<tokio::sync::broadcast::Receiver<String>>,
 ) -> Option<Arc<audio::AudioEntry>> {
     // Endpoint+creds key — mainStream URL carries userinfo.
     let common::monitor::SourceConfig::Rtsp(rtsp) = config.source();
     let url: url::Url = (*rtsp.main_stream).clone();
     let key = url.to_string();
 
-    if entry.is_none() {
-        let client = state.service.make_client(url);
-        *entry = Some(state.service.entry(monitor_id, key, client).await);
-    }
+    // Every attach re-keys — a mainStream/creds change rebuilds the
+    // entry and drops the stale session's consumers.
+    let client = state.service.make_client(url);
+    *entry = Some(state.service.entry(monitor_id, key, client).await);
     let e = entry.as_ref().expect("entry resolved above");
 
     match state
@@ -1270,7 +1337,8 @@ async fn attach_direction(
         )
         .await
     {
-        audio::Attach::Open(caps, _pcm) => {
+        audio::Attach::Open(caps, _pcm, rx) => {
+            *ctrl_rx = Some(rx);
             // `caps` — grant/report: merged mark set + lock state.
             let mut marks: Vec<String> = config.config().audio.unsupported().to_vec();
             marks.extend(e.session_marks().await);
@@ -1290,13 +1358,7 @@ async fn attach_direction(
             Some(e.clone())
         }
         audio::Attach::Busy => {
-            _ = socket
-                .send(axum::extract::ws::Message::Text(
-                    serde_json::json!({"type": "busy", "command": direction.name()})
-                        .to_string()
-                        .into(),
-                ))
-                .await;
+            _ = socket.send(busy_ctrl()).await;
             Some(e.clone())
         }
         audio::Attach::Unsupported => {
@@ -1307,13 +1369,34 @@ async fn attach_direction(
         }
         audio::Attach::Fault(msg) => {
             _ = socket.send(error_ctrl(&msg)).await;
-            Some(e.clone())
+            _ = socket.send(close_frame(1000)).await;
+            None
         }
         audio::Attach::Full => {
-            _ = drop_tx.send(audio::ConsumerDrop::Error("consumer bound".to_owned()));
+            _ = drop_tx.send(audio::ConsumerDrop::Error(
+                "consumer bound".to_owned(),
+                1008,
+            ));
             None
         }
     }
+}
+
+/// Server-initiated close frame carrying a WS status code.
+fn close_frame(code: u16) -> axum::extract::ws::Message {
+    axum::extract::ws::Message::Close(Some(axum::extract::ws::CloseFrame {
+        code,
+        reason: "".into(),
+    }))
+}
+
+/// `{"type":"busy","command":"talk-start"}` — the denied verb.
+fn busy_ctrl() -> axum::extract::ws::Message {
+    axum::extract::ws::Message::Text(
+        serde_json::json!({"type": "busy", "command": "talk-start"})
+            .to_string()
+            .into(),
+    )
 }
 
 /// `{"type":"error","message":..}` outbound ctrl.

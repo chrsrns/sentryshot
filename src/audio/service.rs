@@ -48,13 +48,15 @@ struct Consumer {
     drop_tx: tokio::sync::mpsc::UnboundedSender<ConsumerDrop>,
 }
 
-/// Why a consumer's WS is being terminated server-side.
+/// Why a consumer's WS is being terminated server-side. Codes:
+/// `1008` policy (excess attach, directionless); `1000` operational
+/// (fault, monitor gone/disable, key change, shutdown).
 #[derive(Clone, Debug)]
 pub enum ConsumerDrop {
-    /// `error` ctrl + close(1008).
-    Error(String),
-    /// Silent close — entry rebuild, monitor gone, shutdown.
-    Close,
+    /// `error` ctrl + close with the given WS code.
+    Error(String, u16),
+    /// Silent close with the given WS code.
+    Close(u16),
 }
 
 /// Open outcome shared by joiners that attached mid-open.
@@ -80,6 +82,7 @@ pub struct OpenSession {
     caps: AudioCaps,
     pcm_tx: broadcast::Sender<PcmChunk>,
     _pump: tokio::task::JoinHandle<()>,
+    _death_watch: tokio::task::JoinHandle<()>,
 }
 
 /// Per-monitor registry entry — rebuilt when the endpoint+creds key
@@ -100,6 +103,12 @@ pub struct AudioEntry {
     /// Direction names faulted while the current session lives —
     /// cleared on session close, never persisted.
     session_marks: Mutex<HashSet<String>>,
+    /// Last-seen persisted mark set — merged into `caps` broadcasts
+    /// (the live source of truth stays monitor config).
+    persisted: Mutex<HashSet<String>>,
+    /// Server→consumer ctrl broadcast (`caps` on lock release /
+    /// mark change / session death).
+    ctrl_tx: broadcast::Sender<String>,
     consumers: Mutex<HashMap<ConsumerId, Consumer>>,
 }
 
@@ -113,6 +122,8 @@ impl AudioEntry {
             op_lock: Mutex::new(()),
             talk_owner: Mutex::new(None),
             session_marks: Mutex::new(HashSet::new()),
+            persisted: Mutex::new(HashSet::new()),
+            ctrl_tx: broadcast::channel(16).0,
             consumers: Mutex::new(HashMap::new()),
         }
     }
@@ -146,6 +157,11 @@ impl AudioEntry {
         if *owner == Some(consumer) {
             *owner = None;
         }
+    }
+
+    /// Whether this consumer still holds any direction interest.
+    pub async fn has_interest(&self, consumer: ConsumerId) -> bool {
+        self.consumers.lock().await.contains_key(&consumer)
     }
 
     /// Whether this consumer holds the talk lock.
@@ -216,6 +232,24 @@ impl AudioEntry {
         self.close_if_idle().await;
     }
 
+    /// Mid-session transport fault — `error` ctrl + close(1000) to
+    /// every consumer + session teardown.
+    async fn session_died(&self) {
+        self.close_session().await;
+        let consumers: Vec<Consumer> = self
+            .consumers
+            .lock()
+            .await
+            .drain()
+            .map(|(_, c)| c)
+            .collect();
+        for c in consumers {
+            _ = c
+                .drop_tx
+                .send(ConsumerDrop::Error("session lost".to_owned(), 1000));
+        }
+    }
+
     /// `TEARDOWN` + close every consumer WS — entry rebuild, monitor
     /// gone, or shutdown.
     async fn drop_all(&self) {
@@ -228,7 +262,7 @@ impl AudioEntry {
             .map(|(_, c)| c)
             .collect();
         for c in consumers {
-            _ = c.drop_tx.send(ConsumerDrop::Close);
+            _ = c.drop_tx.send(ConsumerDrop::Close(1000));
         }
     }
 
@@ -277,8 +311,13 @@ impl AudioEntry {
 /// Open decisions a consumer attach can produce.
 #[derive(Debug)]
 pub enum Attach {
-    /// Session usable — caps + optional PCM receiver for listen.
-    Open(AudioCaps, Option<broadcast::Receiver<PcmChunk>>),
+    /// Session usable — caps, optional PCM receiver for listen, and
+    /// the entry's server→consumer ctrl broadcast (`caps`/`error`).
+    Open(
+        AudioCaps,
+        Option<broadcast::Receiver<PcmChunk>>,
+        broadcast::Receiver<String>,
+    ),
     /// `busy` — talk lock held by another consumer.
     Busy,
     /// `error` — direction marked unsupported (persisted ∪ session).
@@ -421,13 +460,17 @@ impl AudioService {
         {
             return Attach::Unsupported;
         }
+        *entry.persisted.lock().await = persisted_marks.iter().cloned().collect();
 
         if direction == Direction::Talk && !entry.try_take_talk(consumer).await {
             return Attach::Busy;
         }
 
-        // Ensure a session exists with this direction negotiated.
-        let outcome = self.ensure_open(entry, consumer, direction).await;
+        // Ensure a session exists. `want_talk` = talk unmarked —
+        // derived from the persisted set, ⊥ the attaching direction
+        // (sendonly ⊥ addable mid-session).
+        let want_talk = !persisted_marks.iter().any(|m| m == "talk");
+        let outcome = self.ensure_open(entry, consumer, want_talk).await;
         match outcome {
             Ok(open) => {
                 // Session usable for the direction? A listen-only open
@@ -456,7 +499,7 @@ impl AudioService {
                 } else {
                     None
                 };
-                Attach::Open(open.caps, pcm)
+                Attach::Open(open.caps, pcm, entry.ctrl_tx.subscribe())
             }
             Err(e) => {
                 if direction == Direction::Talk {
@@ -467,7 +510,8 @@ impl AudioService {
         }
     }
 
-    /// Remove one direction interest; detach on empty.
+    /// Remove one direction interest; detach on empty. A talk
+    /// release broadcasts `caps` so `busy`-marked consumers unmark.
     pub async fn remove_direction(
         &self,
         entry: &Arc<AudioEntry>,
@@ -476,6 +520,7 @@ impl AudioService {
     ) {
         if direction == Direction::Talk {
             entry.release_talk(consumer).await;
+            self.broadcast_caps(entry).await;
         }
         if !entry.remove_interest(consumer, direction).await {
             entry.detach(consumer).await;
@@ -484,7 +529,53 @@ impl AudioService {
 
     /// WS-close path — release talk, remove consumer, close-if-idle.
     pub async fn detach(&self, entry: &Arc<AudioEntry>, consumer: ConsumerId) {
+        let was_owner = entry.owns_talk(consumer).await;
         entry.detach(consumer).await;
+        if was_owner {
+            self.broadcast_caps(entry).await;
+        }
+    }
+
+    /// Revoke a held talk lock + the owner's talk interest —
+    /// implied `talk-end` on a mid-session talk mark.
+    async fn revoke_talk(entry: &Arc<AudioEntry>) {
+        let owner = entry.talk_owner.lock().await.take();
+        if let Some(owner) = owner {
+            // A tentative owner (attach still pre-register) has no
+            // interest to strip — detaching it would close the
+            // freshly opened session via `close_if_idle`.
+            if entry.has_interest(owner).await
+                && !entry.remove_interest(owner, Direction::Talk).await
+            {
+                entry.detach(owner).await;
+            }
+        }
+    }
+
+    /// `caps` broadcast to every attached consumer — current session
+    /// caps + persisted ∪ session marks + live lock state.
+    async fn broadcast_caps(&self, entry: &Arc<AudioEntry>) {
+        let caps = match &*entry.slot.read().await {
+            SessionSlot::Open(open) => open.caps,
+            _ => AudioCaps {
+                listen: false,
+                talk: false,
+            },
+        };
+        let mut marks: Vec<String> = entry.persisted.lock().await.iter().cloned().collect();
+        marks.extend(entry.session_marks.lock().await.iter().cloned());
+        marks.sort();
+        marks.dedup();
+        _ = entry.ctrl_tx.send(
+            serde_json::json!({
+                "type": "caps",
+                "listen": caps.listen,
+                "talk": caps.talk,
+                "talkFree": caps.talk && !entry.talk_owned().await,
+                "unsupported": marks,
+            })
+            .to_string(),
+        );
     }
 
     /// Open or join the session for `direction`. Joiners during an
@@ -494,7 +585,7 @@ impl AudioService {
         &self,
         entry: &Arc<AudioEntry>,
         _consumer: ConsumerId,
-        direction: Direction,
+        want_talk: bool,
     ) -> Result<Arc<OpenSession>, OpenError> {
         // Pre-lock read — joiners subscribe to the in-flight open
         // without queueing behind `op_lock`.
@@ -545,7 +636,6 @@ impl AudioService {
         let (tx, _rx) = watch::channel(None);
         *entry.slot.write().await = SessionSlot::Opening(tx.clone());
 
-        let want_talk = direction == Direction::Talk;
         let outcome = match self.do_open(entry, want_talk).await {
             Ok(open) => OpenOutcome(Ok(open)),
             Err(e) => OpenOutcome(Err(e)),
@@ -584,8 +674,29 @@ impl AudioService {
                     }
                 }
                 if !persisted.is_empty() {
+                    entry
+                        .persisted
+                        .lock()
+                        .await
+                        .extend(persisted.iter().cloned());
                     (self.persist)(entry.monitor.clone(), persisted).await;
                 }
+                // Mid-session talk mark ⇒ revoke the owner (implied
+                // `talk-end`) + `caps` broadcast.
+                if session.marks().iter().any(|(d, _)| *d == Direction::Talk) {
+                    Self::revoke_talk(entry).await;
+                }
+                self.broadcast_caps(entry).await;
+                // Session-death watcher — transport fault mid-session
+                // ⇒ `error` + teardown to every consumer.
+                let weak = Arc::downgrade(entry);
+                let dead = session.clone();
+                let dead_watch = tokio::spawn(async move {
+                    dead.wait_dead().await;
+                    if let Some(e) = weak.upgrade() {
+                        e.session_died().await;
+                    }
+                });
                 let (pcm_tx, _) = broadcast::channel(64);
                 let pump = if caps.listen {
                     let (tx, session) = (pcm_tx.clone(), session.clone());
@@ -602,6 +713,7 @@ impl AudioService {
                     caps,
                     pcm_tx,
                     _pump: pump,
+                    _death_watch: dead_watch,
                 }))
             }
             Err(e) => Err(OpenError {
@@ -629,6 +741,7 @@ mod tests {
         marks: Vec<(Direction, FaultClass)>,
         talked: Mutex<Vec<i16>>,
         closed: AtomicUsize,
+        dead: Mutex<Option<watch::Receiver<bool>>>,
     }
 
     #[async_trait::async_trait]
@@ -649,18 +762,28 @@ mod tests {
         async fn close(&self) {
             self.closed.fetch_add(1, Ordering::SeqCst);
         }
+        async fn wait_dead(&self) {
+            match self.dead.lock().await.take() {
+                Some(mut rx) => {
+                    _ = rx.wait_for(|d| *d).await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        }
     }
 
     struct StubClient {
         session: Result<Arc<StubSession>, Error>,
         opens: AtomicUsize,
         gate: Option<Arc<tokio::sync::Notify>>,
+        want_talk: Mutex<Vec<bool>>,
     }
 
     #[async_trait::async_trait]
     impl crate::AudioClient for StubClient {
-        async fn open(&self, _want_talk: bool) -> Result<ArcAudioSession, Error> {
+        async fn open(&self, want_talk: bool) -> Result<ArcAudioSession, Error> {
             self.opens.fetch_add(1, Ordering::SeqCst);
+            self.want_talk.lock().await.push(want_talk);
             // Gate only the first open — subsequent opens proceed.
             if let Some(g) = &self.gate {
                 if self.opens.load(Ordering::SeqCst) == 1 {
@@ -711,6 +834,7 @@ mod tests {
             marks: Vec::new(),
             talked: Mutex::new(Vec::new()),
             closed: AtomicUsize::new(0),
+            dead: Mutex::new(None),
         })
     }
 
@@ -721,6 +845,7 @@ mod tests {
             session: Ok(sess),
             opens: AtomicUsize::new(0),
             gate: None,
+            want_talk: Mutex::new(Vec::new()),
         });
         let (svc, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
@@ -729,7 +854,7 @@ mod tests {
                 .attach(&e, &mid(), i, Direction::Listen, &[], &drop_tx())
                 .await
             {
-                Attach::Open(caps, pcm) => {
+                Attach::Open(caps, pcm, _ctrl) => {
                     assert!(caps.listen);
                     assert!(pcm.is_some());
                 }
@@ -747,6 +872,7 @@ mod tests {
             session: Ok(ok_session(true, true)),
             opens: AtomicUsize::new(0),
             gate: None,
+            want_talk: Mutex::new(Vec::new()),
         });
         let (svc, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
@@ -771,6 +897,7 @@ mod tests {
             session: Ok(ok_session(true, true)),
             opens: AtomicUsize::new(0),
             gate: None,
+            want_talk: Mutex::new(Vec::new()),
         });
         let (svc, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
@@ -792,6 +919,7 @@ mod tests {
             session: Ok(ok_session(true, true)),
             opens: AtomicUsize::new(0),
             gate: None,
+            want_talk: Mutex::new(Vec::new()),
         });
         let (svc, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
@@ -822,6 +950,7 @@ mod tests {
             session: Ok(sess.clone()),
             opens: AtomicUsize::new(0),
             gate: None,
+            want_talk: Mutex::new(Vec::new()),
         });
         let (svc, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
@@ -838,6 +967,7 @@ mod tests {
             session: Ok(ok_session(false, true)),
             opens: AtomicUsize::new(0),
             gate: None,
+            want_talk: Mutex::new(Vec::new()),
         });
         let (svc, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
@@ -846,7 +976,7 @@ mod tests {
             .attach(&e, &mid(), 1, Direction::Talk, &[], &drop_tx())
             .await
         {
-            Attach::Open(caps, _) => {
+            Attach::Open(caps, _, _ctrl) => {
                 assert!(!caps.listen && caps.talk);
             }
             _ => panic!("expected open"),
@@ -867,6 +997,7 @@ mod tests {
             session: Ok(sess.clone()),
             opens: AtomicUsize::new(0),
             gate: None,
+            want_talk: Mutex::new(Vec::new()),
         });
         let (svc, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
@@ -896,11 +1027,13 @@ mod tests {
             ],
             talked: Mutex::new(Vec::new()),
             closed: AtomicUsize::new(0),
+            dead: Mutex::new(None),
         });
         let client = Arc::new(StubClient {
             session: Ok(sess),
             opens: AtomicUsize::new(0),
             gate: None,
+            want_talk: Mutex::new(Vec::new()),
         });
         let (svc, persisted) = svc(client.clone());
         let e = entry_of(&svc, &client);
@@ -920,6 +1053,7 @@ mod tests {
             session: Err(Error::Unsupported(Direction::Listen)),
             opens: AtomicUsize::new(0),
             gate: Some(gate.clone()),
+            want_talk: Mutex::new(Vec::new()),
         });
         let (svc, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
@@ -948,11 +1082,109 @@ mod tests {
             session: Ok(ok_session(true, true)),
             opens: AtomicUsize::new(0),
             gate: None,
+            want_talk: Mutex::new(Vec::new()),
         }));
         let t = svc.mint_token(mid()).await;
         assert_eq!(svc.consume_token(&t).await, Some(mid()));
         // Single-use — second consume fails.
         assert_eq!(svc.consume_token(&t).await, None);
         assert_eq!(svc.consume_token("bogus").await, None);
+    }
+
+    #[tokio::test]
+    async fn want_talk_derives_from_persisted_marks_not_direction() {
+        let client = Arc::new(StubClient {
+            session: Ok(ok_session(true, true)),
+            opens: AtomicUsize::new(0),
+            gate: None,
+            want_talk: Mutex::new(Vec::new()),
+        });
+        let (svc, _) = svc(client.clone());
+
+        // A listen attach on an unmarked monitor still opens
+        // want_talk — sendonly ⊥ addable mid-session.
+        let e = entry_of(&svc, &client);
+        _ = svc
+            .attach(&e, &mid(), 1, Direction::Listen, &[], &drop_tx())
+            .await;
+        // Talk marked persisted → the open skips sendonly.
+        let e2 = entry_of(&svc, &client);
+        _ = svc
+            .attach(
+                &e2,
+                &mid(),
+                2,
+                Direction::Listen,
+                &["talk".to_owned()],
+                &drop_tx(),
+            )
+            .await;
+        assert_eq!(*client.want_talk.lock().await, vec![true, false]);
+    }
+
+    #[tokio::test]
+    async fn talk_release_broadcasts_caps() {
+        let client = Arc::new(StubClient {
+            session: Ok(ok_session(true, true)),
+            opens: AtomicUsize::new(0),
+            gate: None,
+            want_talk: Mutex::new(Vec::new()),
+        });
+        let (svc, _) = svc(client.clone());
+        let e = entry_of(&svc, &client);
+        let mut ctrl1 = match svc
+            .attach(&e, &mid(), 1, Direction::Talk, &[], &drop_tx())
+            .await
+        {
+            Attach::Open(_, _, rx) => rx,
+            _ => panic!("expected open"),
+        };
+        let mut ctrl2 = match svc
+            .attach(&e, &mid(), 2, Direction::Listen, &[], &drop_tx())
+            .await
+        {
+            Attach::Open(_, _, rx) => rx,
+            _ => panic!("expected open"),
+        };
+        svc.remove_direction(&e, 1, Direction::Talk).await;
+        for rx in [&mut ctrl1, &mut ctrl2] {
+            let msg = rx.recv().await.unwrap();
+            let v: serde_json::Value = serde_json::from_str(&msg).unwrap();
+            assert_eq!(v["type"], "caps");
+            assert_eq!(v["talkFree"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_death_drops_consumers_with_error_1000() {
+        let (dead_tx, dead_rx) = watch::channel(false);
+        let sess = ok_session(true, false);
+        *sess.dead.lock().await = Some(dead_rx);
+        let client = Arc::new(StubClient {
+            session: Ok(sess.clone()),
+            opens: AtomicUsize::new(0),
+            gate: None,
+            want_talk: Mutex::new(Vec::new()),
+        });
+        let (svc, _) = svc(client.clone());
+        let e = entry_of(&svc, &client);
+        let (drop_tx, mut drop_rx) = tokio::sync::mpsc::unbounded_channel();
+        match svc
+            .attach(&e, &mid(), 1, Direction::Listen, &[], &drop_tx)
+            .await
+        {
+            Attach::Open(..) => {}
+            _ => panic!("expected open"),
+        }
+        dead_tx.send(true).unwrap();
+        match tokio::time::timeout(std::time::Duration::from_secs(2), drop_rx.recv())
+            .await
+            .unwrap()
+        {
+            Some(ConsumerDrop::Error(_, 1000)) => {}
+            other => panic!("expected error+close(1000), got {other:?}"),
+        }
+        // Session was torn down — the entry's slot is closed.
+        assert!(sess.closed.load(Ordering::SeqCst) > 0);
     }
 }

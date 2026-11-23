@@ -157,6 +157,11 @@ pub trait AudioSession: Send + Sync {
 
     /// `TEARDOWN` + close. Idempotent.
     async fn close(&self);
+
+    /// Resolves when the session dies underneath — transport fault,
+    /// reader/pump/keepalive task exit. Never resolves for a session
+    /// that lives until `close`.
+    async fn wait_dead(&self);
 }
 
 /// Factory for monitor audio sessions — one instance per monitor

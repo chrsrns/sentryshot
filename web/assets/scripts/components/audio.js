@@ -95,7 +95,11 @@ export function newAudioController(csrfToken, getMonitorId, errorElem) {
 				const s = Math.max(-1, Math.min(1, input[i * decimation]));
 				out[i] = s < 0 ? s * 32768 : s * 32767;
 			}
-			ws.send(out.buffer);
+			// ≤20 ms wire frames (160 samples @ 8 kHz) — the
+			// ScriptProcessor buffer runs longer than one frame.
+			for (let off = 0; off < out.length; off += 160) {
+				ws.send(out.buffer.slice(off * 2, Math.min((off + 160) * 2, out.length * 2)));
+			}
 		};
 		source.connect(node);
 		node.connect(captureCtx.destination);

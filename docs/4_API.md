@@ -180,20 +180,27 @@ Server→client messages:
 
 ```json
 { "type": "caps", "listen": true, "talk": true, "talkFree": false, "unsupported": ["talk"] }
-{ "type": "busy", "command": "talk" }
+{ "type": "busy", "command": "talk-start" }
 { "type": "error", "message": "talk unavailable in session" }
 ```
 
-- `caps` is sent on attach and on grant — `talkFree` is false while
-  another consumer holds the talk lock; a `busy`-marked client must
-  wait for a `caps` carrying `talkFree: true` before re-marking the
-  control usable.
+- `caps` is sent on attach and on grant, and broadcast to every
+  attached consumer on talk-lock release and mid-session mark
+  changes — `talkFree` is false while another consumer holds the
+  talk lock; a `busy`-marked client must wait for a `caps` carrying
+  `talkFree: true` before re-marking the control usable.
 - Binary frames are PCM Int16 little-endian, 8 kHz mono, ≤20 ms per
   frame — server→client is decoded camera audio, client→server is
   mic audio for encoding to the negotiated G.711 codec. Binary frames
   from a connection that does not hold the talk lock are dropped.
 - Attach is lazy: upgrade alone subscribes nothing — a socket with no
-  direction ctrl for 10 s is closed, at most 8 consumers per monitor.
+  direction ctrl for 10 s is closed (`1008`), and the clock re-arms
+  each time a consumer's interest empties. At most 8 consumers per
+  monitor; excess attach gets `error` + close `1008`.
+- Server-initiated closes carry `1008` for policy triggers
+  (directionless, excess attach) and `1000` for operational ones
+  (open fault, mid-session transport fault, monitor delete/disable,
+  key change). An open fault sends `error` then closes `1000`.
 - The session is single-flight per monitor: the first direction ctrl
   opens it, the last detach sends `TEARDOWN`. A session opened
   listen-only stays listen-only — talk capability joins at the next

@@ -363,11 +363,17 @@ impl App {
             // Monitor.
             .route_admin(
                 "/api/monitor",
-                delete(monitor_delete_handler).with_state(self.monitor_manager.clone()),
+                delete(monitor_delete_handler).with_state(MonitorLifecycleState {
+                    monitors: self.monitor_manager.clone(),
+                    audio: audio_service.clone(),
+                }),
             )
             .route_admin(
                 "/api/monitor",
-                put(monitor_put_handler).with_state(self.monitor_manager.clone()),
+                put(monitor_put_handler).with_state(MonitorLifecycleState {
+                    monitors: self.monitor_manager.clone(),
+                    audio: audio_service.clone(),
+                }),
             )
             // Monitor restart.
             .route_admin(
