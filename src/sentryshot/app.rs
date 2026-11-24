@@ -281,13 +281,22 @@ impl App {
         ));
 
         let persist_monitors = self.monitor_manager.clone();
+        let unmark_monitors = self.monitor_manager.clone();
         let audio_service = Arc::new(audio::AudioService::new(
-            Arc::new(|url, alt| -> audio::ArcAudioClient {
-                Arc::new(audio::RtspAudioClient::new(url, alt))
+            Arc::new(|url, alt, cfg| -> audio::ArcAudioClient {
+                Arc::new(audio::RtspAudioClient::new(url, alt, cfg))
             }),
             Arc::new(move |monitor_id, marks| {
                 let monitors = persist_monitors.clone();
                 Box::pin(persist_audio_marks(monitors, monitor_id, marks))
+            }),
+            Arc::new(move |monitor_id, names| {
+                let monitors = unmark_monitors.clone();
+                Box::pin(async move {
+                    // Server-owned raw-patch removal — the union in
+                    // `monitor_set` would resurrect a reduced set.
+                    drop(monitors.monitor_unmark_audio(monitor_id, names).await);
+                })
             }),
         ));
 

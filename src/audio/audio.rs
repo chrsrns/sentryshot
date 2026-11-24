@@ -28,8 +28,8 @@ mod vigi;
 pub use rtsp::{Interleaved, Response, RtspClient};
 pub use sdp::{AudioMedia, Codec, PayloadMap, Sdp, SdpDirection, parse as parse_sdp};
 pub use service::{
-    Attach, AudioEntry, AudioService, ConsumerDrop, DIRECTIONLESS_TIMEOUT, MAX_CONSUMERS,
-    TOKEN_TTL, WS_PING_CADENCE,
+    Attach, AudioEntry, AudioService, CfgAccessor, ConsumerDrop, DIRECTIONLESS_TIMEOUT,
+    MAX_CONSUMERS, PersistFn, TOKEN_TTL, UnmarkFn, V380Cfg, WS_PING_CADENCE,
 };
 pub use session::RtspAudioClient;
 pub use v380::{

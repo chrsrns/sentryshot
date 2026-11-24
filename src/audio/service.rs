@@ -396,8 +396,32 @@ pub enum Attach {
 pub type PersistFn =
     Arc<dyn Fn(MonitorId, Vec<String>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// Persisted-mark removal sink (V281) — `monitor_unmark_audio`
+/// raw-patch op; a `monitor_set` RMW would resurrect via the union.
+pub type UnmarkFn =
+    Arc<dyn Fn(MonitorId, Vec<String>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// V380 probe inputs resolved live from monitor `Config` inside
+/// `open` (⊥ construction-captured — an entry reuse must see the
+/// latest saved values).
+#[derive(Clone, Debug, Default)]
+pub struct V380Cfg {
+    /// `audio.v380DeviceId` — configured override wins over the
+    /// ONVIF-serial derivation.
+    pub device_id: Option<u32>,
+    /// `audio.v380User` — wins the username candidate order.
+    pub user: Option<String>,
+    /// `ptz.onvifAddr` — derivation endpoint when valid.
+    pub onvif_addr: String,
+}
+
+/// Live-config channel for the V380 probe (V278) — invoked at
+/// open time, not at client construction.
+pub type CfgAccessor = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = V380Cfg> + Send>> + Send + Sync>;
+
 /// Session factory — `RtspAudioClient` in production, a mock in tests.
-pub type ClientFactory = Arc<dyn Fn(url::Url, Option<url::Url>) -> ArcAudioClient + Send + Sync>;
+pub type ClientFactory =
+    Arc<dyn Fn(url::Url, Option<url::Url>, CfgAccessor) -> ArcAudioClient + Send + Sync>;
 
 /// Per-monitor session registry + WS token store. Lives in route
 /// state; built once at startup.
@@ -407,16 +431,18 @@ pub struct AudioService {
     tokens: Mutex<HashMap<String, (MonitorId, Instant)>>,
     factory: ClientFactory,
     persist: PersistFn,
+    unmark: UnmarkFn,
     next_consumer: std::sync::atomic::AtomicU64,
 }
 
 impl AudioService {
-    pub fn new(factory: ClientFactory, persist: PersistFn) -> Self {
+    pub fn new(factory: ClientFactory, persist: PersistFn, unmark: UnmarkFn) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
             tokens: Mutex::new(HashMap::new()),
             factory,
             persist,
+            unmark,
             next_consumer: std::sync::atomic::AtomicU64::new(1),
         }
     }
@@ -481,9 +507,15 @@ impl AudioService {
 
     /// Build a client via the injected factory — route layer extracts
     /// endpoint+creds from monitor config. `alt` = the `subStream`
-    /// URL the session retries on a `429`.
-    pub fn make_client(&self, url: url::Url, alt: Option<url::Url>) -> ArcAudioClient {
-        (self.factory)(url, alt)
+    /// URL the session retries on a `429`; `cfg` resolves V380
+    /// probe inputs live at open (V278).
+    pub fn make_client(
+        &self,
+        url: url::Url,
+        alt: Option<url::Url>,
+        cfg: CfgAccessor,
+    ) -> ArcAudioClient {
+        (self.factory)(url, alt, cfg)
     }
 
     /// Drop the entry — TEARDOWN + consumer closes. Called when the
@@ -758,6 +790,31 @@ impl AudioService {
         }
     }
 
+    /// V281 — directions the composed session serves heal stale
+    /// persisted marks: removal is awaited BEFORE any new-mark
+    /// persist so the persist RMW's read→set window sees the
+    /// unmarked state (⊥ a spawn — interleaving resurrects the name
+    /// via the union). Scoped to caps-served directions; purges
+    /// only the removed names from the entry mirror.
+    async fn unmark_served(&self, entry: &Arc<AudioEntry>, caps: &AudioCaps) {
+        let served: Vec<String> = [
+            (Direction::Listen, caps.listen),
+            (Direction::Talk, caps.talk),
+        ]
+        .into_iter()
+        .filter(|&(_d, yes)| yes)
+        .map(|(d, _yes)| d.name().to_owned())
+        .collect();
+        let stale: Vec<String> = {
+            let p = entry.persisted.lock().await;
+            served.iter().filter(|n| p.contains(*n)).cloned().collect()
+        };
+        if !stale.is_empty() {
+            (self.unmark)(entry.monitor.clone(), stale.clone()).await;
+            entry.persisted.lock().await.retain(|n| !stale.contains(n));
+        }
+    }
+
     /// `client.open` + mark bookkeeping — capability marks persist
     /// via the sink, the rest land session-only.
     async fn do_open(
@@ -768,6 +825,7 @@ impl AudioService {
         match entry.client.open(want_talk).await {
             Ok(session) => {
                 let caps = session.caps();
+                self.unmark_served(entry, &caps).await;
                 let mut persisted = Vec::new();
                 for (dir, class) in session.marks() {
                     let name = dir.name().to_owned();
@@ -961,8 +1019,7 @@ mod tests {
             u64::try_from(
                 self.lazy
                     .as_ref()
-                    .map(|l| l.claims.load(Ordering::SeqCst))
-                    .unwrap_or(0),
+                    .map_or(0, |l| l.claims.load(Ordering::SeqCst)),
             )
             .unwrap_or(0)
         }
@@ -1002,19 +1059,30 @@ mod tests {
 
     fn svc(
         client: Arc<StubClient>,
-    ) -> (Arc<AudioService>, Arc<Mutex<Vec<(MonitorId, Vec<String>)>>>) {
+    ) -> (
+        Arc<AudioService>,
+        Arc<Mutex<Vec<(MonitorId, Vec<String>)>>>,
+        Arc<Mutex<Vec<(MonitorId, Vec<String>)>>>,
+    ) {
         let persisted = Arc::new(Mutex::new(Vec::<(MonitorId, Vec<String>)>::new()));
+        let unmarked = Arc::new(Mutex::new(Vec::<(MonitorId, Vec<String>)>::new()));
         let p = persisted.clone();
+        let u = unmarked.clone();
         let c = client.clone();
         (
             Arc::new(AudioService::new(
-                Arc::new(move |_, _| c.clone()),
+                Arc::new(move |_, _, _| c.clone()),
                 Arc::new(move |id, marks| {
                     let p = p.clone();
                     Box::pin(async move { p.lock().await.push((id, marks)) })
                 }),
+                Arc::new(move |id, names| {
+                    let u = u.clone();
+                    Box::pin(async move { u.lock().await.push((id, names)) })
+                }),
             )),
             persisted,
+            unmarked,
         )
     }
 
@@ -1073,7 +1141,7 @@ mod tests {
     async fn lazy_claim_busy_is_retryable_listen_survives() {
         let sess = lazy_session(TalkClaim::Busy);
         let client = stub_client(sess.clone());
-        let (svc, _) = svc(client.clone());
+        let (svc, _, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
         let (drop_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         match svc
@@ -1100,7 +1168,7 @@ mod tests {
     async fn lazy_claim_refused_marks_session_only() {
         let sess = lazy_session(TalkClaim::Refused);
         let client = stub_client(sess.clone());
-        let (svc, persisted) = svc(client.clone());
+        let (svc, persisted, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
         let (drop_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         match svc
@@ -1135,7 +1203,7 @@ mod tests {
     async fn lazy_claim_unreachable_retryable_no_mark() {
         let sess = lazy_session(TalkClaim::Unreachable);
         let client = stub_client(sess);
-        let (svc, _) = svc(client.clone());
+        let (svc, _, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
         let (drop_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         match svc
@@ -1153,7 +1221,7 @@ mod tests {
     async fn lazy_claim_install_release_reclaim() {
         let sess = lazy_session(TalkClaim::Ready);
         let client = stub_client(sess.clone());
-        let (svc, _) = svc(client.clone());
+        let (svc, _, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
         let (drop_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         match svc
@@ -1187,7 +1255,7 @@ mod tests {
         let sess = lazy_session(TalkClaim::Ready);
         let dead_tx = sess.lazy.as_ref().unwrap().dead_tx.clone();
         let client = stub_client(sess);
-        let (svc, _) = svc(client.clone());
+        let (svc, _, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
         let (drop_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut ctrl = match svc
@@ -1223,7 +1291,7 @@ mod tests {
         let (dead_tx, dead_rx) = watch::channel(false);
         *sess.dead.lock().unwrap() = Some(dead_rx);
         let client = stub_client(sess.clone());
-        let (svc, _) = svc(client.clone());
+        let (svc, _, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
         let (drop_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         // Consumer 2 holds the session via listen.
@@ -1272,7 +1340,7 @@ mod tests {
             gate: None,
             want_talk: Mutex::new(Vec::new()),
         });
-        let (svc, _) = svc(client.clone());
+        let (svc, _, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
         for i in 1..=2u64 {
             match svc
@@ -1299,7 +1367,7 @@ mod tests {
             gate: None,
             want_talk: Mutex::new(Vec::new()),
         });
-        let (svc, _) = svc(client.clone());
+        let (svc, _, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
         let first = svc
             .attach(&e, &mid(), 1, Direction::Talk, &[], &drop_tx())
@@ -1324,7 +1392,7 @@ mod tests {
             gate: None,
             want_talk: Mutex::new(Vec::new()),
         });
-        let (svc, _) = svc(client.clone());
+        let (svc, _, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
         let marks = vec!["talk".to_owned()];
         match svc
@@ -1346,7 +1414,7 @@ mod tests {
             gate: None,
             want_talk: Mutex::new(Vec::new()),
         });
-        let (svc, _) = svc(client.clone());
+        let (svc, _, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
         for i in 0..MAX_CONSUMERS as u64 {
             assert!(matches!(
@@ -1377,7 +1445,7 @@ mod tests {
             gate: None,
             want_talk: Mutex::new(Vec::new()),
         });
-        let (svc, _) = svc(client.clone());
+        let (svc, _, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
         _ = svc
             .attach(&e, &mid(), 1, Direction::Listen, &[], &drop_tx())
@@ -1394,7 +1462,7 @@ mod tests {
             gate: None,
             want_talk: Mutex::new(Vec::new()),
         });
-        let (svc, _) = svc(client.clone());
+        let (svc, _, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
         // want_talk open lands talk-only; a listen ctrl errors.
         match svc
@@ -1424,7 +1492,7 @@ mod tests {
             gate: None,
             want_talk: Mutex::new(Vec::new()),
         });
-        let (svc, _) = svc(client.clone());
+        let (svc, _, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
         // consumer 1 owns talk; consumer 2's frames drop.
         _ = svc
@@ -1462,7 +1530,7 @@ mod tests {
             gate: None,
             want_talk: Mutex::new(Vec::new()),
         });
-        let (svc, persisted) = svc(client.clone());
+        let (svc, persisted, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
         _ = svc
             .attach(&e, &mid(), 1, Direction::Talk, &[], &drop_tx())
@@ -1482,7 +1550,7 @@ mod tests {
             gate: Some(gate.clone()),
             want_talk: Mutex::new(Vec::new()),
         });
-        let (svc, _) = svc(client.clone());
+        let (svc, _, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
         let svc2 = svc.clone();
         let e2 = e.clone();
@@ -1505,7 +1573,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_single_use_and_ttl() {
-        let (svc, _) = svc(Arc::new(StubClient {
+        let (svc, _, _) = svc(Arc::new(StubClient {
             session: Ok(ok_session(true, true)),
             opens: AtomicUsize::new(0),
             gate: None,
@@ -1526,7 +1594,7 @@ mod tests {
             gate: None,
             want_talk: Mutex::new(Vec::new()),
         });
-        let (svc, _) = svc(client.clone());
+        let (svc, _, _) = svc(client.clone());
 
         // A listen attach on an unmarked monitor still opens
         // want_talk — sendonly ⊥ addable mid-session.
@@ -1557,21 +1625,19 @@ mod tests {
             gate: None,
             want_talk: Mutex::new(Vec::new()),
         });
-        let (svc, _) = svc(client.clone());
+        let (svc, _, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
-        let mut ctrl1 = match svc
+        let Attach::Open(_, _, mut ctrl1) = svc
             .attach(&e, &mid(), 1, Direction::Talk, &[], &drop_tx())
             .await
-        {
-            Attach::Open(_, _, rx) => rx,
-            _ => panic!("expected open"),
+        else {
+            panic!("expected open")
         };
-        let mut ctrl2 = match svc
+        let Attach::Open(_, _, mut ctrl2) = svc
             .attach(&e, &mid(), 2, Direction::Listen, &[], &drop_tx())
             .await
-        {
-            Attach::Open(_, _, rx) => rx,
-            _ => panic!("expected open"),
+        else {
+            panic!("expected open")
         };
         svc.remove_direction(&e, 1, Direction::Talk).await;
         for rx in [&mut ctrl1, &mut ctrl2] {
@@ -1593,7 +1659,7 @@ mod tests {
             gate: None,
             want_talk: Mutex::new(Vec::new()),
         });
-        let (svc, _) = svc(client.clone());
+        let (svc, _, _) = svc(client.clone());
         let e = entry_of(&svc, &client);
         let (drop_tx, mut drop_rx) = tokio::sync::mpsc::unbounded_channel();
         match svc
@@ -1613,5 +1679,50 @@ mod tests {
         }
         // Session was torn down — the entry's slot is closed.
         assert!(sess.closed.load(Ordering::SeqCst) > 0);
+    }
+    /// Served-direction names in `entry.persisted` are removed via
+    /// the unmark sink (raw-patch) + purged from the mirror —
+    /// BEFORE any new-mark persist lands (V281 sequencing).
+    #[tokio::test]
+    async fn do_open_unmarks_served_persisted_names() {
+        let sess = Arc::new(StubSession {
+            caps: AudioCaps {
+                listen: true,
+                talk: true,
+            },
+            marks: Vec::new(),
+            talked: Mutex::new(Vec::new()),
+            closed: AtomicUsize::new(0),
+            dead: std::sync::Mutex::new(None),
+            dead_keep: watch::channel(false).0,
+            lazy: None,
+        });
+        let client = Arc::new(StubClient {
+            session: Ok(sess),
+            opens: AtomicUsize::new(0),
+            gate: None,
+            want_talk: Mutex::new(Vec::new()),
+        });
+        let (svc, persisted, unmarked) = svc(client.clone());
+        let e = entry_of(&svc, &client);
+        e.persisted.lock().await.insert("talk".to_owned());
+        // Attach listen against a persisted `talk` mark — the
+        // direction isn't gated, the open heals it.
+        _ = svc
+            .attach(
+                &e,
+                &mid(),
+                1,
+                Direction::Listen,
+                &["talk".to_owned()],
+                &drop_tx(),
+            )
+            .await;
+        assert_eq!(
+            unmarked.lock().await.as_slice(),
+            &[(mid(), vec!["talk".to_owned()])]
+        );
+        assert!(!e.persisted.lock().await.contains("talk"));
+        assert!(persisted.lock().await.is_empty());
     }
 }

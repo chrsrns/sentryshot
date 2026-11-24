@@ -606,6 +606,16 @@ pub trait IMonitorManager {
     async fn monitors_info(&self) -> Option<HashMap<MonitorId, MonitorInfo>>;
     async fn monitor_config(&self, monitor_id: MonitorId) -> Option<Option<MonitorConfig>>;
     async fn monitor_configs(&self) -> Option<MonitorConfigs>;
+
+    /// Raw-patch removal of `names` from `audio.unsupported` —
+    /// the server-owned unmark path for composed-direction healing.
+    /// NOT a `monitor_set` RMW: `union_audio_marks` would resurrect
+    /// a reduced set. Atomic-write + configs update, actor-serial.
+    async fn monitor_unmark_audio(
+        &self,
+        id: MonitorId,
+        names: Vec<String>,
+    ) -> Option<Result<(), MonitorSetError>>;
 }
 
 #[async_trait]

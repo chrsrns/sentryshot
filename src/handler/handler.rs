@@ -149,7 +149,7 @@ pub async fn hls_handler(
             return (StatusCode::OK, headers).into_response();
         }
         _ => return (StatusCode::METHOD_NOT_ALLOWED, headers).into_response(),
-    };
+    }
 
     let (muxer_name, file_name) = match parse_path(path) {
         Ok(v) => v,
@@ -364,7 +364,7 @@ pub async fn recording_query_handler(
                     &format!("query events: {e}"),
                 ));
             }
-        };
+        }
     }
     Ok(Json(recordings))
 }
@@ -1350,7 +1350,32 @@ async fn attach_direction(
 
     // Every attach re-keys — a mainStream/subStream/creds change
     // rebuilds the entry and drops the stale session's consumers.
-    let client = state.service.make_client(url, alt);
+    // The V380 probe resolves its inputs live from `Config` inside
+    // `open` — a saved `v380*`/`ptz.onvifAddr` edit takes effect
+    // on the next open without an entry rebuild.
+    let monitors = state.monitors.clone();
+    let cfg_id = monitor_id.clone();
+    let client = state.service.make_client(
+        url,
+        alt,
+        Arc::new(move || {
+            let monitors = monitors.clone();
+            let id = cfg_id.clone();
+            let f: std::pin::Pin<Box<dyn std::future::Future<Output = audio::V380Cfg> + Send>> =
+                Box::pin(async move {
+                    let Some(Some(config)) = monitors.monitor_config(id).await else {
+                        return audio::V380Cfg::default();
+                    };
+                    let a = &config.config().audio;
+                    audio::V380Cfg {
+                        device_id: a.v380_device_id(),
+                        user: a.v380_user().map(str::to_owned),
+                        onvif_addr: config.config().ptz.onvif_addr().to_owned(),
+                    }
+                });
+            f
+        }),
+    );
     *entry = Some(state.service.entry(monitor_id, key, client).await);
     let e = entry.as_ref().expect("entry resolved above");
 

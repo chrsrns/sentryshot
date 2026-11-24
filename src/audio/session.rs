@@ -54,6 +54,10 @@ pub struct RtspAudioClient {
     /// V265 fallback — `subStream`; `None` when it names the same
     /// endpoint as `url`.
     alt_url: Option<url::Url>,
+    /// V380 probe inputs resolved live from `Config` at open —
+    /// a `MonitorConfig` re-read on every `open` call (the entry
+    /// may outlive a settings save).
+    cfg: crate::service::CfgAccessor,
 }
 
 /// Creds-free endpoint identity — host, effective port, path,
@@ -67,11 +71,12 @@ fn same_endpoint(a: &url::Url, b: &url::Url) -> bool {
 
 impl RtspAudioClient {
     /// New client for a monitor's stream URLs (creds ride each
-    /// URL's own userinfo); `alt` retries the open on a `429`.
+    /// URL's own userinfo); `alt` retries the open on a `429`,
+    /// `cfg` resolves V380 probe inputs inside `open`.
     #[must_use]
-    pub fn new(url: url::Url, alt: Option<url::Url>) -> Self {
+    pub fn new(url: url::Url, alt: Option<url::Url>, cfg: crate::service::CfgAccessor) -> Self {
         let alt_url = alt.filter(|a| !same_endpoint(&url, a));
-        Self { url, alt_url }
+        Self { url, alt_url, cfg }
     }
 
     /// Camera host for the VIGI `:8800` probe (T142).
@@ -121,71 +126,146 @@ struct Described {
 impl RtspAudioClient {
     /// One full negotiate on `url` — `alt` marks the V265 retry,
     /// whose capability observations stay session-only (V266).
+    /// A pre-selection RTSP fault demotes to the private-protocol
+    /// arm rather than killing the open (V278); `429`/`StreamLimit`
+    /// propagates to the alt retry unprobed.
+    #[allow(clippy::too_many_lines)]
     async fn open_inner(
         &self,
         url: &url::Url,
         want_talk: bool,
         alt: bool,
     ) -> Result<ArcAudioSession, Error> {
-        let mut client = RtspClient::connect(url).await?;
-        // Liveness probe — any response proves the RTSP stack;
-        // a `429` is the saturation signal the retry acts on.
-        let resp = timed(client.request("OPTIONS", client.base(), &[])).await?;
-        if resp.status == 429 {
-            return Err(Error::StreamLimit);
+        // Probe budget shares this URL's open window — a mid-arm
+        // exhaustion maps to ⊥-V380, ⊥ a second window.
+        let deadline = tokio::time::Instant::now() + OPEN_BUDGET;
+
+        let phase = async {
+            let mut client = RtspClient::connect(url).await?;
+            // Liveness probe — any response proves the RTSP stack;
+            // a `429` is the saturation signal the retry acts on.
+            let resp = timed(client.request("OPTIONS", client.base(), &[])).await?;
+            if resp.status == 429 {
+                return Err(Error::StreamLimit);
+            }
+            let described = describe(&client, url, want_talk).await?;
+            let media_rx = client
+                .take_media()
+                .ok_or_else(|| Error::Protocol("media channel already taken".into()))?;
+            Ok((client, described, media_rx))
         }
+        .await;
 
-        let described = describe(&client, url, want_talk).await?;
-        let media_rx = client
-            .take_media()
-            .ok_or_else(|| Error::Protocol("media channel already taken".into()))?;
+        let (mut rtsp_client, described, media_rx, orig_fault) = match phase {
+            Ok((c, d, r)) => (Some(c), Some(d), Some(r), None),
+            Err(Error::StreamLimit) => return Err(Error::StreamLimit),
+            Err(e) => (None, None, None, Some(e)),
+        };
 
-        // Track selection + marks.
-        let (listen_sel, talk_sel, mut marks) = select(&described.sdp, want_talk);
+        // Track selection + marks — the fault arm starts markless.
+        let (listen_sel, talk_sel, mut marks) = match &described {
+            Some(d) => select(&d.sdp, want_talk),
+            None => (None, None, Vec::new()),
+        };
 
         // VIGI :8800 talk fallback (V259) — ONVIF yielded no talk
         // track on a want_talk open ⇒ unconditional probe; outcome
         // decides the talk mark's class. Capability-only under V275:
         // a `Ready` talker is dropped immediately (the slot frees —
         // claims happen per hold), a `-52405` grant still proves the
-        // protocol.
-        let vigi_claim = if want_talk && talk_sel.is_none() {
+        // protocol. The fault arm evaluates it before V380 (V278).
+        let vigi = if want_talk && talk_sel.is_none() {
             probe_vigi(url, &mut marks).await
         } else {
-            None
+            VigiOut::NotProbed
         };
-        if listen_sel.is_none() && talk_sel.is_none() && vigi_claim.is_none() {
-            client.close();
+        let vigi_claim = match &vigi {
+            VigiOut::Served(c) => Some(VigiClaim {
+                host: c.host.clone(),
+                user: c.user.clone(),
+                pass: c.pass.clone(),
+            }),
+            _ => None,
+        };
+
+        // V380 fallback (V278) — a wanted direction uncovered AND
+        // the VIGI dialect ⊥-proven (absent, Refused, Unreachable —
+        // a `Ready`/`Busy` settle proves VIGI owns `:8800`).
+        let uncovered = listen_sel.is_none() || (want_talk && talk_sel.is_none());
+        let v380 = if uncovered && !matches!(vigi, VigiOut::Served(_)) {
+            let cfg = (self.cfg)().await;
+            probe_v380(url, &cfg, deadline).await
+        } else {
+            V380Out::Skipped
+        };
+        let (v380_serves_listen, v380_serves_talk, v380_compose, v380_claim) = apply_v380(
+            &v380,
+            &vigi,
+            listen_sel.is_none(),
+            talk_sel.is_none() && vigi_claim.is_none(),
+            &mut marks,
+        );
+
+        // Compose gate — anything negotiated ∨ lazily claimed ∨
+        // oracle-minted keeps the session alive.
+        let rtsp_composed = listen_sel.is_some() || talk_sel.is_some() || vigi_claim.is_some();
+        if !rtsp_composed && !v380_compose {
+            if let Some(c) = &mut rtsp_client {
+                c.close();
+            }
+            // A creds/result verdict carries its message; the fault
+            // arm otherwise propagates the original fault (V278).
+            if let V380Out::Creds(m) = v380 {
+                return Err(Error::Protocol(m));
+            }
+            if let Some(f) = orig_fault {
+                return Err(f);
+            }
             return Err(Error::Protocol("no usable audio path".into()));
         }
 
+        // A selection-arm pure-V380 compose owns ⊥ RTSP session —
+        // the conn closes post-`select` (V278); mixed composes keep
+        // it for the negotiated direction.
+        if !rtsp_composed && orig_fault.is_none() {
+            if let Some(c) = rtsp_client.take() {
+                c.close();
+            }
+        }
+        let client = rtsp_client.map(Arc::new);
+
         // SETUP each selected track on fresh channel pairs. A
         // `sendrecv` line serving both directions is SETUP'd once —
-        // one control URL owns both bindings.
-        let client = Arc::new(client);
-        let (session_id, listen, talk) =
-            setup_tracks(&client, &described, listen_sel, talk_sel).await?;
+        // one control URL owns both bindings. ⊥-RTSP arms (fault,
+        // pure-V380) skip SETUP/PLAY entirely.
+        let (session_id, listen, talk) = match (&client, &described) {
+            (Some(c), Some(d)) => setup_tracks(c, d, listen_sel, talk_sel).await?,
+            _ => (String::new(), None, None),
+        };
 
         // PLAY the aggregate control URL — only when a track was
-        // SETUP'd; a pure-VIGI talk session owns no RTSP session.
+        // SETUP'd; a pure private-protocol session owns no RTSP
+        // session.
         let mut keepalive = DEFAULT_SESSION_TIMEOUT;
-        if listen.is_some() || talk.is_some() {
-            let session_hdr = ("Session", session_id.as_str());
-            let require_hdr = ("Require", REQUIRE);
-            let mut extra = vec![session_hdr];
-            if described.tagged {
-                extra.push(require_hdr);
+        if let (Some(c), Some(d)) = (&client, &described) {
+            if listen.is_some() || talk.is_some() {
+                let session_hdr = ("Session", session_id.as_str());
+                let require_hdr = ("Require", REQUIRE);
+                let mut extra = vec![session_hdr];
+                if d.tagged {
+                    extra.push(require_hdr);
+                }
+                let resp = timed(c.request("PLAY", &d.sdp.control, &extra)).await?;
+                if resp.status == 429 {
+                    release(c, &d.sdp.control, &session_id).await;
+                    return Err(Error::StreamLimit);
+                }
+                if resp.status / 100 != 2 {
+                    release(c, &d.sdp.control, &session_id).await;
+                    return Err(Error::Protocol(format!("PLAY status {}", resp.status)));
+                }
+                keepalive = session_timeout(&resp);
             }
-            let resp = timed(client.request("PLAY", &described.sdp.control, &extra)).await?;
-            if resp.status == 429 {
-                release(&client, &described.sdp.control, &session_id).await;
-                return Err(Error::StreamLimit);
-            }
-            if resp.status / 100 != 2 {
-                release(&client, &described.sdp.control, &session_id).await;
-                return Err(Error::Protocol(format!("PLAY status {}", resp.status)));
-            }
-            keepalive = session_timeout(&resp);
         }
 
         // V266 — capability faults learned on the alternate URL
@@ -199,15 +279,22 @@ impl RtspAudioClient {
             }
         }
 
+        let (control, tagged) =
+            described.map_or((String::new(), false), |d| (d.sdp.control, d.tagged));
         Ok(RtspSession::start(
             client,
             session_id,
-            described.sdp.control,
-            described.tagged,
+            control,
+            tagged,
             keepalive,
             listen,
             talk,
             vigi_claim,
+            v380_claim.map(|claim| ComposedV380 {
+                claim,
+                serves_listen: v380_serves_listen,
+                serves_talk: v380_serves_talk,
+            }),
             media_rx,
             marks,
         ))
@@ -444,11 +531,12 @@ struct ListenState {
     rx: Mutex<broadcast::Receiver<PcmChunk>>,
 }
 
-/// Where the pacer writes talk media — RTSP interleaved or the
-/// VIGI `:8800` multipart writer (V259 composition).
+/// Where the pacer writes talk media — RTSP interleaved or a
+/// lazily-claimed private-protocol talker (V259 VIGI / V282 V380).
 enum TalkOut {
     Rtsp { ch: u8, pt: u8 },
     Vigi(Box<LazyVigi>),
+    V380(Box<LazyV380>),
 }
 
 /// Credentials for a per-hold `:8800` claim (V275).
@@ -488,28 +576,287 @@ impl LazyVigi {
     }
 }
 
+/// One installed V380 talk conn + its send-side state — the
+/// IMA accumulation and block sequence live per-claim, so a
+/// fresh claim starts a clean predictor (V282).
+struct V380Talker {
+    conn: crate::v380::V380Conn,
+    /// PCM waiting for a full 505-sample block.
+    pending: Vec<i16>,
+    /// `180` seq byte — wraps.
+    seq: u8,
+    enc: crate::v380::ImaEncoder,
+}
+
+/// Lazily-claimed V380 `:8800` talker — same shape as `LazyVigi`:
+/// a fresh `1167` login + `377` per hold, released on mic-up.
+struct LazyV380 {
+    slot: Mutex<Option<V380Talker>>,
+    claim: V380Claim,
+    claiming: std::sync::atomic::AtomicBool,
+    claim_lock: Mutex<()>,
+    claim_gen: std::sync::atomic::AtomicU64,
+    dead_tx: watch::Sender<u64>,
+}
+
+impl LazyV380 {
+    fn new(claim: V380Claim) -> Self {
+        Self {
+            slot: Mutex::new(None),
+            claim,
+            claiming: std::sync::atomic::AtomicBool::new(false),
+            claim_lock: Mutex::new(()),
+            claim_gen: std::sync::atomic::AtomicU64::new(0),
+            dead_tx: watch::channel(0).0,
+        }
+    }
+
+    /// Fresh-conn claim — `1167` login then `377` talk-open with
+    /// the new ticket (V282). `Ok(conn)` = `477`+`1001`.
+    async fn claim(claim: &V380Claim) -> Result<crate::v380::V380Conn, Error> {
+        let mut conn = crate::v380::V380Conn::connect(&claim.host).await?;
+        let resp = conn
+            .login(claim.device_id, &claim.user, &claim.pass)
+            .await?;
+        if resp.result != crate::v380::login_result::OK {
+            return Err(Error::Protocol(format!(
+                "v380 claim login ({})",
+                resp.result
+            )));
+        }
+        let result = conn
+            .talk_open(claim.device_id, resp.ticket, claim.channel)
+            .await?;
+        if result != crate::v380::login_result::OK {
+            // ∀ non-`1001` `477` = an availability event (V282) —
+            // `Busy`, ⊥ capability evidence.
+            return Err(Error::Protocol(format!("v380 talk-open ({result})")));
+        }
+        Ok(conn)
+    }
+}
+
+/// VIGI `:8800` probe outcome — distinct so the V380 arm can
+/// tell a complete `Refused` verdict (whose talk-mark upgrade
+/// persists) from an unanswered dialect question (V278).
+enum VigiOut {
+    /// Gated out — `want_talk` false ∨ a talk track negotiated.
+    NotProbed,
+    /// `Ready` ∨ `Busy` — VIGI dialect proven; claim descriptor.
+    Served(VigiClaim),
+    /// Complete refusal — the talk mark upgraded to `Capability`.
+    Refused,
+    /// Transport/gate-fail — the dialect question went unanswered.
+    Unreachable,
+}
+
 /// VIGI `:8800` capability probe (V259/V275) — `Ready` ∨ `Busy`
 /// proves the protocol and yields a lazy-claim descriptor;
 /// `Refused` upgrades the talk mark to capability; `Unreachable`
 /// leaves the class untouched.
-async fn probe_vigi(url: &url::Url, marks: &mut Vec<(Direction, FaultClass)>) -> Option<VigiClaim> {
-    let host = url.host_str()?.to_owned();
+async fn probe_vigi(url: &url::Url, marks: &mut Vec<(Direction, FaultClass)>) -> VigiOut {
+    let Some(host) = url.host_str().map(str::to_owned) else {
+        return VigiOut::Unreachable;
+    };
     let user = url.username().to_owned();
     let pass = url.password().unwrap_or("").to_owned();
     match crate::vigi::VigiTalk::connect(&host, &user, &pass).await {
         crate::vigi::VigiProbe::Ready(_) | crate::vigi::VigiProbe::Busy => {
             marks.retain(|(d, _)| *d != Direction::Talk);
-            Some(VigiClaim { host, user, pass })
+            VigiOut::Served(VigiClaim { host, user, pass })
         }
-        crate::vigi::VigiProbe::Unreachable => None,
+        crate::vigi::VigiProbe::Unreachable => VigiOut::Unreachable,
         crate::vigi::VigiProbe::Refused => {
             for (d, c) in marks.iter_mut() {
                 if *d == Direction::Talk {
                     *c = FaultClass::Capability;
                 }
             }
-            None
+            VigiOut::Refused
         }
+    }
+}
+
+/// Credentials for every lazily-claimed V380 conn (V281 — each
+/// conn self-authenticates with a fresh `1167`; ⊥ cross-conn
+/// ticket reuse). Resolved once at open from config + oracle.
+#[derive(Clone)]
+struct V380Claim {
+    host: String,
+    device_id: u32,
+    user: String,
+    pass: String,
+    /// `chNN` index from the monitor's RTSP path, oracle-clamped.
+    channel: u32,
+}
+
+/// A V380 dialect proven at open — the claim descriptor the lazy
+/// talker (V282) and the attach-claimed stream conn (V283)
+/// re-authenticate with; `serves_*` = the login's caps oracle.
+#[allow(dead_code)] // `serves_*` + reuse lands with the listen claim.
+struct ComposedV380 {
+    claim: V380Claim,
+    serves_listen: bool,
+    serves_talk: bool,
+}
+
+/// The V380 `1167` probe's disposition (V280).
+enum V380Out {
+    /// `1001` + `version<31` — the caps oracle answered.
+    Served(Box<V380Served>),
+    /// `1001` + `version≥31` — dialect proven, AES-media
+    /// unavailable; session marks carry the verdict.
+    Dialect31,
+    /// `1168` seen ∧ creds exhausted (`1011`/`1012`/`1018`) ∨ an
+    /// unknown `loginResult` — a real verdict, ⊥ marks.
+    Creds(String),
+    /// ⊥ `1168` — dial fault, silence, garbage head, derive
+    /// fault, budget exhaustion: the dialect went unanswered.
+    Unanswered,
+    /// Empty creds — the V246 skip posture (⊥ an evaluated
+    /// outcome: marks keep their class).
+    Skipped,
+}
+
+/// `1001` payload the session composes on.
+struct V380Served {
+    claim: V380Claim,
+    /// `nAudioPri>0` — mic-listen capable.
+    n_audio_pri: bool,
+    /// `nSpeaker>0` — talk capable.
+    n_speaker: bool,
+}
+
+/// V380 dialect probe (V278/V279) — deviceId resolve (config
+/// override → ONVIF-serial derive ≤3 s), ≤3 username candidates
+/// on fresh conns, all inside `deadline`. Any `1168` proves
+/// dialect ∀ `loginResult`; ⊥ `1168` is `Unanswered`.
+async fn probe_v380(
+    url: &url::Url,
+    cfg: &crate::service::V380Cfg,
+    deadline: tokio::time::Instant,
+) -> V380Out {
+    use crate::v380::login_result as lr;
+    let Some(host) = url.host_str().map(str::to_owned) else {
+        return V380Out::Unanswered;
+    };
+    let rtsp_user = url.username();
+    let rtsp_pass = url.password().unwrap_or("");
+    // V246 empty-creds posture — nothing to authenticate with.
+    if rtsp_user.is_empty() && rtsp_pass.is_empty() && cfg.user.is_none() {
+        return V380Out::Skipped;
+    }
+    let remaining = |min: Duration| {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        (left > min).then_some(left)
+    };
+    // deviceId — configured override wins; else the ONVIF-serial
+    // derivation, bounded ≤3 s (V279).
+    let device_id = if let Some(id) = cfg.device_id {
+        id
+    } else {
+        let Some(xaddr) = crate::v380::derive_xaddr(url.as_str(), &cfg.onvif_addr) else {
+            return V380Out::Unanswered;
+        };
+        let Some(bound) = remaining(Duration::ZERO).map(|d| d.min(Duration::from_secs(3))) else {
+            return V380Out::Unanswered;
+        };
+        let soap = onvif::SoapClient::new();
+        let creds = (!rtsp_user.is_empty()).then_some((rtsp_user, rtsp_pass));
+        let Some(id) = crate::v380::derive_device_id(&soap, &xaddr, creds, bound).await else {
+            return V380Out::Unanswered;
+        };
+        id
+    };
+    let channel = crate::v380::channel_from_path(url.path());
+    let users = crate::v380::username_candidates(cfg.user.as_deref(), rtsp_user);
+    let Some(bound) = remaining(Duration::from_millis(500)) else {
+        return V380Out::Unanswered; // mid-arm budget exhaustion
+    };
+    let Ok(Ok((_conn, user, resp))) = tokio::time::timeout(
+        bound,
+        crate::v380::V380Conn::login_viable(&host, device_id, &users, rtsp_pass),
+    )
+    .await
+    else {
+        return V380Out::Unanswered;
+    };
+    match resp.result {
+        lr::OK if resp.version >= 31 => V380Out::Dialect31,
+        lr::OK => {
+            // A parsed index ≥ `nChannels` clamps to 0 (V279).
+            let channel = if resp.n_channels > 0 && channel >= u32::from(resp.n_channels) {
+                0
+            } else {
+                channel
+            };
+            V380Out::Served(Box::new(V380Served {
+                claim: V380Claim {
+                    host,
+                    device_id,
+                    user,
+                    pass: rtsp_pass.to_owned(),
+                    channel,
+                },
+                n_audio_pri: resp.n_audio_pri > 0,
+                n_speaker: resp.n_speaker > 0,
+            }))
+        }
+        r => V380Out::Creds(format!("v380 login refused ({r})")),
+    }
+}
+
+/// Apply the probe disposition to `marks` (V280/V281) — returns
+/// `(serves_listen, serves_talk, composes, claim)`:
+/// - `Served`: a served direction's pending marks drop ∀ producer
+///   (the oracle outranks the absent-`m=audio` heuristic ∧ a
+///   `Refused` from a non-VIGI `:8800` service); a ⊥-served
+///   direction's mark mints `Session`-class only when nothing else
+///   covers it (⊥ marks a direction the session serves).
+/// - `Dialect31`: session-classed marks both directions, ⊥
+///   persisted (V280); the session still composes to carry them.
+/// - `Unanswered`: `select`-produced marks degrade to
+///   `Session`-class — the dialect question went unanswered; a
+///   mark minted by a COMPLETE verdict (the VIGI `Refused` class
+///   upgrade) keeps its class + persistence (V278).
+/// - `Creds`/`Skipped`: marks untouched.
+fn apply_v380(
+    v380: &V380Out,
+    vigi: &VigiOut,
+    listen_uncovered: bool,
+    talk_uncovered: bool,
+    marks: &mut Vec<(Direction, FaultClass)>,
+) -> (bool, bool, bool, Option<V380Claim>) {
+    match v380 {
+        V380Out::Served(p) => {
+            for (dir, served, uncovered) in [
+                (Direction::Listen, p.n_audio_pri, listen_uncovered),
+                (Direction::Talk, p.n_speaker, talk_uncovered),
+            ] {
+                marks.retain(|(d, _)| *d != dir);
+                if !served && uncovered {
+                    marks.push((dir, FaultClass::Session));
+                }
+            }
+            (p.n_audio_pri, p.n_speaker, true, Some(p.claim.clone()))
+        }
+        V380Out::Dialect31 => {
+            for dir in [Direction::Listen, Direction::Talk] {
+                marks.retain(|(d, _)| *d != dir);
+                marks.push((dir, FaultClass::Session));
+            }
+            (false, false, true, None)
+        }
+        V380Out::Unanswered => {
+            let verdict_dir = matches!(vigi, VigiOut::Refused).then_some(Direction::Talk);
+            for (d, c) in &mut *marks {
+                if Some(*d) != verdict_dir {
+                    *c = FaultClass::Session;
+                }
+            }
+            (false, false, false, None)
+        }
+        V380Out::Creds(_) | V380Out::Skipped => (false, false, false, None),
     }
 }
 
@@ -524,7 +871,9 @@ struct TalkShared {
 
 /// A live audio session.
 pub struct RtspSession {
-    client: Arc<RtspClient>,
+    /// `None` on a pure private-protocol compose (fault arm ∨
+    /// selection-arm pure-V380 — the RTSP conn closed post-`select`).
+    client: Option<Arc<RtspClient>>,
     session_id: String,
     control: String,
     tagged: bool,
@@ -544,7 +893,7 @@ impl RtspSession {
     /// keepalive.
     #[allow(clippy::too_many_arguments)]
     fn start(
-        client: Arc<RtspClient>,
+        client: Option<Arc<RtspClient>>,
         session_id: String,
         control: String,
         tagged: bool,
@@ -552,20 +901,33 @@ impl RtspSession {
         listen: Option<Binding>,
         talk: Option<Binding>,
         vigi_claim: Option<VigiClaim>,
-        media_rx: mpsc::Receiver<Interleaved>,
+        v380: Option<ComposedV380>,
+        media_rx: Option<mpsc::Receiver<Interleaved>>,
         marks: Vec<(Direction, FaultClass)>,
     ) -> ArcAudioSession {
         let mut tasks = Vec::new();
         let (dead_tx, _) = watch::channel(false);
 
         // Listen pump — interleaved → RTP → seq-check → G.711 → PCM.
-        let listen_state = listen.map(|b| {
-            let (tx, rx) = broadcast::channel(PCM_BROADCAST);
-            let mut channels: HashMap<u8, (u8, sdp::Codec)> = HashMap::new();
-            channels.insert(b.channel, (b.pt, b.codec));
-            tasks.push(tokio::spawn(pump(media_rx, channels, tx, dead_tx.clone())));
-            ListenState { rx: Mutex::new(rx) }
-        });
+        // A V380-served listen allocates the broadcast at compose
+        // but parks unclaimed — `recv()` waits on it (⊥ EOS, V283);
+        // the stream-conn claim + pump land in T156.
+        let v380_listen = v380.as_ref().is_some_and(|v| v.serves_listen);
+        let listen_state = listen
+            .and_then(|b| media_rx.map(|rx| (b, rx)))
+            .map(|(b, media_rx)| {
+                let (tx, rx) = broadcast::channel(PCM_BROADCAST);
+                let mut channels: HashMap<u8, (u8, sdp::Codec)> = HashMap::new();
+                channels.insert(b.channel, (b.pt, b.codec));
+                tasks.push(tokio::spawn(pump(media_rx, channels, tx, dead_tx.clone())));
+                ListenState { rx: Mutex::new(rx) }
+            })
+            .or_else(|| {
+                v380_listen.then(|| {
+                    let (_tx, rx) = broadcast::channel(PCM_BROADCAST);
+                    ListenState { rx: Mutex::new(rx) }
+                })
+            });
 
         // Talk pacer — 20 ms ticks, one ≤160-sample frame per tick.
         let talk_state = talk
@@ -580,6 +942,14 @@ impl RtspSession {
             })
             .or_else(|| {
                 vigi_claim.map(|c| (sdp::Codec::Pcma, TalkOut::Vigi(Box::new(LazyVigi::new(c)))))
+            })
+            .or_else(|| {
+                v380.filter(|v| v.serves_talk).map(|v| {
+                    (
+                        sdp::Codec::Pcma,
+                        TalkOut::V380(Box::new(LazyV380::new(v.claim))),
+                    )
+                })
             })
             .map(|(codec, out)| {
                 let t = Arc::new(TalkShared {
@@ -632,12 +1002,14 @@ impl RtspSession {
                     break;
                 }
                 let extra = [("Session", this.session_id.as_str())];
-                let ok = this
-                    .client
-                    .request("OPTIONS", &this.control, &extra)
-                    .await
-                    .map(|r| r.status / 100 == 2)
-                    .unwrap_or(false);
+                let ok = match &this.client {
+                    Some(c) => c
+                        .request("OPTIONS", &this.control, &extra)
+                        .await
+                        .map(|r| r.status / 100 == 2)
+                        .unwrap_or(false),
+                    None => false,
+                };
                 if !ok {
                     // Socket fault ∨ non-2xx (`429`/`454`) — the
                     // camera dropped the session; teardown follows.
@@ -683,18 +1055,18 @@ async fn pump(
 /// Talk pacer — emits at most one ≤160-sample RTP frame per 20 ms
 /// tick; queue underruns skip the tick (drop-oldest happens at the
 /// push side). >160-sample chunks re-queue the remainder.
-async fn pacer(client: Arc<RtspClient>, state: Arc<TalkShared>) {
+async fn pacer(client: Option<Arc<RtspClient>>, state: Arc<TalkShared>) {
     let mut tick = tokio::time::interval(Duration::from_millis(20));
     let mut seq: u16 = rand::random();
     let mut ts: u32 = rand::random();
     let ssrc: u32 = rand::random();
     loop {
         tick.tick().await;
-        // VIGI arm — the talker is claimed per hold (V275): ⊥ pop
-        // while unclaimed, the send rides the claim-slot lock (a
-        // release can't interleave mid-send), a send fault is
-        // claim-scoped (drop the talker + signal the generation —
-        // the SESSION survives).
+        // Lazy-claim arms — the talker is claimed per hold (V275
+        // VIGI / V282 V380): ⊥ pop while unclaimed, the send rides
+        // the claim-slot lock (a release can't interleave mid-send),
+        // a send fault is claim-scoped (drop the talker + signal the
+        // generation — the SESSION survives).
         if let TalkOut::Vigi(lazy) = &state.out {
             let mut slot = lazy.slot.lock().await;
             let Some(talker) = slot.as_mut() else {
@@ -721,6 +1093,38 @@ async fn pacer(client: Arc<RtspClient>, state: Arc<TalkShared>) {
             ts = ts.wrapping_add(u32::try_from(chunk.len()).unwrap_or(0));
             continue;
         }
+        if let TalkOut::V380(lazy) = &state.out {
+            // V380 arm (V282) — PCM accumulates into 505-sample
+            // blocks ⇒ IMA-ADPCM ⇒ `180` frames; the 20 ms tick +
+            // block gate lands sends ~63 ms apart in realtime.
+            let mut slot = lazy.slot.lock().await;
+            let Some(t) = slot.as_mut() else {
+                drop(slot);
+                continue;
+            };
+            {
+                let mut q = state.queue.lock().await;
+                while t.pending.len() < crate::v380::IMA_BLOCK_SAMPLES {
+                    let Some(mut c) = q.pop_front() else { break };
+                    t.pending.append(&mut c);
+                }
+            }
+            if t.pending.len() < crate::v380::IMA_BLOCK_SAMPLES {
+                drop(slot);
+                continue;
+            }
+            let block: Vec<i16> = t.pending.drain(..crate::v380::IMA_BLOCK_SAMPLES).collect();
+            let enc = t.enc.encode_block(&block);
+            let seq = t.seq;
+            t.seq = t.seq.wrapping_add(1);
+            let claim_gen = lazy.claim_gen.load(Ordering::Relaxed);
+            if t.conn.send_talk_block(&enc, seq).await.is_err() {
+                *slot = None;
+                drop(slot);
+                _ = lazy.dead_tx.send(claim_gen);
+            }
+            continue;
+        }
         let mut q = state.queue.lock().await;
         let Some(mut chunk) = q.pop_front() else {
             drop(q);
@@ -732,14 +1136,16 @@ async fn pacer(client: Arc<RtspClient>, state: Arc<TalkShared>) {
         }
         drop(q);
         let sent = match &state.out {
-            TalkOut::Rtsp { ch, pt } => {
-                let payload = g711::encode(state.codec, &chunk);
-                client
-                    .send_interleaved(*ch, &rtp::build(*pt, seq, ts, ssrc, &payload))
-                    .await
-                    .is_ok()
-            }
-            TalkOut::Vigi(_) => unreachable!("vigi arm handled above"),
+            TalkOut::Rtsp { ch, pt } => match &client {
+                Some(c) => {
+                    let payload = g711::encode(state.codec, &chunk);
+                    c.send_interleaved(*ch, &rtp::build(*pt, seq, ts, ssrc, &payload))
+                        .await
+                        .is_ok()
+                }
+                None => false,
+            },
+            TalkOut::Vigi(_) | TalkOut::V380(_) => unreachable!("lazy arms handled above"),
         };
         if !sent {
             _ = state.dead_tx.send(true);
@@ -775,13 +1181,19 @@ impl AudioSession for RtspSession {
         let Some(t) = &self.talk else {
             return Err(Error::Unsupported(Direction::Talk));
         };
-        // V275 — an unclaimed VIGI talker ⊥ claim-in-flight errors;
-        // frames buffer through an in-flight claim.
-        if let TalkOut::Vigi(lazy) = &t.out {
-            let unclaimed = lazy.slot.lock().await.is_none();
-            if unclaimed && !lazy.claiming.load(Ordering::Relaxed) {
-                return Err(Error::Protocol("vigi talker unclaimed".into()));
+        // V275/V282 — an unclaimed lazy talker ⊥ claim-in-flight
+        // errors; frames buffer through an in-flight claim.
+        let unclaimed = match &t.out {
+            TalkOut::Vigi(l) => {
+                l.slot.lock().await.is_none() && !l.claiming.load(Ordering::Relaxed)
             }
+            TalkOut::V380(l) => {
+                l.slot.lock().await.is_none() && !l.claiming.load(Ordering::Relaxed)
+            }
+            TalkOut::Rtsp { .. } => false,
+        };
+        if unclaimed {
+            return Err(Error::Protocol("talker unclaimed".into()));
         }
         let mut q = t.queue.lock().await;
         while q.len() >= TALK_QUEUE {
@@ -808,12 +1220,16 @@ impl AudioSession for RtspSession {
             } else {
                 vec![("Session", &self.session_id)]
             };
-            let _ = self.client.request("TEARDOWN", &self.control, &extra).await;
+            if let Some(c) = &self.client {
+                let _ = c.request("TEARDOWN", &self.control, &extra).await;
+            }
         }
         for task in self.tasks.lock().await.drain(..) {
             task.abort();
         }
-        self.client.close();
+        if let Some(c) = &self.client {
+            c.close();
+        }
         // ACTIVE close of a held `:8800` talker (V275/B122 — the
         // device slot must free, ⊥ Arc-drop reliance).
         self.drop_talker().await;
@@ -824,19 +1240,52 @@ impl AudioSession for RtspSession {
     }
 
     fn talk_dead_rx(&self) -> Option<watch::Receiver<u64>> {
-        let TalkOut::Vigi(lazy) = &self.talk.as_ref()?.out else {
-            return None;
-        };
-        Some(lazy.dead_tx.subscribe())
+        match &self.talk.as_ref()?.out {
+            TalkOut::Vigi(l) => Some(l.dead_tx.subscribe()),
+            TalkOut::V380(l) => Some(l.dead_tx.subscribe()),
+            TalkOut::Rtsp { .. } => None,
+        }
     }
 
     fn claims_lazily(&self) -> bool {
-        matches!(self.talk.as_ref().map(|t| &t.out), Some(TalkOut::Vigi(_)))
+        matches!(
+            self.talk.as_ref().map(|t| &t.out),
+            Some(TalkOut::Vigi(_) | TalkOut::V380(_))
+        )
     }
 
-    /// V275 claim — connect OUTSIDE locks, install under the
+    /// V275/V282 claim — connect OUTSIDE locks, install under the
     /// claim-slot lock, single-flight via `claim_lock`.
     async fn claim_talk(&self) -> TalkClaim {
+        if let Some(lazy) = self.lazy_v380() {
+            let _one = lazy.claim_lock.lock().await;
+            if lazy.slot.lock().await.is_some() {
+                return TalkClaim::Ready;
+            }
+            lazy.claiming.store(true, Ordering::Relaxed);
+            let claim = LazyV380::claim(&lazy.claim).await;
+            lazy.claiming.store(false, Ordering::Relaxed);
+            return match claim {
+                Ok(conn) => {
+                    if self.dead() {
+                        return TalkClaim::Unreachable;
+                    }
+                    *lazy.slot.lock().await = Some(V380Talker {
+                        conn,
+                        pending: Vec::with_capacity(crate::v380::IMA_BLOCK_SAMPLES),
+                        seq: 0,
+                        enc: crate::v380::ImaEncoder::new(),
+                    });
+                    lazy.claim_gen.fetch_add(1, Ordering::Relaxed);
+                    TalkClaim::Ready
+                }
+                // ∀ non-`1001` `477`/login result = availability, ⊥
+                // capability evidence (V282 — asymmetric w/ VIGI's
+                // `Refused`-marks deliberately).
+                Err(Error::Protocol(_)) => TalkClaim::Busy,
+                Err(_) => TalkClaim::Unreachable,
+            };
+        }
         let Some(lazy) = self.lazy_vigi() else {
             return TalkClaim::Ready;
         };
@@ -873,6 +1322,9 @@ impl AudioSession for RtspSession {
     }
 
     fn talk_gen(&self) -> u64 {
+        if let Some(l) = self.lazy_v380() {
+            return l.claim_gen.load(Ordering::Relaxed);
+        }
         self.lazy_vigi()
             .map_or(0, |l| l.claim_gen.load(Ordering::Relaxed))
     }
@@ -891,11 +1343,23 @@ impl RtspSession {
         }
     }
 
+    /// The lazy V380 slot, when this session carries one.
+    fn lazy_v380(&self) -> Option<&LazyV380> {
+        match self.talk.as_ref().map(|t| &t.out) {
+            Some(TalkOut::V380(lazy)) => Some(lazy),
+            _ => None,
+        }
+    }
+
     /// Drop the installed `:8800` talker — TCP close frees the
     /// device-side single-talker slot (R63).
     async fn drop_talker(&self) {
-        let Some(lazy) = self.lazy_vigi() else { return };
-        lazy.slot.lock().await.take();
+        if let Some(l) = self.lazy_vigi() {
+            l.slot.lock().await.take();
+        }
+        if let Some(l) = self.lazy_v380() {
+            l.slot.lock().await.take();
+        }
     }
 }
 
@@ -905,9 +1369,9 @@ mod tests {
     use super::*;
     use crate::{Codec, Direction};
 
-    /// Serializes tests that can hit the fixed VIGI `:8800` port —
+    /// Serializes tests that can hit the fixed `:8800` port —
     /// a bound stub would answer *any* test's probe.
-    static VIGI_PORT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    static PORT_8800: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     use pretty_assertions::assert_eq;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -1034,6 +1498,15 @@ mod tests {
             got,
             _task: h,
         }
+    }
+
+    fn no_cfg() -> crate::service::CfgAccessor {
+        std::sync::Arc::new(|| {
+            let f: std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::service::V380Cfg> + Send>,
+            > = Box::pin(async { crate::service::V380Cfg::default() });
+            f
+        })
     }
 
     fn url(port: u16) -> url::Url {
@@ -1173,7 +1646,7 @@ mod tests {
     #[tokio::test]
     async fn open_duplex_negotiates_backchannel() {
         let mut st = stub(DUPLEX_SDP).await;
-        let client = RtspAudioClient::new(url(st.port), None);
+        let client = RtspAudioClient::new(url(st.port), None, no_cfg());
         let sess = client.open(true).await.unwrap();
         assert_eq!(
             sess.caps(),
@@ -1208,7 +1681,7 @@ mod tests {
         const RECV_SDP: &str =
             "v=0\r\nm=audio 0 RTP/AVP 8\r\na=recvonly\r\na=control:trackID=1\r\n";
         let mut st = stub(RECV_SDP).await;
-        let client = RtspAudioClient::new(url(st.port), None);
+        let client = RtspAudioClient::new(url(st.port), None, no_cfg());
         let sess = client.open(false).await.unwrap();
         assert_eq!(
             sess.caps(),
@@ -1232,9 +1705,9 @@ mod tests {
         // for the untagged session, not re-described (B118).
         const RECV_SDP: &str =
             "v=0\r\nm=audio 0 RTP/AVP 8\r\na=recvonly\r\na=control:trackID=1\r\n";
-        let _port_guard = VIGI_PORT.lock().await;
+        let _port_guard = PORT_8800.lock().await;
         let mut st = stub(RECV_SDP).await;
-        let client = RtspAudioClient::new(url(st.port), None);
+        let client = RtspAudioClient::new(url(st.port), None, no_cfg());
         let sess = client.open(true).await.unwrap();
         assert_eq!(
             sess.caps(),
@@ -1281,7 +1754,7 @@ mod tests {
             10,
         )
         .await;
-        let client = RtspAudioClient::new(url(st.port), None);
+        let client = RtspAudioClient::new(url(st.port), None, no_cfg());
         let sess = client.open(true).await.unwrap();
         assert!(sess.caps().listen);
         sess.close().await;
@@ -1301,7 +1774,7 @@ mod tests {
     async fn live_open_smoke() {
         let u = std::env::var("RTSP_URL").unwrap();
         let parsed = url::Url::parse(&u).unwrap();
-        let client = RtspAudioClient::new(parsed, None);
+        let client = RtspAudioClient::new(parsed, None, no_cfg());
         let sess = client.open(true).await.unwrap();
         eprintln!("caps: {:?} marks: {:?}", sess.caps(), sess.marks());
         sess.close().await;
@@ -1312,7 +1785,7 @@ mod tests {
         const TALK_SDP: &str =
             "v=0\r\nm=audio 0 RTP/AVP 0\r\na=sendonly\r\na=control:trackID=9\r\n";
         let mut st = stub(TALK_SDP).await;
-        let client = RtspAudioClient::new(url(st.port), None);
+        let client = RtspAudioClient::new(url(st.port), None, no_cfg());
         let sess = client.open(true).await.unwrap();
         assert_eq!(
             sess.caps(),
@@ -1330,9 +1803,9 @@ mod tests {
     #[tokio::test]
     async fn inactive_only_sdp_opens_nothing() {
         const INACT: &str = "v=0\r\nm=audio 0 RTP/AVP 0\r\na=inactive\r\na=control:trackID=1\r\n";
-        let _port_guard = VIGI_PORT.lock().await;
+        let _port_guard = PORT_8800.lock().await;
         let st = stub(INACT).await;
-        let client = RtspAudioClient::new(url(st.port), None);
+        let client = RtspAudioClient::new(url(st.port), None, no_cfg());
         let Err(err) = client.open(true).await else {
             panic!("expected open failure")
         };
@@ -1389,7 +1862,7 @@ mod tests {
                 .unwrap();
             tokio::time::sleep(Duration::from_secs(2)).await;
         });
-        let client = RtspAudioClient::new(url(port), None);
+        let client = RtspAudioClient::new(url(port), None, no_cfg());
         let sess = client.open(false).await.unwrap();
         let first = sess.recv().await.unwrap();
         assert_eq!(first.len(), 4);
@@ -1465,7 +1938,7 @@ mod tests {
         const TALK_SDP: &str =
             "v=0\r\nm=audio 0 RTP/AVP 0\r\na=sendonly\r\na=control:trackID=9\r\n";
         let (port, mut got, task) = spawn_talk_stub(TALK_SDP);
-        let client = RtspAudioClient::new(url(port), None);
+        let client = RtspAudioClient::new(url(port), None, no_cfg());
         let sess = client.open(true).await.unwrap();
         sess.talk(&[1000_i16; 160]).await.unwrap();
         let f1 = tokio::time::timeout(Duration::from_secs(2), got.recv())
@@ -1497,7 +1970,7 @@ mod tests {
         const TALK_SDP: &str =
             "v=0\r\nm=audio 0 RTP/AVP 0\r\na=sendonly\r\na=control:trackID=9\r\n";
         let (port, mut got, task) = spawn_talk_stub(TALK_SDP);
-        let client = RtspAudioClient::new(url(port), None);
+        let client = RtspAudioClient::new(url(port), None, no_cfg());
         let sess = client.open(true).await.unwrap();
         for _ in 0..13 {
             sess.talk(&[7_i16; 160]).await.unwrap();
@@ -1518,7 +1991,7 @@ mod tests {
         const RECV_SDP: &str =
             "v=0\r\nm=audio 0 RTP/AVP 8\r\na=recvonly\r\na=control:trackID=1\r\n";
         let mut st = stub(RECV_SDP).await;
-        let client = RtspAudioClient::new(url(st.port), None);
+        let client = RtspAudioClient::new(url(st.port), None, no_cfg());
         let sess = client.open(false).await.unwrap();
         let Err(err) = sess.talk(&[0; 160]).await else {
             panic!("expected talk failure")
@@ -1533,7 +2006,7 @@ mod tests {
         const RECV_SDP: &str =
             "v=0\r\nm=audio 0 RTP/AVP 8\r\na=recvonly\r\na=control:trackID=1\r\n";
         let mut st = stub(RECV_SDP).await;
-        let client = RtspAudioClient::new(url(st.port), None);
+        let client = RtspAudioClient::new(url(st.port), None, no_cfg());
         let sess = client.open(false).await.unwrap();
         // Session timeout negotiated 60s → keepalive at 30s — too
         // long to observe; assert the plumbing only via OPTIONS
@@ -1555,7 +2028,7 @@ mod tests {
     async fn vigi_fallback_composes_duplex() {
         const RECV_SDP_V: &str =
             "v=0\r\nm=audio 0 RTP/AVP 8\r\na=recvonly\r\na=control:trackID=1\r\n";
-        let _port_guard = VIGI_PORT.lock().await;
+        let _port_guard = PORT_8800.lock().await;
         let Ok(lis8800) = TcpListener::bind("127.0.0.1:8800").await else {
             return; // port held — skip
         };
@@ -1602,7 +2075,7 @@ mod tests {
         });
 
         let mut st = stub(RECV_SDP_V).await;
-        let client = RtspAudioClient::new(url(st.port), None);
+        let client = RtspAudioClient::new(url(st.port), None, no_cfg());
         let sess = client.open(true).await.unwrap();
         assert_eq!(
             sess.caps(),
@@ -1652,12 +2125,12 @@ mod tests {
         let cfg_path = std::env::var("SS_LIVE_CFG")
             .unwrap_or_else(|_| "/tmp/ss-run/configs/monitors/6eqdc.json".into());
         let cfg = std::fs::read_to_string(cfg_path).expect("monitor config");
-        let main = serde_json::from_str::<serde_json::Value>(&cfg).unwrap()["sourcertsp"]
-            ["mainStream"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let client = RtspAudioClient::new(url::Url::parse(&main).unwrap(), None);
+        let main =
+            serde_json::from_str::<serde_json::Value>(&cfg).unwrap()["sourcertsp"]["mainStream"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+        let client = RtspAudioClient::new(url::Url::parse(&main).unwrap(), None, no_cfg());
         let sess = client.open(true).await.expect("open");
         assert!(sess.caps().talk, "{:?}", sess.caps());
         match sess.claim_talk().await {
@@ -1695,7 +2168,7 @@ mod tests {
         const RECV_SDP: &str =
             "v=0\r\nm=audio 0 RTP/AVP 8\r\na=recvonly\r\na=control:trackID=1\r\n";
         let mut st = stub(RECV_SDP).await;
-        let client = RtspAudioClient::new(url(st.port), None);
+        let client = RtspAudioClient::new(url(st.port), None, no_cfg());
         let sess = client.open(false).await.unwrap();
         sess.close().await;
         let mut saw_teardown = false;
@@ -1712,7 +2185,7 @@ mod tests {
     async fn play_429_retries_alternate() {
         let mut primary = stub_429("PLAY", DUPLEX_SDP).await;
         let mut alt = stub_scripted(|_| "200 OK", DUPLEX_SDP, 60).await;
-        let client = RtspAudioClient::new(url(primary.port), Some(url(alt.port)));
+        let client = RtspAudioClient::new(url(primary.port), Some(url(alt.port)), no_cfg());
         let sess = client.open(true).await.unwrap();
         assert_eq!(
             sess.caps(),
@@ -1739,7 +2212,7 @@ mod tests {
     async fn describe_429_retries_alternate() {
         let mut primary = stub_429("DESCRIBE", DUPLEX_SDP).await;
         let alt = stub_scripted(|_| "200 OK", DUPLEX_SDP, 60).await;
-        let client = RtspAudioClient::new(url(primary.port), Some(url(alt.port)));
+        let client = RtspAudioClient::new(url(primary.port), Some(url(alt.port)), no_cfg());
         let sess = client.open(false).await.unwrap();
         assert!(sess.caps().listen);
         sess.close().await;
@@ -1752,7 +2225,7 @@ mod tests {
     async fn options_429_retries_alternate() {
         let mut primary = stub_429("OPTIONS", DUPLEX_SDP).await;
         let alt = stub_scripted(|_| "200 OK", DUPLEX_SDP, 60).await;
-        let client = RtspAudioClient::new(url(primary.port), Some(url(alt.port)));
+        let client = RtspAudioClient::new(url(primary.port), Some(url(alt.port)), no_cfg());
         let sess = client.open(false).await.unwrap();
         assert!(sess.caps().listen);
         sess.close().await;
@@ -1767,7 +2240,7 @@ mod tests {
     async fn setup_429_retries_alternate() {
         let primary = stub_429("SETUP", DUPLEX_SDP).await;
         let mut alt = stub_scripted(|_| "200 OK", DUPLEX_SDP, 60).await;
-        let client = RtspAudioClient::new(url(primary.port), Some(url(alt.port)));
+        let client = RtspAudioClient::new(url(primary.port), Some(url(alt.port)), no_cfg());
         let sess = client.open(false).await.unwrap();
         assert!(sess.caps().listen);
         sess.close().await;
@@ -1780,9 +2253,9 @@ mod tests {
 
     #[tokio::test]
     async fn play_429_without_alternate_is_stream_limit() {
-        let _g = VIGI_PORT.lock().await;
+        let _g = PORT_8800.lock().await;
         let mut primary = stub_429("PLAY", DUPLEX_SDP).await;
-        let client = RtspAudioClient::new(url(primary.port), None);
+        let client = RtspAudioClient::new(url(primary.port), None, no_cfg());
         let Err(err) = client.open(false).await else {
             panic!("expected StreamLimit");
         };
@@ -1796,10 +2269,10 @@ mod tests {
 
     #[tokio::test]
     async fn both_urls_429_propagates_stream_limit() {
-        let _g = VIGI_PORT.lock().await;
+        let _g = PORT_8800.lock().await;
         let primary = stub_429("PLAY", DUPLEX_SDP).await;
         let alt = stub_429("PLAY", DUPLEX_SDP).await;
-        let client = RtspAudioClient::new(url(primary.port), Some(url(alt.port)));
+        let client = RtspAudioClient::new(url(primary.port), Some(url(alt.port)), no_cfg());
         let Err(err) = client.open(false).await else {
             panic!("expected StreamLimit");
         };
@@ -1808,7 +2281,7 @@ mod tests {
 
     #[tokio::test]
     async fn same_endpoint_alternate_not_retried() {
-        let _g = VIGI_PORT.lock().await;
+        let _g = PORT_8800.lock().await;
         let mut primary = stub_429("PLAY", DUPLEX_SDP).await;
         // Same endpoint, different userinfo → deduped at construction.
         let creds = url::Url::parse(&format!(
@@ -1816,7 +2289,7 @@ mod tests {
             primary.port
         ))
         .unwrap();
-        let client = RtspAudioClient::new(url(primary.port), Some(creds));
+        let client = RtspAudioClient::new(url(primary.port), Some(creds), no_cfg());
         let Err(err) = client.open(false).await else {
             panic!("expected StreamLimit");
         };
@@ -1838,12 +2311,12 @@ mod tests {
 
     #[tokio::test]
     async fn alternate_capability_marks_stay_session_only() {
-        let _g = VIGI_PORT.lock().await;
+        let _g = PORT_8800.lock().await;
         let primary = stub_429("PLAY", DUPLEX_SDP).await;
         // Alt SDP: sendonly AAC → talk capability mark (codec-less);
         // 127.0.0.1:8800 refused → mark survives, downgraded alt-side.
         let mut alt = stub_scripted(|_| "200 OK", ALT_AAC_TALK_SDP, 60).await;
-        let client = RtspAudioClient::new(url(primary.port), Some(url(alt.port)));
+        let client = RtspAudioClient::new(url(primary.port), Some(url(alt.port)), no_cfg());
         let sess = client.open(true).await.unwrap();
         assert_eq!(
             sess.caps(),
@@ -1865,7 +2338,7 @@ mod tests {
 
     #[tokio::test]
     async fn keepalive_non_2xx_kills_session() {
-        let _g = VIGI_PORT.lock().await;
+        let _g = PORT_8800.lock().await;
         // First OPTIONS answers the handshake probe; later ones 500.
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let c = count.clone();
@@ -1883,12 +2356,481 @@ mod tests {
             2,
         )
         .await;
-        let client = RtspAudioClient::new(url(st.port), None);
+        let client = RtspAudioClient::new(url(st.port), None, no_cfg());
         let sess = client.open(false).await.unwrap();
         tokio::time::timeout(Duration::from_secs(10), sess.wait_dead())
             .await
             .expect("session must die on keepalive 500");
         sess.close().await;
         let _ = &mut st;
+    }
+
+    // ── V380 fallback (V278–V281) ────────────────────────────────
+
+    /// `1168` reply bytes — fields per `parse_login_resp`.
+    fn v380_reply(result: i32, version: u8, n_audio_pri: u8, n_speaker: u8) -> Vec<u8> {
+        let mut b = vec![0_u8; 68];
+        b[0..4].copy_from_slice(&1168_u32.to_le_bytes());
+        b[4..8].copy_from_slice(&result.to_le_bytes());
+        b[12] = version;
+        b[13..17].copy_from_slice(&0x1234_u32.to_le_bytes()); // ticket
+        b[63] = 1; // nChannels
+        b[64] = n_audio_pri;
+        b[66] = n_speaker;
+        b
+    }
+
+    struct V380Stub {
+        conns: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    /// `:8800` stub — each accepted conn reads the 256 B login,
+    /// replies `1168` with `results[conn_idx]` (clamped to last),
+    /// then stays open for any follow-up packets.
+    /// `garbage` replies a non-`1168` head instead.
+    async fn v380_stub(
+        results: &'static [i32],
+        version: u8,
+        audio_pri: u8,
+        speaker: u8,
+    ) -> Option<V380Stub> {
+        let lis = TcpListener::bind("127.0.0.1:8800").await.ok()?;
+        let conns = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let conns2 = conns.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = lis.accept().await else {
+                    return;
+                };
+                let idx =
+                    usize::try_from(conns2.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                        .unwrap_or_default();
+                tokio::spawn(async move {
+                    let (mut rd, mut wr) = stream.into_split();
+                    let mut pkt = [0_u8; 256];
+                    if rd.read_exact(&mut pkt).await.is_err() {
+                        return;
+                    }
+                    let result = results[idx.min(results.len() - 1)];
+                    let resp = v380_reply(result, version, audio_pri, speaker);
+                    if wr.write_all(&resp).await.is_err() {
+                        return;
+                    }
+                    let mut sink = vec![0_u8; 512];
+                    loop {
+                        if rd.read(&mut sink).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        Some(V380Stub { conns, _task: task })
+    }
+
+    fn v380_cfg() -> crate::service::CfgAccessor {
+        std::sync::Arc::new(|| {
+            let f: std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::service::V380Cfg> + Send>,
+            > = Box::pin(async {
+                crate::service::V380Cfg {
+                    device_id: Some(46_078_507),
+                    ..Default::default()
+                }
+            });
+            f
+        })
+    }
+
+    fn url_creds(port: u16) -> url::Url {
+        url::Url::parse(&format!("rtsp://admin:pass@127.0.0.1:{port}/live/ch00_0")).unwrap()
+    }
+
+    /// Video-only SDP — both audio directions uncovered.
+    const VIDEO_SDP: &str = "v=0\r\nm=video 0 RTP/AVP 96\r\na=control:trackID=0\r\n";
+    /// Listen-only SDP — talk uncovered.
+    const RECV_SDP_V380: &str =
+        "v=0\r\nm=audio 0 RTP/AVP 8\r\na=recvonly\r\na=control:trackID=1\r\n";
+    /// Talk-only SDP — listen uncovered.
+    const SEND_SDP_V380: &str =
+        "v=0\r\nm=audio 0 RTP/AVP 0\r\na=sendonly\r\na=control:trackID=9\r\n";
+
+    /// `1001`+caps ⇒ pure-V380 compose — both directions served,
+    /// select-minted marks dropped, RTSP conn closed post-select.
+    #[tokio::test]
+    async fn v380_1001_composes_pure_and_closes_rtsp() {
+        let _g = PORT_8800.lock().await;
+        let Some(v) = v380_stub(&[1001], 3, 1, 1).await else {
+            return;
+        };
+        let mut st = stub_scripted(|_| "200 OK", VIDEO_SDP, 60).await;
+        let client = RtspAudioClient::new(url_creds(st.port), None, v380_cfg());
+        let sess = client.open(true).await.unwrap();
+        assert_eq!(
+            sess.caps(),
+            AudioCaps {
+                listen: true,
+                talk: true
+            }
+        );
+        assert!(sess.marks().is_empty(), "{:?}", sess.marks());
+        assert!(sess.claims_lazily());
+        // Pure-V380 ⇒ the RTSP conn closed post-select (EOF marker).
+        let saw_eof = tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(m) = st.got.recv().await {
+                if m == "EOF" {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(saw_eof, "selection-arm pure-V380 must close the RTSP conn");
+        sess.close().await;
+        drop(v);
+    }
+
+    /// caps-zero oracle ⇒ session still composes, session-class
+    /// marks on both directions, deduped.
+    #[tokio::test]
+    async fn v380_caps_zero_composes_session_marks() {
+        let _g = PORT_8800.lock().await;
+        let Some(_v) = v380_stub(&[1001], 3, 0, 0).await else {
+            return;
+        };
+        let mut st = stub_scripted(|_| "200 OK", VIDEO_SDP, 60).await;
+        let client = RtspAudioClient::new(url_creds(st.port), None, v380_cfg());
+        let sess = client.open(true).await.unwrap();
+        assert_eq!(
+            sess.caps(),
+            AudioCaps {
+                listen: false,
+                talk: false
+            }
+        );
+        assert_eq!(
+            sess.marks(),
+            vec![
+                (Direction::Listen, FaultClass::Session),
+                (Direction::Talk, FaultClass::Session),
+            ]
+        );
+        let _ = &mut st;
+        sess.close().await;
+    }
+
+    /// `1001`+`version`≥31 ⇒ session marks both dirs, still `Ok`.
+    #[tokio::test]
+    async fn v380_version31_composes_session_marks() {
+        let _g = PORT_8800.lock().await;
+        let Some(_v) = v380_stub(&[1001], 31, 1, 1).await else {
+            return;
+        };
+        let mut st = stub_scripted(|_| "200 OK", VIDEO_SDP, 60).await;
+        let client = RtspAudioClient::new(url_creds(st.port), None, v380_cfg());
+        let sess = client.open(true).await.unwrap();
+        assert_eq!(
+            sess.caps(),
+            AudioCaps {
+                listen: false,
+                talk: false
+            }
+        );
+        assert!(
+            sess.marks().iter().all(|(_, c)| *c == FaultClass::Session),
+            "{:?}",
+            sess.marks()
+        );
+        let _ = &mut st;
+        sess.close().await;
+    }
+
+    /// Creds verdict non-fatal when a direction composed — the
+    /// negotiated listen survives a talk-arm `1018`.
+    #[tokio::test]
+    async fn v380_creds_fault_nonfatal_with_listen() {
+        let _g = PORT_8800.lock().await;
+        let Some(_v) = v380_stub(&[1018], 3, 1, 1).await else {
+            return;
+        };
+        let mut st = stub_scripted(|_| "200 OK", RECV_SDP_V380, 60).await;
+        let client = RtspAudioClient::new(url_creds(st.port), None, v380_cfg());
+        let sess = client.open(true).await.unwrap();
+        assert_eq!(
+            sess.caps(),
+            AudioCaps {
+                listen: true,
+                talk: false
+            }
+        );
+        let _ = &mut st;
+        sess.close().await;
+    }
+
+    /// Creds verdict fatal when nothing composed — the `1018`
+    /// message rides the open error.
+    #[tokio::test]
+    async fn v380_creds_fault_fatal_when_nothing_composed() {
+        let _g = PORT_8800.lock().await;
+        let Some(_v) = v380_stub(&[1018], 3, 1, 1).await else {
+            return;
+        };
+        let mut st = stub_scripted(|_| "200 OK", VIDEO_SDP, 60).await;
+        let client = RtspAudioClient::new(url_creds(st.port), None, v380_cfg());
+        let r = client.open(true).await;
+        let Err(err) = r else {
+            panic!("expected creds-fatal open fault")
+        };
+        assert!(format!("{err:?}").contains("1018"), "{err:?}");
+        let _ = &mut st;
+    }
+
+    /// ⊥-`1168` ⊥-V380 ⇒ `select`-minted marks degrade to
+    /// `Session`-class — the absent-`m=audio` `Capability` on an
+    /// unanswered dialect ⊥ persists.
+    #[tokio::test]
+    async fn v380_unanswered_downgrades_select_marks() {
+        let _g = PORT_8800.lock().await;
+        // ⊥ :8800 bound — the probe's dial faults.
+        let mut st = stub_scripted(|_| "200 OK", SEND_SDP_V380, 60).await;
+        let client = RtspAudioClient::new(url_creds(st.port), None, v380_cfg());
+        let sess = client.open(true).await.unwrap();
+        assert_eq!(
+            sess.caps(),
+            AudioCaps {
+                listen: false,
+                talk: true
+            }
+        );
+        assert_eq!(
+            sess.marks(),
+            vec![(Direction::Listen, FaultClass::Session)],
+            "{:?}",
+            sess.marks()
+        );
+        let _ = &mut st;
+        sess.close().await;
+    }
+
+    /// A VIGI `Refused` verdict mark keeps its `Capability` class
+    /// through a ⊥-`1168` V380 outcome — the downgrade covers
+    /// `select`-produced marks only.
+    #[tokio::test]
+    async fn v380_vigi_verdict_mark_keeps_class() {
+        let _g = PORT_8800.lock().await;
+        // Conn1 VIGI Refused; conn2 replies garbage (non-`1168`).
+        let lis = TcpListener::bind("127.0.0.1:8800").await;
+        let Ok(lis) = lis else { return };
+        crate::vigi::gate_reset_for_test("127.0.0.1");
+        let idx = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let idx2 = idx.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = lis.accept().await else {
+                    return;
+                };
+                let n = idx2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let (rd, mut wr) = stream.into_split();
+                    let mut rd = tokio::io::BufReader::new(rd);
+                    if n == 0 {
+                        let _ = read_head(&mut rd).await;
+                        _ = wr
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: multipart/mixed\r\n\r\n")
+                            .await;
+                        let mut buf = vec![0_u8; 4096];
+                        let _ = rd.read(&mut buf).await.unwrap_or(0);
+                        let body = r#"{"params":{"error_code":-1}}"#;
+                        let part = format!(
+                            "----device-stream-boundary--\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        _ = wr.write_all(part.as_bytes()).await;
+                        return;
+                    }
+                    let mut pkt = [0_u8; 256];
+                    if rd.read_exact(&mut pkt).await.is_err() {
+                        return;
+                    }
+                    _ = wr.write_all(b"\xde\xad\xbe\xef garbage head").await;
+                });
+            }
+        });
+        let mut st = stub_scripted(|_| "200 OK", RECV_SDP_V380, 60).await;
+        let client = RtspAudioClient::new(url_creds(st.port), None, v380_cfg());
+        let sess = client.open(true).await.unwrap();
+        assert_eq!(
+            sess.caps(),
+            AudioCaps {
+                listen: true,
+                talk: false
+            }
+        );
+        assert_eq!(
+            sess.marks(),
+            vec![(Direction::Talk, FaultClass::Capability)],
+            "{:?}",
+            sess.marks()
+        );
+        let _ = &mut st;
+        sess.close().await;
+    }
+
+    /// Empty creds ⇒ the probe skips (V246 posture) — ⊥ an
+    /// evaluated outcome: the `Capability` mark keeps its class.
+    #[tokio::test]
+    async fn v380_empty_creds_skips_probe() {
+        let _g = PORT_8800.lock().await;
+        let Some(v) = v380_stub(&[1001], 3, 1, 1).await else {
+            return;
+        };
+        let mut st = stub_scripted(|_| "200 OK", SEND_SDP_V380, 60).await;
+        // url() carries ⊥ userinfo.
+        let client = RtspAudioClient::new(url(st.port), None, v380_cfg());
+        let sess = client.open(true).await.unwrap();
+        assert_eq!(
+            sess.caps(),
+            AudioCaps {
+                listen: false,
+                talk: true
+            }
+        );
+        assert_eq!(
+            sess.marks(),
+            vec![(Direction::Listen, FaultClass::Capability)],
+            "{:?}",
+            sess.marks()
+        );
+        assert_eq!(v.conns.load(std::sync::atomic::Ordering::Relaxed), 0);
+        let _ = &mut st;
+        sess.close().await;
+    }
+
+    /// Fault arm: DESCRIBE fault + `1001` ⇒ pure-V380 session.
+    #[tokio::test]
+    async fn v380_fault_arm_composes_pure() {
+        let _g = PORT_8800.lock().await;
+        let Some(_v) = v380_stub(&[1001], 3, 1, 1).await else {
+            return;
+        };
+        let mut st = stub_scripted(
+            |head| {
+                if head.starts_with("DESCRIBE") {
+                    "500 Internal Server Error"
+                } else {
+                    "200 OK"
+                }
+            },
+            VIDEO_SDP,
+            60,
+        )
+        .await;
+        let client = RtspAudioClient::new(url_creds(st.port), None, v380_cfg());
+        let sess = client.open(true).await.unwrap();
+        assert_eq!(
+            sess.caps(),
+            AudioCaps {
+                listen: true,
+                talk: true
+            }
+        );
+        assert!(sess.marks().is_empty(), "{:?}", sess.marks());
+        let _ = &mut st;
+        sess.close().await;
+    }
+
+    /// Fault arm ⊥-V380 ⇒ the original RTSP fault propagates.
+    #[tokio::test]
+    async fn v380_fault_arm_propagates_original_fault() {
+        let _g = PORT_8800.lock().await;
+        // ⊥ :8800 bound — V380 dial faults.
+        let mut st = stub_scripted(
+            |head| {
+                if head.starts_with("DESCRIBE") {
+                    "500 Internal Server Error"
+                } else {
+                    "200 OK"
+                }
+            },
+            VIDEO_SDP,
+            60,
+        )
+        .await;
+        let client = RtspAudioClient::new(url_creds(st.port), None, v380_cfg());
+        let r = client.open(true).await;
+        let Err(err) = r else {
+            panic!("expected original fault to propagate")
+        };
+        assert!(format!("{err:?}").contains("500"), "{err:?}");
+        let _ = &mut st;
+    }
+
+    /// `429` propagates to the alt-URL retry unprobed — the V380
+    /// stub sees ⊥ conns.
+    #[tokio::test]
+    async fn v380_429_retries_alt_unprobed() {
+        let _g = PORT_8800.lock().await;
+        let Some(v) = v380_stub(&[1001], 3, 1, 1).await else {
+            return;
+        };
+        let mut primary = stub_scripted(
+            |head| {
+                if head.starts_with("OPTIONS") {
+                    "429 Too Many Requests"
+                } else {
+                    "200 OK"
+                }
+            },
+            VIDEO_SDP,
+            60,
+        )
+        .await;
+        let mut alt = stub_scripted(|_| "200 OK", RECV_SDP_V380, 60).await;
+        let client = RtspAudioClient::new(
+            url_creds(primary.port),
+            Some(url_creds(alt.port)),
+            v380_cfg(),
+        );
+        let sess = client.open(true).await.unwrap();
+        // Alt yielded a listen track; talk stayed uncovered — the
+        // probe MAY run on the alt URL (it's the surviving attempt),
+        // but the primary's `429` itself was ⊥-probed.
+        assert!(sess.caps().listen);
+        let _ = (&mut primary, &mut alt);
+        drop(v);
+        sess.close().await;
+    }
+
+    /// Mixed compose — RTSP listen + V380 talk keeps the conn:
+    /// SETUP + PLAY ran, no EOF.
+    #[tokio::test]
+    async fn v380_mixed_compose_keeps_rtsp() {
+        let _g = PORT_8800.lock().await;
+        let Some(_v) = v380_stub(&[1001], 3, 0, 1).await else {
+            return;
+        };
+        let mut st = stub_scripted(|_| "200 OK", RECV_SDP_V380, 60).await;
+        let client = RtspAudioClient::new(url_creds(st.port), None, v380_cfg());
+        let sess = client.open(true).await.unwrap();
+        assert_eq!(
+            sess.caps(),
+            AudioCaps {
+                listen: true,
+                talk: true
+            }
+        );
+        assert!(sess.marks().is_empty(), "{:?}", sess.marks());
+        // The conn stayed — SETUP + PLAY requests ran.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut saw_setup = false;
+        let mut saw_play = false;
+        while let Ok(m) = st.got.try_recv() {
+            saw_setup |= m.starts_with("SETUP");
+            saw_play |= m.starts_with("PLAY");
+        }
+        assert!(saw_setup && saw_play, "mixed compose must SETUP+PLAY");
+        sess.close().await;
     }
 }

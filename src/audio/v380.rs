@@ -102,7 +102,7 @@ impl V380Conn {
         let addr = if explicit_port {
             host.to_owned()
         } else {
-            format!("{host}:{}", V380_PORT)
+            format!("{host}:{V380_PORT}")
         };
         let stream = tokio::time::timeout(IO_TIMEOUT, TcpStream::connect(addr))
             .await
@@ -129,8 +129,11 @@ impl V380Conn {
         // (`nSpeaker`@66). Read up to a packet-sized chunk.
         let mut resp = [0_u8; 512];
         let n = self.read_some(&mut resp).await?;
-        if n < 68 {
-            return Err(Error::Protocol(format!("short login reply ({n} B)")));
+        if n < 68 || !is_login_resp(&resp[..n]) {
+            // ⊥ `1168` — the dialect question went unanswered
+            // (garbage head, foreign service); the probe maps
+            // this fault to ⊥-V380, not a creds verdict.
+            return Err(Error::Protocol(format!("non-1168 login reply ({n} B)")));
         }
         Ok(parse_login_resp(&resp[..n]))
     }
@@ -461,9 +464,30 @@ pub fn derive_xaddr(main_stream: &str, onvif_addr: &str) -> Option<String> {
     Some(format!("http://{host}:8899/onvif/device_service"))
 }
 
+/// `chNN` channel index from an RTSP path — the `NN` in `chNN_M`
+/// (V279), `0` on absence ∨ parse-fail. The last `ch<digits>`
+/// run wins; feeds `301`@8, `377`@12, ∀ `8449`/`180` fields.
+#[must_use]
+pub fn channel_from_path(path: &str) -> u32 {
+    let mut found = 0_u32;
+    let b = path.as_bytes();
+    for i in 0..b.len().saturating_sub(2) {
+        if b[i].eq_ignore_ascii_case(&b'c') && b[i + 1].eq_ignore_ascii_case(&b'h') {
+            let digits: String = path[i + 2..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            if !digits.is_empty() {
+                found = digits.parse().unwrap_or(0);
+            }
+        }
+    }
+    found
+}
+
 /// Last-8-hex→`u32` device-ID derivation — the numeric V380 cloud
 /// ID is the serial's low 32 bits on v3-era units (proven on
-/// `f6a302bf1a2b` → `46078507`, R68). `?` universally — `None`
+/// `f6a302bf1a2b` → `46_078_507`, R68). `?` universally — `None`
 /// on any deviation; a configured `v380DeviceId` overrides.
 #[must_use]
 pub fn serial_low8_to_device_id(serial: &str) -> Option<u32> {
@@ -570,6 +594,12 @@ pub struct ImaEncoder {
     index: i16,
 }
 
+impl Default for ImaEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ImaEncoder {
     #[must_use]
     pub fn new() -> Self {
@@ -628,7 +658,7 @@ impl ImaEncoder {
         }
         let p = i32::from(self.predictor);
         self.predictor = i16::try_from(if code & 8 != 0 { p - delta } else { p + delta })
-            .unwrap_or_else(|_| if code & 8 != 0 { i16::MIN } else { i16::MAX });
+            .unwrap_or(if code & 8 != 0 { i16::MIN } else { i16::MAX });
         let ni = i32::from(self.index) + i32::from(IMA_INDEX[usize::from(code & 15)]);
         self.index = i16::try_from(ni.clamp(0, 88)).expect("clamped");
         code
@@ -668,14 +698,20 @@ pub fn ima_decode_block(block: &[u8; IMA_BLOCK_BYTES]) -> [i16; IMA_BLOCK_SAMPLE
             predictor = predictor.clamp(-32768, 32767);
             index += i32::from(IMA_INDEX[usize::from(code & 15)]);
             index = index.clamp(0, 88);
-            out[n] = i16::try_from(predictor)
-                .unwrap_or_else(|_| if predictor < 0 { i16::MIN } else { i16::MAX });
+            out[n] =
+                i16::try_from(predictor).unwrap_or(if predictor < 0 { i16::MIN } else { i16::MAX });
             n += 1;
         }
     }
     out
 }
 
+#[allow(
+    clippy::unwrap_used,
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss
+)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,7 +725,7 @@ mod tests {
         let host = format!("127.0.0.1:{port}");
         let task = tokio::spawn(async move {
             let (mut s, _) = lis.accept().await.unwrap();
-            let mut got = vec![0u8; 256];
+            let mut got = vec![0_u8; 256];
             s.read_exact(&mut got).await.unwrap();
             s.write_all(&resp).await.unwrap();
             got
@@ -698,14 +734,14 @@ mod tests {
     }
 
     fn login_resp(result: i32, version: u8) -> Vec<u8> {
-        let mut b = vec![0u8; 256];
+        let mut b = vec![0_u8; 256];
         b[0..4].copy_from_slice(&CMD_LOGIN_RESP.to_le_bytes());
         b[4..8].copy_from_slice(&result.to_le_bytes());
         b[12] = version;
-        b[13..17].copy_from_slice(&0x84acu32.to_le_bytes()); // ticket
-        b[17..21].copy_from_slice(&0x1234u32.to_le_bytes()); // session
+        b[13..17].copy_from_slice(&0x84ac_u32.to_le_bytes()); // ticket
+        b[17..21].copy_from_slice(&0x1234_u32.to_le_bytes()); // session
         b[27..48].copy_from_slice(b"46078507.nvdvr.net\0\0\0");
-        b[59..63].copy_from_slice(&46078507u32.to_le_bytes());
+        b[59..63].copy_from_slice(&46_078_507_u32.to_le_bytes());
         b[63] = 1; // nChannels
         b[64] = 1; // nAudioPri
         b[65] = 1; // nVideoPri
@@ -730,7 +766,7 @@ mod tests {
     async fn login_packet_layout_and_resp_parse() {
         let (host, task) = stub_login(login_resp(1001, 3)).await;
         let mut conn = test_conn(&host).await;
-        let resp = conn.login(46078507, "Admin", "pw").await.unwrap();
+        let resp = conn.login(46_078_507, "Admin", "pw").await.unwrap();
         let got = task.await.unwrap();
         assert_eq!(u32::from_le_bytes(got[0..4].try_into().unwrap()), CMD_LOGIN);
         assert_eq!(u32::from_le_bytes(got[4..8].try_into().unwrap()), 1022);
@@ -738,14 +774,14 @@ mod tests {
         assert_eq!(got[9], 1);
         assert_eq!(
             u32::from_le_bytes(got[13..17].try_into().unwrap()),
-            46078507
+            46_078_507
         );
         assert!(got[17..49].iter().all(|b| *b == 0)); // hostDateTime zeroed
         assert_eq!(&got[49..54], b"Admin");
         assert_eq!(resp.result, 1001);
         assert_eq!(resp.version, 3);
         assert_eq!(resp.ticket, 0x84ac);
-        assert_eq!(resp.rec_dev_id, 46078507);
+        assert_eq!(resp.rec_dev_id, 46_078_507);
         assert_eq!(resp.domain, "46078507.nvdvr.net");
         assert_eq!(resp.n_channels, 1);
         assert_eq!(resp.n_speaker, 1);
@@ -769,23 +805,26 @@ mod tests {
         let host = format!("127.0.0.1:{}", lis.local_addr().unwrap().port());
         let task = tokio::spawn(async move {
             let (mut s, _) = lis.accept().await.unwrap();
-            let mut got = vec![0u8; 85];
+            let mut got = vec![0_u8; 85];
             s.read_exact(&mut got).await.unwrap();
-            let mut resp = [0u8; 16];
+            let mut resp = [0_u8; 16];
             resp[0..4].copy_from_slice(&CMD_TALK_RESP.to_le_bytes());
-            resp[4..8].copy_from_slice(&1001i32.to_le_bytes());
+            resp[4..8].copy_from_slice(&1001_i32.to_le_bytes());
             s.write_all(&resp).await.unwrap();
             got
         });
         let mut conn = test_conn(&host).await;
-        let result = conn.talk_open(46078507, 0x84ac, 0).await.unwrap();
+        let result = conn.talk_open(46_078_507, 0x84ac, 0).await.unwrap();
         assert_eq!(result, 1001);
         let got = task.await.unwrap();
         assert_eq!(
             u32::from_le_bytes(got[0..4].try_into().unwrap()),
             CMD_TALK_OPEN
         );
-        assert_eq!(u32::from_le_bytes(got[4..8].try_into().unwrap()), 46078507);
+        assert_eq!(
+            u32::from_le_bytes(got[4..8].try_into().unwrap()),
+            46_078_507
+        );
         assert_eq!(u32::from_le_bytes(got[8..12].try_into().unwrap()), 0x84ac);
         assert_eq!(u32::from_le_bytes(got[12..16].try_into().unwrap()), 0);
     }
@@ -796,19 +835,19 @@ mod tests {
         let host = format!("127.0.0.1:{}", lis.local_addr().unwrap().port());
         let task = tokio::spawn(async move {
             let (mut s, _) = lis.accept().await.unwrap();
-            let mut got = vec![0u8; 256];
+            let mut got = vec![0_u8; 256];
             s.read_exact(&mut got).await.unwrap();
-            let mut resp = [0u8; 32];
+            let mut resp = [0_u8; 32];
             resp[0..4].copy_from_slice(&CMD_STREAM_RESP.to_le_bytes());
-            resp[4..8].copy_from_slice(&1001i32.to_le_bytes());
-            resp[8..10].copy_from_slice(&20u16.to_le_bytes());
+            resp[4..8].copy_from_slice(&1001_i32.to_le_bytes());
+            resp[8..10].copy_from_slice(&20_u16.to_le_bytes());
             s.write_all(&resp).await.unwrap();
-            let mut start = vec![0u8; 256];
+            let mut start = vec![0_u8; 256];
             s.read_exact(&mut start).await.unwrap();
             (got, start)
         });
         let mut conn = test_conn(&host).await;
-        let result = conn.stream_open(46078507, 0x84ac, 2, 3).await.unwrap();
+        let result = conn.stream_open(46_078_507, 0x84ac, 2, 3).await.unwrap();
         assert_eq!(result, 1001);
         conn.stream_start().await.unwrap();
         let (got, start) = task.await.unwrap();
@@ -816,7 +855,10 @@ mod tests {
             u32::from_le_bytes(got[0..4].try_into().unwrap()),
             CMD_STREAM_OPEN
         );
-        assert_eq!(u32::from_le_bytes(got[4..8].try_into().unwrap()), 46078507);
+        assert_eq!(
+            u32::from_le_bytes(got[4..8].try_into().unwrap()),
+            46_078_507
+        );
         assert_eq!(u32::from_le_bytes(got[8..12].try_into().unwrap()), 2);
         assert_eq!(u16::from_le_bytes(got[12..14].try_into().unwrap()), 20); // v3 ⇒ 20
         assert_eq!(u32::from_le_bytes(got[14..18].try_into().unwrap()), 0x84ac);
@@ -836,11 +878,11 @@ mod tests {
         let host = format!("127.0.0.1:{}", lis.local_addr().unwrap().port());
         let task = tokio::spawn(async move {
             let (mut s, _) = lis.accept().await.unwrap();
-            let mut got = vec![0u8; 256];
+            let mut got = vec![0_u8; 256];
             s.read_exact(&mut got).await.unwrap();
-            let mut resp = [0u8; 32];
+            let mut resp = [0_u8; 32];
             resp[0..4].copy_from_slice(&CMD_STREAM_RESP.to_le_bytes());
-            resp[4..8].copy_from_slice(&1001i32.to_le_bytes());
+            resp[4..8].copy_from_slice(&1001_i32.to_le_bytes());
             s.write_all(&resp).await.unwrap();
             got
         });
@@ -860,13 +902,13 @@ mod tests {
         let expected = ecb_encrypt(b"abcdefghijklmnop", &inner);
         assert_eq!(out, expected);
         // Sanity: encrypt is deterministic + non-trivial.
-        assert_ne!(out, [0u8; 16]);
+        assert_ne!(out, [0_u8; 16]);
     }
 
     #[test]
     fn ima_decode_known_vector() {
         // All-zero block: header sample 0, then silence-ish decode.
-        let mut block = [0u8; IMA_BLOCK_BYTES];
+        let mut block = [0_u8; IMA_BLOCK_BYTES];
         let out = ima_decode_block(&block);
         assert_eq!(out[0], 0);
         assert_eq!(out.len(), IMA_BLOCK_SAMPLES);
@@ -914,7 +956,7 @@ mod tests {
     #[test]
     fn reassembler_single_fragment() {
         let mut r = Reassembler::new();
-        let mut payload = vec![9u8; AUDIO_FRAME_INNER_HDR + 4];
+        let mut payload = vec![9_u8; AUDIO_FRAME_INNER_HDR + 4];
         payload[AUDIO_FRAME_INNER_HDR..].copy_from_slice(&[1, 2, 3, 4]);
         let out = r
             .push(&frag(22, 1, 0, &payload))
@@ -927,7 +969,7 @@ mod tests {
     fn reassembler_in_order_multi() {
         let mut r = Reassembler::new();
         let mk = |i: u16, data: &[u8]| {
-            let mut p = vec![0u8; AUDIO_FRAME_INNER_HDR];
+            let mut p = vec![0_u8; AUDIO_FRAME_INNER_HDR];
             if i == 0 {
                 p.extend_from_slice(data);
             } else {
@@ -944,7 +986,7 @@ mod tests {
     fn reassembler_gap_resets_pending() {
         let mut r = Reassembler::new();
         let p0 = {
-            let mut v = vec![0u8; AUDIO_FRAME_INNER_HDR];
+            let mut v = vec![0_u8; AUDIO_FRAME_INNER_HDR];
             v.extend_from_slice(&[1]);
             v
         };
@@ -953,7 +995,7 @@ mod tests {
         assert!(r.push(&frag(22, 3, 2, &[3])).unwrap().is_none());
         // Fresh frame after the gap reassembles normally.
         let p0b = {
-            let mut v = vec![0u8; AUDIO_FRAME_INNER_HDR];
+            let mut v = vec![0_u8; AUDIO_FRAME_INNER_HDR];
             v.extend_from_slice(&[7]);
             v
         };
@@ -964,7 +1006,7 @@ mod tests {
     fn reassembler_video_interleave_undisturbed() {
         let mut r = Reassembler::new();
         let p0 = {
-            let mut v = vec![0u8; AUDIO_FRAME_INNER_HDR];
+            let mut v = vec![0_u8; AUDIO_FRAME_INNER_HDR];
             v.extend_from_slice(&[1, 2]);
             v
         };
@@ -984,13 +1026,13 @@ mod tests {
             // Garbage prefix + one audio fragment.
             let mut pkt = vec![0x1f, 0x55, 0x6f, 0xaa, 0x7f];
             pkt.push(22); // type
-            pkt.extend_from_slice(&0u16.to_le_bytes()); // @2-3? — hdr layout: total@3
+            pkt.extend_from_slice(&0_u16.to_le_bytes()); // @2-3? — hdr layout: total@3
             // Rebuild properly: 0x7f, type, pad, total u16@3, idx@5, len@7
             pkt.truncate(4);
             pkt.extend_from_slice(&[0x7f, 22, 0]);
-            pkt.extend_from_slice(&1u16.to_le_bytes()); // total @3
-            pkt.extend_from_slice(&0u16.to_le_bytes()); // idx @5
-            pkt.extend_from_slice(&4u16.to_le_bytes()); // len @7
+            pkt.extend_from_slice(&1_u16.to_le_bytes()); // total @3
+            pkt.extend_from_slice(&0_u16.to_le_bytes()); // idx @5
+            pkt.extend_from_slice(&4_u16.to_le_bytes()); // len @7
             pkt.extend_from_slice(&[0, 0, 0]); // @9-11 pad
             pkt.extend_from_slice(&[10, 11, 12, 13]);
             s.write_all(&pkt).await.unwrap();
@@ -1010,15 +1052,15 @@ mod tests {
         let host = format!("127.0.0.1:{}", lis.local_addr().unwrap().port());
         let task = tokio::spawn(async move {
             let (mut s, _) = lis.accept().await.unwrap();
-            let mut ka = [0u8; 16];
+            let mut ka = [0_u8; 16];
             s.read_exact(&mut ka).await.unwrap();
-            let mut fr = [0u8; 272];
+            let mut fr = [0_u8; 272];
             s.read_exact(&mut fr).await.unwrap();
             (ka, fr)
         });
         let mut conn = test_conn(&host).await;
         conn.keepalive_stream(2, true).await.unwrap();
-        conn.send_talk_block(&[7u8; 256], 42).await.unwrap();
+        conn.send_talk_block(&[7_u8; 256], 42).await.unwrap();
         let (ka, fr) = task.await.unwrap();
         assert_eq!(
             u32::from_le_bytes(ka[0..4].try_into().unwrap()),
@@ -1042,8 +1084,8 @@ mod tests {
 
     #[test]
     fn serial_low8_hex_variants() {
-        assert_eq!(Some(46078507), serial_low8_to_device_id("f6a302bf1a2b"));
-        assert_eq!(Some(46078507), serial_low8_to_device_id("F6A302BF1A2B"));
+        assert_eq!(Some(46_078_507), serial_low8_to_device_id("f6a302bf1a2b"));
+        assert_eq!(Some(46_078_507), serial_low8_to_device_id("F6A302BF1A2B"));
         assert_eq!(Some(0x02bf_1a2b), serial_low8_to_device_id("02bf1a2b"));
         assert_eq!(Some(0x1a2b), serial_low8_to_device_id("1a2b")); // short
         assert_eq!(None, serial_low8_to_device_id(""));
@@ -1105,8 +1147,7 @@ mod tests {
                 let result = verdicts
                     .iter()
                     .find(|(u, _)| *u == user)
-                    .map(|(_, r)| *r)
-                    .unwrap_or(login_result::OK);
+                    .map_or(login_result::OK, |(_, r)| *r);
                 s.write_all(&login_resp(result, 3)).await.unwrap();
             }
             seen
@@ -1123,7 +1164,7 @@ mod tests {
         ])
         .await;
         let users = username_candidates(Some("bob"), "admin");
-        let (_conn, user, resp) = V380Conn::login_viable(&host, 46078507, &users, "pw")
+        let (_conn, user, resp) = V380Conn::login_viable(&host, 46_078_507, &users, "pw")
             .await
             .expect("login_viable");
         assert_eq!("Admin", user);
@@ -1139,7 +1180,7 @@ mod tests {
         ])
         .await;
         let users = username_candidates(None, "rtsp");
-        let (_conn, _user, resp) = V380Conn::login_viable(&host, 46078507, &users, "pw")
+        let (_conn, _user, resp) = V380Conn::login_viable(&host, 46_078_507, &users, "pw")
             .await
             .expect("login_viable");
         assert_eq!(login_result::BAD_USER, resp.result);
@@ -1176,7 +1217,7 @@ mod tests {
         let xaddr = stub_http(body).await;
         let soap = onvif::SoapClient::new();
         assert_eq!(
-            Some(46078507),
+            Some(46_078_507),
             derive_device_id(&soap, &xaddr, None, Duration::from_secs(2)).await
         );
         // Missing SerialNumber ⇒ ⊥-deviceId.
@@ -1191,5 +1232,14 @@ mod tests {
             None,
             derive_device_id(&soap, &xaddr2, None, Duration::from_secs(2)).await
         );
+    }
+    #[test]
+    fn channel_from_path_cases() {
+        assert_eq!(channel_from_path("/live/ch00_0"), 0);
+        assert_eq!(channel_from_path("/live/ch01_0"), 1);
+        assert_eq!(channel_from_path("/live/ch12_0"), 12);
+        assert_eq!(channel_from_path("/live"), 0);
+        assert_eq!(channel_from_path("/live/ch"), 0);
+        assert_eq!(channel_from_path("/a/ch3x/ch7_0"), 7);
     }
 }

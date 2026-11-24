@@ -125,6 +125,34 @@ mod ptz {
         async fn monitor_configs(&self) -> Option<MonitorConfigs> {
             unimplemented!()
         }
+        async fn monitor_unmark_audio(
+            &self,
+            _id: MonitorId,
+            names: Vec<String>,
+        ) -> Option<Result<(), MonitorSetError>> {
+            let mut cfg = self.config.lock().unwrap();
+            if let Some(c) = cfg.as_mut() {
+                let rem: Vec<String> = c
+                    .config()
+                    .audio
+                    .unsupported()
+                    .iter()
+                    .filter(|m| !names.contains(m))
+                    .cloned()
+                    .collect();
+                if let Some(a) = c
+                    .raw_mut()
+                    .get_mut("audio")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    a.insert("unsupported".to_owned(), serde_json::json!(rem));
+                }
+                if let Ok(f) = serde_json::from_value::<MonitorConfig>(c.raw().clone()) {
+                    *c = f;
+                }
+            }
+            Some(Ok(()))
+        }
     }
 
     struct StubPtz {
@@ -631,7 +659,7 @@ mod audio_tests {
     use axum::extract::{Query, State};
     use common::{
         MonitorId,
-        monitor::{IMonitorManager, MonitorConfig, MonitorConfigs, MonitorSetError},
+        monitor::{MonitorConfig, MonitorConfigs, MonitorSetError},
     };
     use http::{HeaderMap, HeaderValue, StatusCode, header};
     use std::{
@@ -681,6 +709,34 @@ mod audio_tests {
         async fn monitor_configs(&self) -> Option<MonitorConfigs> {
             unimplemented!()
         }
+        async fn monitor_unmark_audio(
+            &self,
+            _id: MonitorId,
+            names: Vec<String>,
+        ) -> Option<Result<(), MonitorSetError>> {
+            let mut cfg = self.config.lock().unwrap();
+            if let Some(c) = cfg.as_mut() {
+                let rem: Vec<String> = c
+                    .config()
+                    .audio
+                    .unsupported()
+                    .iter()
+                    .filter(|m| !names.contains(m))
+                    .cloned()
+                    .collect();
+                if let Some(a) = c
+                    .raw_mut()
+                    .get_mut("audio")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    a.insert("unsupported".to_owned(), serde_json::json!(rem));
+                }
+                if let Ok(f) = serde_json::from_value::<MonitorConfig>(c.raw().clone()) {
+                    *c = f;
+                }
+            }
+            Some(Ok(()))
+        }
     }
 
     fn monitor_config_audio(enable: bool, marks: &[&str]) -> MonitorConfig {
@@ -709,8 +765,8 @@ mod audio_tests {
         let p = persisted.clone();
         (
             Arc::new(audio::AudioService::new(
-                Arc::new(|url, alt| {
-                    Arc::new(audio::RtspAudioClient::new(url, alt)) as audio::ArcAudioClient
+                Arc::new(|url, alt, cfg| {
+                    Arc::new(audio::RtspAudioClient::new(url, alt, cfg)) as audio::ArcAudioClient
                 }),
                 Arc::new(move |id: MonitorId, marks: Vec<String>| {
                     let p = p.clone();
@@ -718,6 +774,7 @@ mod audio_tests {
                         p.lock().unwrap().push((id, marks));
                     })
                 }),
+                Arc::new(|_id: MonitorId, _names: Vec<String>| Box::pin(async move {})),
             )),
             persisted,
         )
