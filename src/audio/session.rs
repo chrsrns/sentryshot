@@ -2408,8 +2408,19 @@ mod tests {
                         .unwrap_or_default();
                 tokio::spawn(async move {
                     let (mut rd, mut wr) = stream.into_split();
+                    // Dialect sniff — a non-`1167` head (e.g. a VIGI
+                    // HTTP POST probing the same port) gets an instant
+                    // close rather than a stall on a partial packet.
+                    let mut head = [0_u8; 4];
+                    if rd.read_exact(&mut head).await.is_err() {
+                        return;
+                    }
+                    if u32::from_le_bytes(head) != 1167 {
+                        return;
+                    }
                     let mut pkt = [0_u8; 256];
-                    if rd.read_exact(&mut pkt).await.is_err() {
+                    pkt[0..4].copy_from_slice(&head);
+                    if rd.read_exact(&mut pkt[4..]).await.is_err() {
                         return;
                     }
                     let result = results[idx.min(results.len() - 1)];
@@ -2831,6 +2842,220 @@ mod tests {
             saw_play |= m.starts_with("PLAY");
         }
         assert!(saw_setup && saw_play, "mixed compose must SETUP+PLAY");
+        sess.close().await;
+    }
+
+    /// `:8800` claim stub — every conn answers `1167` with `1001`,
+    /// then an 85 B `377` handshake replies `talk_result`; `180`
+    /// blocks (272 B) stream into `frames`. `closed` reports the
+    /// conn index on server-side EOF; `kill` severs live conns.
+    struct V380TalkStub {
+        conns: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        frames: tmpsc::Receiver<Vec<u8>>,
+        closed: tmpsc::Receiver<u32>,
+        kill: std::sync::Arc<tokio::sync::Notify>,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn v380_talk_stub(talk_result: i32) -> Option<V380TalkStub> {
+        let lis = TcpListener::bind("127.0.0.1:8800").await.ok()?;
+        let conns = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (frames_tx, frames) = tmpsc::channel::<Vec<u8>>(64);
+        let (closed_tx, closed) = tmpsc::channel::<u32>(64);
+        let kill = std::sync::Arc::new(tokio::sync::Notify::new());
+        let conns2 = conns.clone();
+        let kill2 = kill.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = lis.accept().await else {
+                    return;
+                };
+                let idx = conns2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let frames_tx = frames_tx.clone();
+                let closed_tx = closed_tx.clone();
+                let kill = kill2.clone();
+                tokio::spawn(async move {
+                    let (mut rd, mut wr) = stream.into_split();
+                    // Dialect sniff — non-`1167` heads (a VIGI probe
+                    // on the same port) close instantly, ⊥ stall.
+                    let mut head = [0_u8; 4];
+                    if rd.read_exact(&mut head).await.is_err() {
+                        return;
+                    }
+                    if u32::from_le_bytes(head) != 1167 {
+                        return;
+                    }
+                    let mut pkt = [0_u8; 256];
+                    pkt[0..4].copy_from_slice(&head);
+                    if rd.read_exact(&mut pkt[4..]).await.is_err() {
+                        return;
+                    }
+                    if wr.write_all(&v380_reply(1001, 3, 1, 1)).await.is_err() {
+                        return;
+                    }
+                    // `377` handshake — 85 B, channel u32@12.
+                    let mut h = [0_u8; 85];
+                    if rd.read_exact(&mut h).await.is_err() {
+                        _ = closed_tx.send(idx).await;
+                        return;
+                    }
+                    assert_eq!(u32::from_le_bytes(h[0..4].try_into().unwrap()), 377);
+                    let mut r = [0_u8; 8];
+                    r[0..4].copy_from_slice(&477_u32.to_le_bytes());
+                    r[4..8].copy_from_slice(&talk_result.to_le_bytes());
+                    if wr.write_all(&r).await.is_err() {
+                        return;
+                    }
+                    if talk_result != 1001 {
+                        return; // refused claim — the conn dies
+                    }
+                    let mut f = [0_u8; 272];
+                    loop {
+                        tokio::select! {
+                            n = rd.read_exact(&mut f) => {
+                                if n.is_err() {
+                                    _ = closed_tx.send(idx).await;
+                                    return;
+                                }
+                                if frames_tx.send(f.to_vec()).await.is_err() {
+                                    return;
+                                }
+                            }
+                            () = kill.notified() => {
+                                _ = closed_tx.send(idx).await;
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        Some(V380TalkStub {
+            conns,
+            frames,
+            closed,
+            kill,
+            _task: task,
+        })
+    }
+
+    /// Claim success ⇒ `180` blocks stream onto the claim conn —
+    /// 272 B framed (cmd `180`, codec `22`, 256 B payload, seq++).
+    #[tokio::test]
+    async fn v380_claim_paces_180_blocks() {
+        let _g = PORT_8800.lock().await;
+        let Some(mut v) = v380_talk_stub(1001).await else {
+            return;
+        };
+        let st = stub_scripted(|_| "200 OK", RECV_SDP_V380, 60).await;
+        let client = RtspAudioClient::new(url_creds(st.port), None, v380_cfg());
+        let sess = client.open(true).await.unwrap();
+        assert!(sess.caps().talk, "{:?}", sess.caps());
+        // Unclaimed ⇒ ⊥ sends (V282 lazy posture).
+        assert!(sess.talk(&[0_i16; 160]).await.is_err());
+        assert!(matches!(sess.claim_talk().await, TalkClaim::Ready));
+        // Fresh conn for the claim — the probe was conn 0.
+        assert_eq!(v.conns.load(std::sync::atomic::Ordering::Relaxed), 2);
+        // >505 samples ⇒ one `180` per drain; 3 blocks expected.
+        for _ in 0..10 {
+            sess.talk(&[1000_i16; 160]).await.unwrap();
+        }
+        for want_seq in 0..3_u8 {
+            let f = tokio::time::timeout(Duration::from_secs(2), v.frames.recv())
+                .await
+                .expect("a 180 block within 2s")
+                .expect("frame channel open");
+            assert_eq!(f.len(), 272);
+            assert_eq!(u32::from_le_bytes(f[0..4].try_into().unwrap()), 180);
+            assert_eq!(f[6], 22, "codecType IMA");
+            assert_eq!(u16::from_le_bytes(f[13..15].try_into().unwrap()), 256);
+            assert_eq!(f[15], want_seq, "seq increments per block");
+        }
+        sess.close().await;
+    }
+
+    /// `477`≠`1001` ⇒ `Busy` — availability verdict ⊥ capability
+    /// evidence: ⊥ mark, lock released, a re-claim re-tries.
+    #[tokio::test]
+    async fn v380_claim_477_fail_is_busy_no_mark() {
+        let _g = PORT_8800.lock().await;
+        let Some(v) = v380_talk_stub(1009).await else {
+            return;
+        };
+        let st = stub_scripted(|_| "200 OK", RECV_SDP_V380, 60).await;
+        let client = RtspAudioClient::new(url_creds(st.port), None, v380_cfg());
+        let sess = client.open(true).await.unwrap();
+        let before = sess.marks();
+        assert!(matches!(sess.claim_talk().await, TalkClaim::Busy));
+        assert_eq!(sess.marks(), before, "a 477 verdict ⊥ mint marks");
+        // The claim lock released — a second attempt resolves too.
+        assert!(matches!(sess.claim_talk().await, TalkClaim::Busy));
+        drop(v);
+        sess.close().await;
+    }
+
+    /// Mid-hold conn death ⇒ the claim-scoped dead signal carries
+    /// the generation — ⊥ a session mark, ⊥ session death; a
+    /// re-claim lands a fresh conn.
+    #[tokio::test]
+    async fn v380_mid_hold_death_signals_talk_dead() {
+        let _g = PORT_8800.lock().await;
+        let Some(v) = v380_talk_stub(1001).await else {
+            return;
+        };
+        let st = stub_scripted(|_| "200 OK", RECV_SDP_V380, 60).await;
+        let client = RtspAudioClient::new(url_creds(st.port), None, v380_cfg());
+        let sess = client.open(true).await.unwrap();
+        let mut dead = sess.talk_dead_rx().expect("lazy talk_dead_rx");
+        assert!(matches!(sess.claim_talk().await, TalkClaim::Ready));
+        // Backlog of blocks so the pacer keeps sending into the
+        // severed conn — the fault must surface within a few ticks.
+        for _ in 0..20 {
+            sess.talk(&[1000_i16; 160]).await.unwrap();
+        }
+        v.kill.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(3), dead.changed())
+            .await
+            .expect("talk dead signal within 3s")
+            .expect("signal");
+        assert_eq!(*dead.borrow(), 1, "generation of the first claim");
+        // The session itself survives — only the claim died.
+        assert!(!*sess.dead_rx().borrow());
+        // Talker dropped ⇒ unclaimed error until a re-claim.
+        assert!(sess.talk(&[0_i16; 160]).await.is_err());
+        assert!(matches!(sess.claim_talk().await, TalkClaim::Ready));
+        drop(v);
+        sess.close().await;
+    }
+
+    /// Release ⇒ the claim conn closes (server-side EOF) + the slot
+    /// frees — `talk()` unclaims again, a re-claim re-connects.
+    #[tokio::test]
+    async fn v380_release_closes_conn_and_frees_slot() {
+        let _g = PORT_8800.lock().await;
+        let Some(mut v) = v380_talk_stub(1001).await else {
+            return;
+        };
+        let st = stub_scripted(|_| "200 OK", RECV_SDP_V380, 60).await;
+        let client = RtspAudioClient::new(url_creds(st.port), None, v380_cfg());
+        let sess = client.open(true).await.unwrap();
+        assert!(matches!(sess.claim_talk().await, TalkClaim::Ready));
+        sess.release_talk().await;
+        // The talk conn (idx 1 — the probe was 0) EOFs server-side.
+        let saw_close = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if v.closed.recv().await == Some(1) {
+                    return true;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        assert!(saw_close, "release must close the claim conn");
+        assert!(sess.talk(&[0_i16; 160]).await.is_err());
+        assert!(matches!(sess.claim_talk().await, TalkClaim::Ready));
+        assert_eq!(v.conns.load(std::sync::atomic::Ordering::Relaxed), 3);
+        drop(v);
         sess.close().await;
     }
 }
