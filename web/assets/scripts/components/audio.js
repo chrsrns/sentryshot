@@ -6,6 +6,17 @@ import { fetchPostJson, htmlToElem } from "../libs/common.js";
 
 const UNSUPPORTED_TITLE = "unsupported on this camera";
 
+/** Clear a wrap's title back to its `data-hint` (idle hint), or
+ * remove it when no hint exists. */
+const clearWrapTitle = (wrap) => {
+	const { hint } = wrap.dataset;
+	if (hint === undefined) {
+		wrap.removeAttribute("title");
+	} else {
+		wrap.setAttribute("title", hint);
+	}
+};
+
 /**
  * WS URL for the audio channel — `ws:`/`wss:` follows
  * `location.protocol` so a TLS front-end still works.
@@ -100,7 +111,10 @@ export function newAudioController(csrfToken, getMonitorId, errorElem) {
 			);
 			merged.set(pending);
 			for (let i = pending.length; i < merged.length; i++) {
-				const s = Math.max(-1, Math.min(1, input[(i - pending.length) * decimation]));
+				const s = Math.max(
+					-1,
+					Math.min(1, input[(i - pending.length) * decimation]),
+				);
 				merged[i] = s < 0 ? s * 32768 : s * 32767;
 			}
 			let off = 0;
@@ -188,7 +202,7 @@ export function newAudioController(csrfToken, getMonitorId, errorElem) {
 				if (marked) {
 					wrap.setAttribute("title", UNSUPPORTED_TITLE);
 				} else {
-					wrap.removeAttribute("title");
+					clearWrapTitle(wrap);
 				}
 			}
 		}
@@ -202,7 +216,7 @@ export function newAudioController(csrfToken, getMonitorId, errorElem) {
 			} else if (talkBusy) {
 				talkWrap.setAttribute("title", "another session is talking");
 			} else {
-				talkWrap.removeAttribute("title");
+				clearWrapTitle(talkWrap);
 			}
 		}
 	};
@@ -421,7 +435,7 @@ export function applyAudioMarks(root, unsupported) {
 			el.classList.add("ptz-unsupported");
 		} else {
 			if (wrap !== null) {
-				wrap.removeAttribute("title");
+				clearWrapTitle(wrap);
 			}
 			// @ts-ignore
 			el.disabled = false;
@@ -435,8 +449,6 @@ export function applyAudioMarks(root, unsupported) {
 const iconSpeakerPath = "assets/icons/feather/volume-2.svg";
 const iconMicPath = "assets/icons/feather/mic.svg";
 
-const glyphBtn = "ptz-glyph px-2 rounded-lg bg-color2 hover:bg-color3";
-
 /**
  * Audio cluster for a /live tile bar: speaker toggle (listen) + mic
  * hold-to-talk. Talk controls need `isSecureContext`; listen works on
@@ -449,13 +461,32 @@ export function newLiveAudio(csrfToken, monitorId) {
 	const elem = /** @type {HTMLElement} */ (
 		htmlToElem(/* HTML */ `
 			<div class="audio-cluster flex items-center">
-				<span class="js-audio-wrap"
-					><button type="button" class="js-audio-listen ${glyphBtn}">
-						<img src="${iconSpeakerPath}" alt="listen" /></button
+				<span class="js-audio-wrap" title="listen" data-hint="listen"
+					><button
+						type="button"
+						class="js-audio-listen feed-btn p-1 bg-transparent"
+					>
+						<img
+							class="icon-filter"
+							style="height: calc(var(--scale) * 1.5rem); aspect-ratio: 1;"
+							src="${iconSpeakerPath}"
+							alt="listen"
+						/></button
 				></span>
-				<span class="js-audio-wrap js-audio-talk-wrap"
-					><button type="button" class="js-audio-talk ${glyphBtn}">
-						<img src="${iconMicPath}" alt="talk" /></button
+				<span
+					class="js-audio-wrap js-audio-talk-wrap"
+					title="hold to talk"
+					data-hint="hold to talk"
+					><button
+						type="button"
+						class="js-audio-talk feed-btn p-1 bg-transparent"
+					>
+						<img
+							class="icon-filter"
+							style="height: calc(var(--scale) * 1.5rem); aspect-ratio: 1;"
+							src="${iconMicPath}"
+							alt="talk"
+						/></button
 				></span>
 				<div class="js-audio-error text-red"></div>
 			</div>

@@ -259,9 +259,7 @@ describe("audio controller", () => {
 		c.bindListen(root);
 		c.bindTalk(root);
 
-		const talk = /** @type {HTMLElement} */ (
-			root.querySelector(".js-audio-talk")
-		);
+		const talk = /** @type {HTMLElement} */ (root.querySelector(".js-audio-talk"));
 		talk.dispatchEvent(
 			Object.assign(new Event("pointerdown"), { button: 0, pointerId: 1 }),
 		);
@@ -275,8 +273,7 @@ describe("audio controller", () => {
 		});
 		expect(typeof proc.onaudioprocess).toBe("function");
 
-		const binarySent = () =>
-			ws.sent.filter((f) => typeof f !== "string");
+		const binarySent = () => ws.sent.filter((f) => typeof f !== "string");
 		/** @param {number} n */
 		const fire = (n) =>
 			proc.onaudioprocess({
@@ -314,5 +311,37 @@ describe("live audio cluster", () => {
 		const { elem } = newLiveAudio("csrf", "m1");
 		expect(elem.querySelector(".js-audio-listen")).not.toBeNull();
 		expect(elem.querySelector(".js-audio-talk")).not.toBeNull();
+	});
+	test("buttons wear feed-btn chrome + wraps carry hint titles", () => {
+		Object.defineProperty(window, "isSecureContext", {
+			value: true,
+			configurable: true,
+		});
+		const { elem } = newLiveAudio("csrf", "m1");
+		const listen = /** @type {HTMLElement} */ (
+			elem.querySelector(".js-audio-listen")
+		);
+		const talk = /** @type {HTMLElement} */ (elem.querySelector(".js-audio-talk"));
+		expect(listen.classList.contains("feed-btn")).toBe(true);
+		expect(talk.classList.contains("feed-btn")).toBe(true);
+		expect(elem.querySelectorAll("img.icon-filter")).toHaveLength(2);
+		const listenWrap = /** @type {HTMLElement} */ (
+			elem.querySelector(".js-audio-wrap")
+		);
+		const talkWrap = /** @type {HTMLElement} */ (
+			elem.querySelector(".js-audio-talk-wrap")
+		);
+		expect(talkWrap.getAttribute("title")).toBe("hold to talk");
+		expect(listenWrap.getAttribute("title")).toBe("listen");
+	});
+	test("marked title clears back to the data-hint", () => {
+		const { elem, controller } = newLiveAudio("csrf", "m1");
+		const wrap = /** @type {HTMLElement} */ (
+			elem.querySelector(".js-audio-talk-wrap")
+		);
+		controller.onCaps({ unsupported: ["talk"] });
+		expect(wrap.getAttribute("title")).toBe("unsupported on this camera");
+		controller.onCaps({ unsupported: [] });
+		expect(wrap.getAttribute("title")).toBe("hold to talk");
 	});
 });

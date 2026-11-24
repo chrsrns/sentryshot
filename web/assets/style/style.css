@@ -806,6 +806,13 @@ img {
 	pointer-events: none;
 }
 
+/* Two-way audio controls — the on-state for listen/talk. */
+
+.audio-active {
+	background: var(--color-green2);
+	box-shadow: inset 0 0 0 1px var(--color-green);
+}
+
 .ptz-hold {
 	/* stylelint-disable-next-line plugin/no-unsupported-browser-features */
 	touch-action: none;
