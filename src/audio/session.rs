@@ -41,8 +41,10 @@ const REQUIRE: &str = "www.onvif.org/ver20/backchannel";
 const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(30);
 /// 20 ms of 8 kHz mono PCM.
 const FRAME_SAMPLES: usize = 160;
-/// Talk queue bound — ~100 ms of audio (V258 drop-oldest).
-const TALK_QUEUE: usize = 5;
+/// Talk queue bound — ~400 ms of audio (V258 drop-oldest); sized
+/// over the worst-case client capture burst (a 256 ms callback
+/// lands ~13×20 ms frames at once).
+const TALK_QUEUE: usize = 20;
 /// Listen broadcast depth.
 const PCM_BROADCAST: usize = 16;
 
@@ -1400,14 +1402,17 @@ mod tests {
         task.abort();
     }
 
-    #[tokio::test]
-    async fn talk_pacer_writes_rtp_frames() {
-        const TALK_SDP: &str =
-            "v=0\r\nm=audio 0 RTP/AVP 0\r\na=sendonly\r\na=control:trackID=9\r\n";
-        let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    /// Talk-path RTSP stub — answers DESCRIBE with `sdp`, forwards
+    /// `$` interleaved payloads to the returned channel.
+    fn spawn_talk_stub(
+        sdp: &'static str,
+    ) -> (u16, tmpsc::Receiver<Vec<u8>>, tokio::task::JoinHandle<()>) {
+        let (tx, got) = tmpsc::channel::<Vec<u8>>(64);
+        let lis = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        lis.set_nonblocking(true).unwrap();
         let port = lis.local_addr().unwrap().port();
-        let (tx, mut got) = tmpsc::channel::<Vec<u8>>(8);
         let task = tokio::spawn(async move {
+            let lis = TcpListener::from_std(lis).unwrap();
             let (stream, _) = lis.accept().await.unwrap();
             let (rd, mut wr) = stream.into_split();
             let mut rd = tokio::io::BufReader::new(rd);
@@ -1443,7 +1448,7 @@ mod tests {
                 }
                 pending.push(head.clone());
                 let body = if head.starts_with("DESCRIBE") {
-                    TALK_SDP
+                    sdp
                 } else {
                     ""
                 };
@@ -1452,6 +1457,14 @@ mod tests {
                     .unwrap();
             }
         });
+        (port, got, task)
+    }
+
+    #[tokio::test]
+    async fn talk_pacer_writes_rtp_frames() {
+        const TALK_SDP: &str =
+            "v=0\r\nm=audio 0 RTP/AVP 0\r\na=sendonly\r\na=control:trackID=9\r\n";
+        let (port, mut got, task) = spawn_talk_stub(TALK_SDP);
         let client = RtspAudioClient::new(url(port), None);
         let sess = client.open(true).await.unwrap();
         sess.talk(&[1000_i16; 160]).await.unwrap();
@@ -1473,6 +1486,29 @@ mod tests {
             .unwrap();
         assert_eq!(rtp::parse(&f2).unwrap().payload.len(), 160);
         assert_eq!(rtp::parse(&f3).unwrap().payload.len(), 160);
+        sess.close().await;
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn talk_burst_does_not_drop() {
+        // A capture callback lands ~13×160-sample frames at once —
+        // the bounded queue must absorb the whole burst undropped.
+        const TALK_SDP: &str =
+            "v=0\r\nm=audio 0 RTP/AVP 0\r\na=sendonly\r\na=control:trackID=9\r\n";
+        let (port, mut got, task) = spawn_talk_stub(TALK_SDP);
+        let client = RtspAudioClient::new(url(port), None);
+        let sess = client.open(true).await.unwrap();
+        for _ in 0..13 {
+            sess.talk(&[7_i16; 160]).await.unwrap();
+        }
+        for _ in 0..13 {
+            let f = tokio::time::timeout(Duration::from_secs(2), got.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(rtp::parse(&f).unwrap().payload.len(), 160);
+        }
         sess.close().await;
         task.abort();
     }
@@ -1602,6 +1638,56 @@ mod tests {
         );
         sess.close().await;
         let _ = &mut st;
+    }
+
+    /// Live ear-test — `SS_LIVE_TONE=1` streams a 440 Hz sine for
+    /// ~15 s through the real claim+pacer path on 6eqdc. Residual
+    /// chop is audible as tone stutter; the probe also fails on
+    /// any send error. Not CI-safe — env-gated.
+    #[tokio::test]
+    async fn live_tone_probe() {
+        if std::env::var("SS_LIVE_TONE").is_err() {
+            return;
+        }
+        let cfg_path = std::env::var("SS_LIVE_CFG")
+            .unwrap_or_else(|_| "/tmp/ss-run/configs/monitors/6eqdc.json".into());
+        let cfg = std::fs::read_to_string(cfg_path).expect("monitor config");
+        let main = serde_json::from_str::<serde_json::Value>(&cfg).unwrap()["sourcertsp"]
+            ["mainStream"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let client = RtspAudioClient::new(url::Url::parse(&main).unwrap(), None);
+        let sess = client.open(true).await.expect("open");
+        assert!(sess.caps().talk, "{:?}", sess.caps());
+        match sess.claim_talk().await {
+            TalkClaim::Ready => {}
+            other => panic!("claim {other:?}"),
+        }
+        // Prime the queue, then feed one 160-sample frame per 20 ms —
+        // matches the pacer's drain rate so nothing drops.
+        let mut phase = 0.0_f32;
+        let mut frame = || {
+            (0..160)
+                .map(|_| {
+                    phase += 440.0 * std::f32::consts::TAU / 8000.0;
+                    (phase.sin() * 28_000.0) as i16
+                })
+                .collect::<Vec<i16>>()
+        };
+        for _ in 0..4 {
+            sess.talk(&frame()).await.unwrap();
+        }
+        let start = tokio::time::Instant::now();
+        for i in 0..746 {
+            sess.talk(&frame()).await.unwrap();
+            let target = start + Duration::from_millis(20 * (i + 1));
+            if let Some(d) = target.checked_duration_since(tokio::time::Instant::now()) {
+                tokio::time::sleep(d).await;
+            }
+        }
+        sess.release_talk().await;
+        sess.close().await;
     }
 
     #[tokio::test]

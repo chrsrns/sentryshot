@@ -83,23 +83,31 @@ export function newAudioController(csrfToken, getMonitorId, errorElem) {
 		const decimation = Math.round(rate / 8000);
 		// ScriptProcessor is deprecated but universally available —
 		// AudioWorklet needs a separate asset the daemon would have to
-		// serve; the 8 kHz decimation is cheap either way.
-		const node = captureCtx.createScriptProcessor(2048, 1, 1);
+		// serve; the 8 kHz decimation is cheap either way. The small
+		// buffer keeps bursts short (~64 ms @ 8 kHz).
+		const node = captureCtx.createScriptProcessor(512, 1, 1);
+		// Wire frames are always a full 20 ms (160 samples @ 8 kHz) —
+		// the decimated remainder carries between callbacks so a
+		// foreign-rate context can't emit sub-frame parts.
+		let pending = new Int16Array(0);
 		node.onaudioprocess = (ev) => {
 			if (ws === undefined || ws.readyState !== WebSocket.OPEN) {
 				return;
 			}
 			const input = ev.inputBuffer.getChannelData(0);
-			const out = new Int16Array(Math.floor(input.length / decimation));
-			for (let i = 0; i < out.length; i++) {
-				const s = Math.max(-1, Math.min(1, input[i * decimation]));
-				out[i] = s < 0 ? s * 32768 : s * 32767;
+			const merged = new Int16Array(
+				pending.length + Math.floor(input.length / decimation),
+			);
+			merged.set(pending);
+			for (let i = pending.length; i < merged.length; i++) {
+				const s = Math.max(-1, Math.min(1, input[(i - pending.length) * decimation]));
+				merged[i] = s < 0 ? s * 32768 : s * 32767;
 			}
-			// ≤20 ms wire frames (160 samples @ 8 kHz) — the
-			// ScriptProcessor buffer runs longer than one frame.
-			for (let off = 0; off < out.length; off += 160) {
-				ws.send(out.buffer.slice(off * 2, Math.min((off + 160) * 2, out.length * 2)));
+			let off = 0;
+			for (; off + 160 <= merged.length; off += 160) {
+				ws.send(merged.buffer.slice(off * 2, (off + 160) * 2));
 			}
+			pending = merged.slice(off);
 		};
 		source.connect(node);
 		node.connect(captureCtx.destination);

@@ -224,6 +224,80 @@ describe("audio controller", () => {
 		expect(err.textContent).toBe("session overrun");
 	});
 
+	test("talk capture sends only full 160-sample frames", async () => {
+		// Context running at a foreign rate (48 kHz — a browser may
+		// ignore the requested sampleRate) decimates to sub-frame
+		// chunks; the carry must hold them to 160 boundaries.
+		const proc = { connect() {}, onaudioprocess: undefined };
+		class MockAudioContext {
+			constructor() {
+				this.sampleRate = 48000;
+				this.destination = {};
+			}
+			createMediaStreamSource() {
+				return { connect() {} };
+			}
+			createScriptProcessor() {
+				return proc;
+			}
+			close() {
+				return Promise.resolve();
+			}
+		}
+		// @ts-ignore
+		global.AudioContext = MockAudioContext;
+		Object.defineProperty(global.navigator, "mediaDevices", {
+			value: {
+				getUserMedia: () => Promise.resolve({ getTracks: () => [] }),
+			},
+			configurable: true,
+		});
+		mkFetchToken();
+		const err = mkErrorElem();
+		const c = newAudioController("csrf", () => "m1", err);
+		const root = mkRoot();
+		c.bindListen(root);
+		c.bindTalk(root);
+
+		const talk = /** @type {HTMLElement} */ (
+			root.querySelector(".js-audio-talk")
+		);
+		talk.dispatchEvent(
+			Object.assign(new Event("pointerdown"), { button: 0, pointerId: 1 }),
+		);
+		await new Promise((resolve) => {
+			setTimeout(resolve, 0);
+		});
+		const ws = MockWebSocket.instances[0];
+		ws.open();
+		await new Promise((resolve) => {
+			setTimeout(resolve, 0);
+		});
+		expect(typeof proc.onaudioprocess).toBe("function");
+
+		const binarySent = () =>
+			ws.sent.filter((f) => typeof f !== "string");
+		/** @param {number} n */
+		const fire = (n) =>
+			proc.onaudioprocess({
+				inputBuffer: {
+					getChannelData: () => new Float32Array(n).fill(0.5),
+				},
+			});
+		fire(512); // 85 decimated samples — held, nothing sent.
+		expect(binarySent()).toHaveLength(0);
+		fire(512); // 170 total → one 160 frame + 10 carried.
+		expect(binarySent()).toHaveLength(1);
+		for (let i = 0; i < 5; i++) {
+			fire(512);
+		}
+		for (const f of binarySent()) {
+			expect(f.byteLength).toBe(320);
+		}
+
+		delete global.AudioContext;
+	});
+
 	test("session mint failure surfaces status", async () => {
 		// @ts-ignore
 		global.fetch = () =>
