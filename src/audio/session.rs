@@ -2047,7 +2047,24 @@ mod tests {
     async fn live_open_smoke() {
         let u = std::env::var("RTSP_URL").unwrap();
         let parsed = url::Url::parse(&u).unwrap();
-        let client = RtspAudioClient::new(parsed, None, no_cfg());
+        // Optional V380 creds via env — `V380_LIVE_USER`,
+        // `V380_LIVE_DEVID` (omit to exercise the ONVIF serial
+        // derive), `V380_ONVIF_ADDR` (derive endpoint).
+        let cfg: crate::service::CfgAccessor = std::sync::Arc::new(|| {
+            let f: std::pin::Pin<
+                Box<dyn std::future::Future<Output = crate::service::V380Cfg> + Send>,
+            > = Box::pin(async {
+                crate::service::V380Cfg {
+                    device_id: std::env::var("V380_LIVE_DEVID")
+                        .ok()
+                        .and_then(|v| v.parse().ok()),
+                    user: std::env::var("V380_LIVE_USER").ok(),
+                    onvif_addr: std::env::var("V380_ONVIF_ADDR").unwrap_or_default(),
+                }
+            });
+            f
+        });
+        let client = RtspAudioClient::new(parsed, None, cfg);
         let sess = client.open(true).await.unwrap();
         eprintln!("caps: {:?} marks: {:?}", sess.caps(), sess.marks());
         sess.close().await;
