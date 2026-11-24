@@ -53,6 +53,9 @@ pub const AUDIO_TYPE_IMA: u8 = 22;
 /// Audio fragment types accepted by the stream reassembler.
 const AUDIO_TYPES: &[u8] = &[21, 22, 24, 25, 26];
 
+/// `1168` reply minimum — fields through `nSpeaker`@66 (R70).
+const LOGIN_RESP_MIN: usize = 68;
+
 /// Inner header inside a reassembled audio frame — 16 B, the v32
 /// layout confirmed live on v3-era aydeh (frameId u32@0, codecType
 /// u16@4 = `22`, u16@6, ts u32@8, u32@12; a 272 B frame = 16 + one
@@ -128,11 +131,19 @@ impl V380Conn {
     ) -> Result<LoginResponse, Error> {
         let pkt = build_login(device_id, user, pass);
         self.write_all(&pkt).await?;
-        // Reply arrives as one packet; ≥68 B covers the parsed tail
-        // (`nSpeaker`@66). Read up to a packet-sized chunk.
+        // ≥68 B covers the parsed tail (`nSpeaker`@66); the reply
+        // may arrive TCP-segmented — accumulate until it does ∨
+        // the peer goes quiet (timeout ⇒ ⊥-V380 either way).
         let mut resp = [0_u8; 512];
-        let n = self.read_some(&mut resp).await?;
-        if n < 68 || !is_login_resp(&resp[..n]) {
+        let mut n = 0;
+        while n < LOGIN_RESP_MIN {
+            let r = self.read_some(&mut resp[n..]).await?;
+            if r == 0 {
+                break;
+            }
+            n += r;
+        }
+        if n < LOGIN_RESP_MIN || !is_login_resp(&resp[..n]) {
             // ⊥ `1168` — the dialect question went unanswered
             // (garbage head, foreign service); the probe maps
             // this fault to ⊥-V380, not a creds verdict.
@@ -164,17 +175,18 @@ impl V380Conn {
         Ok(i32::from_le_bytes(resp[4..8].try_into().expect("4B")))
     }
 
-    /// `301` stream-open (R77) → `401`. `comms_ver` =
-    /// `version >= 32 ? 21 : 20`; the reply's negotiated value is
-    /// read back but advisory on v<31 (audio params may be absent).
-    /// Returns the `401` result.
+    /// `301` stream-open on a fresh conn — authenticated by a
+    /// cross-conn `ticket` (a same-conn `1167`+`301` is refused).
+    /// `comms_ver` = `version >= 32 ? 21 : 20`. Returns
+    /// `(result, negotiated comms-ver u16@8)` — comms-ver may
+    /// come back lower than sent, ⊥ echo-assumed.
     pub async fn stream_open(
         &mut self,
         device_id: u32,
         ticket: u32,
         channel: u32,
         version: u8,
-    ) -> Result<i32, Error> {
+    ) -> Result<(i32, u16), Error> {
         let mut pkt = [0_u8; 256];
         pkt[0..4].copy_from_slice(&CMD_STREAM_OPEN.to_le_bytes());
         pkt[4..8].copy_from_slice(&device_id.to_le_bytes());
@@ -199,7 +211,12 @@ impl V380Conn {
                 &resp[..n.min(32)]
             )));
         }
-        Ok(i32::from_le_bytes(resp[4..8].try_into().expect("4B")))
+        // `result` i32@4; negotiated comms-ver u16@8 — the device
+        // may answer lower, ⊥ echo-assumed (R77).
+        Ok((
+            i32::from_le_bytes(resp[4..8].try_into().expect("4B")),
+            u16::from_le_bytes(resp[8..10].try_into().expect("4B")),
+        ))
     }
 
     /// `303` stream-start — 256 B packet, `0x3001` u16@4 (R77).
@@ -898,7 +915,7 @@ mod tests {
             (got, start)
         });
         let mut conn = test_conn(&host).await;
-        let result = conn.stream_open(46_078_507, 0x84ac, 2, 3).await.unwrap();
+        let (result, _comms_ver) = conn.stream_open(46_078_507, 0x84ac, 2, 3).await.unwrap();
         assert_eq!(result, 1001);
         conn.stream_start().await.unwrap();
         let (got, start) = task.await.unwrap();
@@ -937,7 +954,7 @@ mod tests {
             got
         });
         let mut conn = test_conn(&host).await;
-        conn.stream_open(1, 1, 0, 32).await.unwrap();
+        let _ = conn.stream_open(1, 1, 0, 32).await.unwrap();
         let got = task.await.unwrap();
         assert_eq!(u16::from_le_bytes(got[12..14].try_into().unwrap()), 21);
         assert_eq!(got[30..33], [1, 1, 1]); // v32-era tail bytes (R77)

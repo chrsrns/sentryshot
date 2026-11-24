@@ -240,6 +240,14 @@ pub trait AudioSession: Send + Sync {
     fn dead(&self) -> bool {
         false
     }
+
+    /// One-shot open advisory — a non-fatal verdict the open
+    /// recorded (V280: a V380 creds/result fault composing
+    /// alongside negotiated directions). The entry errors the
+    /// ctrl once on open; `None` ∀ clean opens.
+    fn open_advisory(&self) -> Option<String> {
+        None
+    }
 }
 
 /// `claim_talk` outcome — the entry maps to attach outcomes (V275).

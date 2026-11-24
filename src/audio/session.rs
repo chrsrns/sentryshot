@@ -281,6 +281,13 @@ impl RtspAudioClient {
 
         let (control, tagged) =
             described.map_or((String::new(), false), |d| (d.sdp.control, d.tagged));
+        // V280 — a creds/result verdict composing alongside
+        // negotiated directions is non-fatal: the session carries
+        // it as a one-shot advisory (`error` ctrl on open).
+        let advisory = match &v380 {
+            V380Out::Creds(m) => Some(m.clone()),
+            _ => None,
+        };
         Ok(RtspSession::start(
             client,
             session_id,
@@ -297,6 +304,7 @@ impl RtspAudioClient {
             }),
             media_rx,
             marks,
+            advisory,
         ))
     }
 }
@@ -607,11 +615,16 @@ impl LazyV380Stream {
             )));
         }
         let mut conn = crate::v380::V380Conn::connect(&claim.host).await?;
-        let result = conn
+        let (result, comms_ver) = conn
             .stream_open(claim.device_id, resp.ticket, claim.channel, claim.version)
             .await?;
         if result != crate::v380::login_result::OK {
             return Err(Error::Protocol(format!("v380 stream-open ({result})")));
+        }
+        // The negotiated comms-ver is read back (⊥ echo-assumed) —
+        // our packets are v20/v21-shaped ∀ else.
+        if !(20..=21).contains(&comms_ver) {
+            return Err(Error::Protocol(format!("v380 comms-ver {comms_ver}")));
         }
         conn.stream_start().await?;
         drop(login_conn);
@@ -1035,6 +1048,9 @@ pub struct RtspSession {
     /// Abnormal-task-exit signal — pump/pacer/keepalive send on
     /// transport death; `close` aborts tasks ⊥ signalling.
     dead_tx: watch::Sender<bool>,
+    /// Non-fatal open verdict (V280 — a V380 creds fault composing
+    /// alongside negotiated directions); surfaced as `error` ctrl.
+    advisory: Option<String>,
 }
 
 impl RtspSession {
@@ -1053,6 +1069,7 @@ impl RtspSession {
         v380: Option<ComposedV380>,
         media_rx: Option<mpsc::Receiver<Interleaved>>,
         marks: Vec<(Direction, FaultClass)>,
+        advisory: Option<String>,
     ) -> ArcAudioSession {
         let mut tasks = Vec::new();
         let (dead_tx, _) = watch::channel(false);
@@ -1134,6 +1151,7 @@ impl RtspSession {
             tasks: Mutex::new(tasks),
             closed: AtomicBool::new(false),
             dead_tx,
+            advisory,
         });
         // A pure-VIGI session owns no RTSP session — nothing to keep
         // alive.
@@ -1594,6 +1612,10 @@ impl AudioSession for RtspSession {
 
     fn dead(&self) -> bool {
         self.closed.load(Ordering::Relaxed) || *self.dead_tx.borrow()
+    }
+
+    fn open_advisory(&self) -> Option<String> {
+        self.advisory.clone()
     }
 }
 
@@ -2866,6 +2888,10 @@ mod tests {
                 talk: false
             }
         );
+        assert!(
+            sess.open_advisory().is_some_and(|m| m.contains("1018")),
+            "advisory carries the creds verdict"
+        );
         let _ = &mut st;
         sess.close().await;
     }
@@ -3722,6 +3748,7 @@ mod tests {
     /// decode offsets so the 16-vs-20 B inner header can be judged.
     #[tokio::test]
     #[ignore = "needs a live V380 camera on :8800"]
+    #[allow(clippy::too_many_lines)]
     async fn v380_live_listen_probe() {
         let host = std::env::var("V380_LIVE_HOST").expect("V380_LIVE_HOST");
         let user = std::env::var("V380_LIVE_USER").unwrap_or_else(|_| "Admin".into());
@@ -3749,7 +3776,7 @@ mod tests {
             same_conn
                 .as_ref()
                 .err()
-                .map_or("OK".into(), |e| e.to_string())
+                .map_or("OK".into(), ToString::to_string)
         );
         let (mut rd, mut wr) = match same_conn {
             Ok(halves) => halves,
@@ -3768,7 +3795,7 @@ mod tests {
                 let mut conn = crate::v380::V380Conn::connect(&claim.host)
                     .await
                     .expect("stream conn");
-                let r = conn
+                let (r, _cv) = conn
                     .stream_open(claim.device_id, resp.ticket, claim.channel, claim.version)
                     .await
                     .expect("cross-conn 301");

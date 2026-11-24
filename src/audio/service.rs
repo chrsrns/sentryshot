@@ -649,6 +649,18 @@ impl AudioService {
                     && !entry.owns_listen(consumer).await;
                 entry.add_interest(consumer, direction).await;
                 let ctrl_rx = entry.ctrl_tx.subscribe();
+                // V280 — non-fatal open verdict rides each attach
+                // (the `do_open` broadcast precedes this
+                // consumer's subscribe).
+                if let Some(msg) = open.session.open_advisory() {
+                    _ = entry.ctrl_tx.send(
+                        serde_json::json!({
+                            "type": "error",
+                            "message": msg,
+                        })
+                        .to_string(),
+                    );
+                }
                 if new_listen {
                     open.session.note_listen(1).await;
                     if open.session.claim_listen().await.is_err() {
@@ -980,6 +992,18 @@ impl AudioService {
                     Self::revoke_talk(entry).await;
                 }
                 self.broadcast_caps(entry).await;
+                // V280 — a non-fatal open verdict (V380 creds/
+                // result fault composing alongside negotiated
+                // directions) errors the ctrl once.
+                if let Some(msg) = session.open_advisory() {
+                    _ = entry.ctrl_tx.send(
+                        serde_json::json!({
+                            "type": "error",
+                            "message": msg,
+                        })
+                        .to_string(),
+                    );
+                }
                 let dead_watch = Self::spawn_dead_watch(entry, &session);
                 let (pcm_tx, _) = broadcast::channel(64);
                 let pump = if caps.listen {
@@ -1061,6 +1085,7 @@ mod tests {
         dead_keep: watch::Sender<bool>,
         lazy: Option<StubLazy>,
         lazy_listen: Option<StubLazyListen>,
+        advisory: Option<String>,
     }
 
     #[async_trait::async_trait]
@@ -1099,6 +1124,9 @@ mod tests {
         }
         fn claims_lazily(&self) -> bool {
             self.lazy.is_some()
+        }
+        fn open_advisory(&self) -> Option<String> {
+            self.advisory.clone()
         }
         async fn claim_talk(&self) -> TalkClaim {
             let Some(l) = &self.lazy else {
@@ -1228,6 +1256,7 @@ mod tests {
             dead_keep: watch::channel(false).0,
             lazy: None,
             lazy_listen: None,
+            advisory: None,
         })
     }
 
@@ -1249,6 +1278,16 @@ mod tests {
                 fault,
                 bad_tx: watch::channel(false).0,
             }),
+            advisory: None,
+        })
+    }
+
+    fn advisory_session(msg: &str) -> Arc<StubSession> {
+        let s = ok_session(true, false);
+        // Rebuild with the advisory set — `open_advisory` reads it.
+        Arc::new(StubSession {
+            advisory: Some(msg.to_owned()),
+            ..Arc::try_unwrap(s).unwrap_or_else(|_| unreachable!())
         })
     }
 
@@ -1271,6 +1310,7 @@ mod tests {
                 gate: Mutex::new(None),
             }),
             lazy_listen: None,
+            advisory: None,
         })
     }
 
@@ -1670,6 +1710,7 @@ mod tests {
             dead_keep: watch::channel(false).0,
             lazy: None,
             lazy_listen: None,
+            advisory: None,
         });
         let client = Arc::new(StubClient {
             session: Ok(sess),
@@ -1844,6 +1885,7 @@ mod tests {
             dead_keep: watch::channel(false).0,
             lazy: None,
             lazy_listen: None,
+            advisory: None,
         });
         let client = Arc::new(StubClient {
             session: Ok(sess),
@@ -1903,6 +1945,34 @@ mod tests {
         assert_eq!(l.claims.load(Ordering::SeqCst), 1);
         assert_eq!(l.interest.load(Ordering::SeqCst), 1);
         assert!(e.session_marks.lock().await.is_empty(), "⊥ mark");
+    }
+
+    /// V280 — a non-fatal open verdict errors the ctrl once per
+    /// attach (the `do_open` broadcast precedes this consumer's
+    /// subscribe, so `attach` re-emits).
+    #[tokio::test]
+    async fn open_advisory_errors_ctrl() {
+        let sess = advisory_session("v380: creds failed");
+        let client = stub_client(sess);
+        let (svc, _, _) = svc(client.clone());
+        let e = entry_of(&svc, &client);
+        let (drop_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        match svc
+            .attach(&e, &mid(), 1, Direction::Listen, &[], &drop_tx)
+            .await
+        {
+            Attach::Open(_, _, mut ctrl) => {
+                let msg = tokio::time::timeout(Duration::from_secs(2), ctrl.recv())
+                    .await
+                    .expect("error ctrl within 2s")
+                    .expect("ctrl channel");
+                assert!(
+                    msg.contains("\"error\"") && msg.contains("v380: creds failed"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected open, got {other:?}"),
+        }
     }
 
     /// V283 — last detach releases the claim; a re-attach re-claims.
