@@ -34,7 +34,8 @@ pub use service::{
 pub use session::RtspAudioClient;
 pub use v380::{
     IMA_BLOCK_BYTES, IMA_BLOCK_SAMPLES, ImaEncoder, LoginResponse, Reassembler, V380Conn,
-    ima_decode_block, is_login_resp, login_result,
+    derive_device_id, derive_xaddr, ima_decode_block, is_login_resp, login_result,
+    serial_low8_to_device_id, username_candidates,
 };
 pub use vigi::{VigiProbe, VigiTalk};
 

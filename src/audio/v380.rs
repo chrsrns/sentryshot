@@ -93,9 +93,18 @@ pub struct V380Conn {
 }
 
 impl V380Conn {
-    /// TCP connect to `host:8800`.
+    /// TCP connect to `host:8800` — an explicit `host:port` arg is
+    /// honored verbatim (stub tests).
     pub async fn connect(host: &str) -> Result<Self, Error> {
-        let stream = tokio::time::timeout(IO_TIMEOUT, TcpStream::connect((host, V380_PORT)))
+        let explicit_port = host
+            .rsplit_once(':')
+            .is_some_and(|(_, p)| p.parse::<u16>().is_ok());
+        let addr = if explicit_port {
+            host.to_owned()
+        } else {
+            format!("{host}:{}", V380_PORT)
+        };
+        let stream = tokio::time::timeout(IO_TIMEOUT, TcpStream::connect(addr))
             .await
             .map_err(|_| Error::Timeout("v380 connect"))??;
         _ = stream.set_nodelay(true);
@@ -434,6 +443,101 @@ fn parse_login_resp(b: &[u8]) -> LoginResponse {
 #[must_use]
 pub fn is_login_resp(b: &[u8]) -> bool {
     b.len() >= 4 && u32::from_le_bytes(b[0..4].try_into().expect("4B")) == CMD_LOGIN_RESP
+}
+
+// ── Credentials derivation (V279, R68–R70) ─────────────────────
+
+/// ONVIF device-service endpoint for the serial derivation — a
+/// valid stored `ptz.onvifAddr` verbatim, else the V380-era
+/// `:8899` default derived off the RTSP host.
+#[must_use]
+pub fn derive_xaddr(main_stream: &str, onvif_addr: &str) -> Option<String> {
+    if !onvif_addr.is_empty()
+        && common::monitor::PtzConfig::new(false, onvif_addr.to_owned()).onvif_addr_ok()
+    {
+        return Some(onvif_addr.to_owned());
+    }
+    let host = url::Url::parse(main_stream).ok()?.host_str()?.to_owned();
+    Some(format!("http://{host}:8899/onvif/device_service"))
+}
+
+/// Last-8-hex→`u32` device-ID derivation — the numeric V380 cloud
+/// ID is the serial's low 32 bits on v3-era units (proven on
+/// `f6a302bf1a2b` → `46078507`, R68). `?` universally — `None`
+/// on any deviation; a configured `v380DeviceId` overrides.
+#[must_use]
+pub fn serial_low8_to_device_id(serial: &str) -> Option<u32> {
+    let tail = serial.get(serial.len().saturating_sub(8)..)?;
+    if tail.is_empty() || !tail.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(tail, 16).ok()
+}
+
+/// `GetDeviceInformation` → `SerialNumber` → low-8-hex — `None`
+/// on any transport/parse fault or unparseable serial (the
+/// caller's ⊥-deviceId disposition).
+pub async fn derive_device_id(
+    soap: &onvif::SoapClient,
+    xaddr: &str,
+    creds: Option<(&str, &str)>,
+    timeout: Duration,
+) -> Option<u32> {
+    let (text, status) = soap
+        .soap_call(
+            xaddr,
+            r#"<tds:GetDeviceInformation xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>"#,
+            creds,
+            timeout,
+        )
+        .await
+        .ok()?;
+    if status != 200 {
+        return None;
+    }
+    let doc = onvif::parse_doc(&text).ok()?;
+    serial_low8_to_device_id(onvif::find_text(&doc, "SerialNumber").into_iter().next()?)
+}
+
+/// Username candidates in settle order — configured `v380User`,
+/// the v3-era app-account default `Admin`, then the RTSP user
+/// (case-sensitive, R69). Empties + duplicates dropped.
+#[must_use]
+pub fn username_candidates(v380_user: Option<&str>, rtsp_user: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(3);
+    for u in [v380_user.unwrap_or_default(), "Admin", rtsp_user] {
+        if !u.is_empty() && !out.iter().any(|s| s == u) {
+            out.push(u.to_owned());
+        }
+    }
+    out
+}
+
+impl V380Conn {
+    /// `:8800` logins over `users` in settle order — one fresh conn
+    /// per candidate; the first `1168` with result ≠ `BAD_USER`
+    /// wins and its live conn is returned. All-`BAD_USER` returns
+    /// the last verdict for the caller's creds disposition.
+    pub async fn login_viable(
+        host: &str,
+        device_id: u32,
+        users: &[String],
+        pass: &str,
+    ) -> Result<(Self, String, LoginResponse), Error> {
+        let mut last = None;
+        for u in users {
+            let mut conn = Self::connect(host).await?;
+            let resp = conn.login(device_id, u, pass).await?;
+            if resp.result != login_result::BAD_USER {
+                return Ok((conn, u.clone(), resp));
+            }
+            last = Some((conn, u.clone(), resp));
+        }
+        // All candidates got `BAD_USER` — surface the last verdict
+        // (on its conn, which the caller drops) for the creds
+        // disposition; an empty list is a protocol fault.
+        last.ok_or_else(|| Error::Protocol("no v380 username candidates".into()))
+    }
 }
 
 // ── IMA-ADPCM (Microsoft layout — R71/R76) ──────────────────────
@@ -932,5 +1036,160 @@ mod tests {
         assert_eq!(u16::from_le_bytes(fr[13..15].try_into().unwrap()), 256);
         assert_eq!(fr[15], 42);
         assert!(fr[16..].iter().all(|b| *b == 7));
+    }
+
+    // ── Credentials (V279) ───────────────────────────────────────
+
+    #[test]
+    fn serial_low8_hex_variants() {
+        assert_eq!(Some(46078507), serial_low8_to_device_id("f6a302bf1a2b"));
+        assert_eq!(Some(46078507), serial_low8_to_device_id("F6A302BF1A2B"));
+        assert_eq!(Some(0x02bf_1a2b), serial_low8_to_device_id("02bf1a2b"));
+        assert_eq!(Some(0x1a2b), serial_low8_to_device_id("1a2b")); // short
+        assert_eq!(None, serial_low8_to_device_id(""));
+        assert_eq!(None, serial_low8_to_device_id("xyz12345"));
+        assert_eq!(None, serial_low8_to_device_id("\u{00e9}\u{00e9}\u{00e9}"));
+    }
+
+    #[test]
+    fn xaddr_resolution_cases() {
+        assert_eq!(
+            "http://cam:8899/onvif/device_service",
+            derive_xaddr("rtsp://cam/live/ch00_1", "").unwrap()
+        );
+        // Stored onvifAddr wins verbatim.
+        assert_eq!(
+            "http://cam:2020/onvif/device_service",
+            derive_xaddr("rtsp://cam/x", "http://cam:2020/onvif/device_service").unwrap()
+        );
+        // An invalid stored value falls back to the :8899 default.
+        assert_eq!(
+            "http://cam:8899/onvif/device_service",
+            derive_xaddr("rtsp://cam/x", "https://cam").unwrap()
+        );
+        assert!(derive_xaddr("not a url", "").is_none());
+    }
+
+    #[test]
+    fn candidates_order_dedup() {
+        assert_eq!(
+            vec!["bob", "Admin", "admin"],
+            username_candidates(Some("bob"), "admin")
+        );
+        assert_eq!(vec!["Admin", "rtsp"], username_candidates(None, "rtsp"));
+        assert_eq!(vec!["Admin"], username_candidates(Some("Admin"), "Admin"));
+        assert_eq!(vec!["Admin"], username_candidates(None, ""));
+    }
+
+    /// Stub `:8800` that answers `1167` per-username — records the
+    /// attempt order, serves each candidate on a fresh conn.
+    async fn stub_user_gate(
+        verdicts: &[(&'static str, i32)],
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = lis.local_addr().unwrap().port();
+        let verdicts: Vec<(String, i32)> = verdicts
+            .iter()
+            .map(|(u, r)| ((*u).to_owned(), *r))
+            .collect();
+        let task = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            while let Ok((mut s, _)) = lis.accept().await {
+                let mut pkt = vec![0_u8; 256];
+                if s.read_exact(&mut pkt).await.is_err() {
+                    break;
+                }
+                let end = pkt[49..81].iter().position(|c| *c == 0).unwrap_or(32);
+                let user = String::from_utf8_lossy(&pkt[49..49 + end]).into_owned();
+                seen.push(user.clone());
+                let result = verdicts
+                    .iter()
+                    .find(|(u, _)| *u == user)
+                    .map(|(_, r)| *r)
+                    .unwrap_or(login_result::OK);
+                s.write_all(&login_resp(result, 3)).await.unwrap();
+            }
+            seen
+        });
+        (format!("127.0.0.1:{port}"), task)
+    }
+
+    #[tokio::test]
+    async fn login_viable_settles_on_first_non_bad_user() {
+        let (host, task) = stub_user_gate(&[
+            ("bob", login_result::BAD_USER),
+            ("Admin", login_result::OK),
+            ("admin", login_result::OK), // unreachable — Admin settled
+        ])
+        .await;
+        let users = username_candidates(Some("bob"), "admin");
+        let (_conn, user, resp) = V380Conn::login_viable(&host, 46078507, &users, "pw")
+            .await
+            .expect("login_viable");
+        assert_eq!("Admin", user);
+        assert_eq!(login_result::OK, resp.result);
+        drop(task); // conn closed by return — listener keeps running; order checked via seen
+    }
+
+    #[tokio::test]
+    async fn login_viable_all_bad_user_returns_last() {
+        let (host, task) = stub_user_gate(&[
+            ("Admin", login_result::BAD_USER),
+            ("rtsp", login_result::BAD_USER),
+        ])
+        .await;
+        let users = username_candidates(None, "rtsp");
+        let (_conn, _user, resp) = V380Conn::login_viable(&host, 46078507, &users, "pw")
+            .await
+            .expect("login_viable");
+        assert_eq!(login_result::BAD_USER, resp.result);
+        drop(task);
+    }
+
+    /// Minimal HTTP/1.1 server for the ONVIF derivation probe.
+    async fn stub_http(body: &'static str) -> String {
+        let lis = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = lis.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = lis.accept().await.unwrap();
+            let mut buf = vec![0_u8; 8192];
+            _ = s.read(&mut buf).await.unwrap();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            s.write_all(resp.as_bytes()).await.unwrap();
+        });
+        format!("http://127.0.0.1:{port}/onvif/device_service")
+    }
+
+    #[tokio::test]
+    async fn derive_device_id_parses_serial() {
+        let body = concat!(
+            r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">"#,
+            r#"<s:Body><tds:GetDeviceInformationResponse"#,
+            r#" xmlns:tds="http://www.onvif.org/ver10/device/wsdl">"#,
+            r#"<tds:SerialNumber>f6a302bf1a2b</tds:SerialNumber>"#,
+            "</tds:GetDeviceInformationResponse></s:Body></s:Envelope>"
+        );
+        let xaddr = stub_http(body).await;
+        let soap = onvif::SoapClient::new();
+        assert_eq!(
+            Some(46078507),
+            derive_device_id(&soap, &xaddr, None, Duration::from_secs(2)).await
+        );
+        // Missing SerialNumber ⇒ ⊥-deviceId.
+        let body2 = concat!(
+            r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">"#,
+            r#"<s:Body><tds:GetDeviceInformationResponse"#,
+            r#" xmlns:tds="http://www.onvif.org/ver10/device/wsdl"/>"#,
+            "</s:Body></s:Envelope>"
+        );
+        let xaddr2 = stub_http(body2).await;
+        assert_eq!(
+            None,
+            derive_device_id(&soap, &xaddr2, None, Duration::from_secs(2)).await
+        );
     }
 }
