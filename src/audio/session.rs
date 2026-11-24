@@ -587,13 +587,17 @@ impl LazyV380Stream {
         }
     }
 
-    /// Fresh-conn stream claim — `1167` login → `301`+`401` →
-    /// `303` (V283). `Ok` = conn halves post-stream-start.
+    /// Fresh-conn stream claim — `1167` on a login conn then
+    /// `301`+`401` → `303` on a SECOND conn authenticated by the
+    /// login's cross-conn ticket (V283 — a same-conn `1167`+`301`
+    /// is refused, live-verified aydeh: the conn closes). The
+    /// login conn drops post-`303`; the stream persists. `Ok` =
+    /// conn halves post-stream-start.
     async fn claim(
         claim: &V380Claim,
     ) -> Result<(crate::v380::V380Reader, crate::v380::V380Writer), Error> {
-        let mut conn = crate::v380::V380Conn::connect(&claim.host).await?;
-        let resp = conn
+        let mut login_conn = crate::v380::V380Conn::connect(&claim.host).await?;
+        let resp = login_conn
             .login(claim.device_id, &claim.user, &claim.pass)
             .await?;
         if resp.result != crate::v380::login_result::OK {
@@ -602,6 +606,7 @@ impl LazyV380Stream {
                 resp.result
             )));
         }
+        let mut conn = crate::v380::V380Conn::connect(&claim.host).await?;
         let result = conn
             .stream_open(claim.device_id, resp.ticket, claim.channel, claim.version)
             .await?;
@@ -609,6 +614,7 @@ impl LazyV380Stream {
             return Err(Error::Protocol(format!("v380 stream-open ({result})")));
         }
         conn.stream_start().await?;
+        drop(login_conn);
         Ok(conn.into_split())
     }
 }
@@ -3368,34 +3374,39 @@ mod tests {
                 let kill = kill2.clone();
                 tokio::spawn(async move {
                     let (mut rd, mut wr) = stream.into_split();
-                    // Dialect sniff — non-`1167` heads close
-                    // instantly, ⊥ stall on a partial packet.
+                    // Dialect sniff — the claim splits conns: `1167`
+                    // heads = the login conn (reply `1168`, hold till
+                    // close), `301` = the stream conn carrying a
+                    // cross-conn ticket. Other heads close instantly,
+                    // ⊥ stall on a partial packet.
                     let mut head = [0_u8; 4];
                     if rd.read_exact(&mut head).await.is_err() {
                         return;
                     }
-                    if u32::from_le_bytes(head) != 1167 {
+                    if u32::from_le_bytes(head) == 1167 {
+                        let mut pkt = [0_u8; 256];
+                        pkt[0..4].copy_from_slice(&head);
+                        if rd.read_exact(&mut pkt[4..]).await.is_err() {
+                            return;
+                        }
+                        if wr
+                            .write_all(&v380_reply(1001, 3, audio_pri, speaker))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        // Login conn idles until the claim drops it.
+                        let mut sink = Vec::new();
+                        _ = rd.read_buf(&mut sink).await;
                         return;
                     }
-                    let mut pkt = [0_u8; 256];
-                    pkt[0..4].copy_from_slice(&head);
-                    if rd.read_exact(&mut pkt[4..]).await.is_err() {
+                    if u32::from_le_bytes(head) != 301 {
                         return;
                     }
-                    if wr
-                        .write_all(&v380_reply(1001, 3, audio_pri, speaker))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    // `301` stream-open (256 B) → `401`+`1001`.
                     let mut open = [0_u8; 256];
-                    if rd.read_exact(&mut open).await.is_err() {
-                        _ = closed_tx.send(idx).await;
-                        return;
-                    }
-                    if u32::from_le_bytes(open[0..4].try_into().unwrap()) != 301 {
+                    open[0..4].copy_from_slice(&head);
+                    if rd.read_exact(&mut open[4..]).await.is_err() {
                         _ = closed_tx.send(idx).await;
                         return;
                     }
@@ -3487,10 +3498,10 @@ mod tests {
         f
     }
 
-    /// A typed audio frame — 20 B inner hdr (`codecType`@4) +
-    /// `blocks` × 256 B IMA blocks.
+    /// A typed audio frame — 16 B inner hdr (`codecType`@4, live
+    /// v3-era wire) + `blocks` × 256 B IMA blocks.
     fn v380_audio_frame(type_: u16, blocks: &[[u8; 256]]) -> Vec<u8> {
-        let mut f = vec![0_u8; 20];
+        let mut f = vec![0_u8; 16];
         f[4..6].copy_from_slice(&type_.to_le_bytes());
         for b in blocks {
             f.extend_from_slice(b);
@@ -3658,12 +3669,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        // The claim conn is idx 1 (the open probe was idx 0).
-        assert_eq!(st.conns.load(std::sync::atomic::Ordering::Relaxed), 2);
+        // The claim's conns are idx 1+2 (open probe = 0; login +
+        // stream conn per claim).
+        assert_eq!(st.conns.load(std::sync::atomic::Ordering::Relaxed), 3);
         sess.note_listen(-1).await;
         let saw_close = tokio::time::timeout(Duration::from_secs(3), async {
             while let Some(idx) = st.closed.recv().await {
-                if idx == 1 {
+                if idx == 2 {
                     return true;
                 }
             }
@@ -3672,15 +3684,136 @@ mod tests {
         .await
         .unwrap_or(false);
         assert!(saw_close, "last detach must close the stream conn");
-        // Re-attach re-claims — a fresh conn runs `301`/`303`.
+        // Re-attach re-claims — fresh conns run `301`/`303`.
         sess.note_listen(1).await;
         sess.claim_listen().await.unwrap();
         tokio::time::timeout(Duration::from_secs(3), st.started.recv())
             .await
             .expect("second 303 within 3s")
             .expect("started channel");
-        assert_eq!(st.conns.load(std::sync::atomic::Ordering::Relaxed), 3);
+        assert_eq!(st.conns.load(std::sync::atomic::Ordering::Relaxed), 5);
         drop(rtsp);
         sess.close().await;
+    }
+
+    /// Live listen probe (R77's inner-header `?`) — run against a
+    /// real V380 unit:
+    /// `V380_LIVE_HOST=<ip> V380_LIVE_USER=Admin V380_LIVE_PASS=<pw>
+    ///  V380_LIVE_DEVID=<id> cargo test v380_live_listen -- --ignored --nocapture`
+    /// Claims a stream conn via the real handshake, reassembles
+    /// audio frames, and dumps the leading bytes + both candidate
+    /// decode offsets so the 16-vs-20 B inner header can be judged.
+    #[tokio::test]
+    #[ignore = "needs a live V380 camera on :8800"]
+    async fn v380_live_listen_probe() {
+        let host = std::env::var("V380_LIVE_HOST").expect("V380_LIVE_HOST");
+        let user = std::env::var("V380_LIVE_USER").unwrap_or_else(|_| "Admin".into());
+        let pass = std::env::var("V380_LIVE_PASS").expect("V380_LIVE_PASS");
+        let device_id: u32 = std::env::var("V380_LIVE_DEVID")
+            .expect("V380_LIVE_DEVID")
+            .parse()
+            .unwrap();
+        let channel: u32 = std::env::var("V380_LIVE_CH")
+            .unwrap_or_else(|_| "0".into())
+            .parse()
+            .unwrap();
+        let claim = V380Claim {
+            host,
+            device_id,
+            user,
+            pass,
+            channel,
+            version: 3,
+        };
+        // Variant A — the real claim (two-conn `1167`+`301`/`303`).
+        let same_conn = LazyV380Stream::claim(&claim).await;
+        eprintln!(
+            "claim result: {}",
+            same_conn
+                .as_ref()
+                .err()
+                .map_or("OK".into(), |e| e.to_string())
+        );
+        let (mut rd, mut wr) = match same_conn {
+            Ok(halves) => halves,
+            Err(e) => {
+                // Variant B — refs' split-conn: `301` on a fresh conn
+                // carrying the ticket of a separate `1167` conn.
+                eprintln!("same-conn claim failed ({e}) — trying cross-conn ticket");
+                let mut login_conn = crate::v380::V380Conn::connect(&claim.host)
+                    .await
+                    .expect("login conn");
+                let resp = login_conn
+                    .login(claim.device_id, &claim.user, &claim.pass)
+                    .await
+                    .expect("login");
+                assert_eq!(resp.result, crate::v380::login_result::OK);
+                let mut conn = crate::v380::V380Conn::connect(&claim.host)
+                    .await
+                    .expect("stream conn");
+                let r = conn
+                    .stream_open(claim.device_id, resp.ticket, claim.channel, claim.version)
+                    .await
+                    .expect("cross-conn 301");
+                assert_eq!(r, crate::v380::login_result::OK, "cross-conn 301 result");
+                conn.stream_start().await.expect("303");
+                drop(login_conn);
+                conn.into_split()
+            }
+        };
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let mut type_counts = std::collections::BTreeMap::<u8, u32>::new();
+        let mut pending = Vec::<u8>::new();
+        let mut frames = Vec::<Vec<u8>>::new();
+        let mut tick = tokio::time::interval(Duration::from_millis(2_500));
+        tick.tick().await;
+        while tokio::time::Instant::now() < deadline && frames.len() < 6 {
+            tokio::select! {
+                frag = rd.next_fragment() => {
+                    let frag = match frag {
+                        Ok(f) => f,
+                        Err(e) => {
+                            eprintln!("fragment read error: {e}");
+                            break;
+                        }
+                    };
+                    *type_counts.entry(frag.type_).or_insert(0) += 1;
+                    if frag.type_ == crate::v380::AUDIO_TYPE_IMA {
+                        if frag.index == 0 {
+                            pending.clear();
+                        }
+                        pending.extend_from_slice(&frag.payload);
+                        if frag.index + 1 == frag.total {
+                            frames.push(std::mem::take(&mut pending));
+                        }
+                    }
+                }
+                _ = tick.tick() => {
+                    if let Err(e) = wr.keepalive_stream(channel, true).await {
+                        eprintln!("keepalive error: {e}");
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = wr.keepalive_stream(channel, false).await;
+        eprintln!("fragment types seen: {type_counts:?}");
+        assert!(!frames.is_empty(), "no IMA frames captured");
+        for (i, f) in frames.iter().enumerate() {
+            let n = f.len().min(48);
+            eprintln!("frame {i} len={} head={:02x?}", f.len(), &f[..n]);
+            for hdr in [16_usize, 20] {
+                if f.len() > hdr + 4 {
+                    let blk = &f[hdr..];
+                    let pred = i16::from_le_bytes([blk[0], blk[1]]);
+                    let step = blk[2];
+                    eprintln!(
+                        "  hdr={hdr}: predictor={pred} step_idx={step} \
+                         (step>88 ⇒ wrong offset)"
+                    );
+                }
+            }
+        }
     }
 }

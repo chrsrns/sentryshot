@@ -53,9 +53,12 @@ pub const AUDIO_TYPE_IMA: u8 = 22;
 /// Audio fragment types accepted by the stream reassembler.
 const AUDIO_TYPES: &[u8] = &[21, 22, 24, 25, 26];
 
-/// Inner header inside a reassembled audio frame — the v3-era skip
-/// (`?` R77: 20 B is the closest-era evidence, live-verify pending).
-const AUDIO_FRAME_INNER_HDR: usize = 20;
+/// Inner header inside a reassembled audio frame — 16 B, the v32
+/// layout confirmed live on v3-era aydeh (frameId u32@0, codecType
+/// u16@4 = `22`, u16@6, ts u32@8, u32@12; a 272 B frame = 16 + one
+/// 256 B IMA block). prsyahmi's raw-audio 20 B skip does not match
+/// the v3 wire (R77).
+const AUDIO_FRAME_INNER_HDR: usize = 16;
 
 /// `Error` reuse — protocol faults + transport + timeout all map to
 /// the audio crate's error surface.
@@ -181,14 +184,20 @@ impl V380Conn {
         pkt[14..18].copy_from_slice(&ticket.to_le_bytes());
         // Audio flag `4097`@22 — stream carries audio.
         pkt[22..26].copy_from_slice(&4097_u32.to_le_bytes());
-        // quality@26 stays 0; bytes 30-32 = 1.
-        pkt[30] = 1;
-        pkt[31] = 1;
+        // quality@26 stays 0; bytes 30,31,32 = 1 (v32-era —
+        // smichea; v3-era leaves them 0 — prsyahmi).
+        let tail = u8::from(version >= 32);
+        pkt[30] = tail;
+        pkt[31] = tail;
+        pkt[32] = tail;
         self.write_all(&pkt).await?;
         let mut resp = [0_u8; 64];
         let n = self.read_some(&mut resp).await?;
         if n < 10 || u32::from_le_bytes(resp[0..4].try_into().expect("4B")) != CMD_STREAM_RESP {
-            return Err(Error::Protocol("bad stream-open reply".into()));
+            return Err(Error::Protocol(format!(
+                "bad stream-open reply n={n} head={:02x?}",
+                &resp[..n.min(32)]
+            )));
         }
         Ok(i32::from_le_bytes(resp[4..8].try_into().expect("4B")))
     }
@@ -905,8 +914,7 @@ mod tests {
         assert_eq!(u16::from_le_bytes(got[12..14].try_into().unwrap()), 20); // v3 ⇒ 20
         assert_eq!(u32::from_le_bytes(got[14..18].try_into().unwrap()), 0x84ac);
         assert_eq!(u32::from_le_bytes(got[22..26].try_into().unwrap()), 4097);
-        assert_eq!(got[30], 1);
-        assert_eq!(got[31], 1);
+        assert_eq!(got[30..33], [0, 0, 0]); // v3-era tail stays zeroed
         assert_eq!(
             u32::from_le_bytes(start[0..4].try_into().unwrap()),
             CMD_STREAM_START
@@ -932,6 +940,7 @@ mod tests {
         conn.stream_open(1, 1, 0, 32).await.unwrap();
         let got = task.await.unwrap();
         assert_eq!(u16::from_le_bytes(got[12..14].try_into().unwrap()), 21);
+        assert_eq!(got[30..33], [1, 1, 1]); // v32-era tail bytes (R77)
     }
 
     #[test]
