@@ -7,7 +7,7 @@ use axum::{
 use bytesize::ByteSize;
 use common::{
     ArcAuth, ArcLogger, ArcStorage, DynEnvConfig, EnvConfig, ILogger, LogEntry, LogLevel,
-    monitor::{ArcMonitorManager, ArcStreamer},
+    monitor::{ArcMonitorManager, ArcStreamer, IMonitorManager},
     time::Duration,
 };
 use env::{EnvConf, EnvConfigNewError};
