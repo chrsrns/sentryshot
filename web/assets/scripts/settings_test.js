@@ -1328,4 +1328,18 @@ describe("newAudioField", () => {
 		field.set({ enable: true });
 		expect(panelOf(field).hasAttribute("hidden")).toBe(true);
 	});
+
+	test("non-owned keys survive a panel save byte-identical", () => {
+		const field = newAudioField("token", getId, {
+			cam1: { audio: { enable: true } },
+		});
+		const cfg = {
+			enable: true,
+			unsupported: ["talk"],
+			v380DeviceId: "12345678",
+			v380User: "Admin",
+		};
+		field.set(cfg);
+		expect(field.value()).toEqual(cfg);
+	});
 });

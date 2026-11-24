@@ -1257,6 +1257,8 @@ const ptzOnvifAddrRules = [
  * @typedef {Object} AudioConfig
  * @property {boolean} enable
  * @property {string[]=} unsupported
+ * @property {string=} v380DeviceId
+ * @property {string=} v380User
  */
 
 /**
@@ -1275,23 +1277,29 @@ function newAudioField(csrfToken, getMonitorId, monitors) {
 	const panel = newAudioPanel(csrfToken, getMonitorId);
 
 	const form = newForm(fields);
-	/** @type {string[]|undefined} */
-	let unsupported;
+	/** @type {Record<string, unknown>} */
+	let extra = {};
 	return {
 		elems: [...fields.enable.elems, panel.elem],
 		value() {
 			/** @type {AudioConfig} */
 			const value = { enable: false };
 			form.get(value);
-			// Server-managed capability marks — round-tripped untouched.
-			if (unsupported !== undefined) {
-				value.unsupported = unsupported;
+			// Keys this field does not own — server-managed capability
+			// marks, hand-edited V380 creds — round-tripped untouched.
+			for (const key of Object.keys(extra)) {
+				value[key] = extra[key];
 			}
 			return value;
 		},
 		set(input) {
 			const value = input === undefined ? {} : input;
-			unsupported = value.unsupported;
+			extra = {};
+			for (const key of Object.keys(value)) {
+				if (key !== "enable") {
+					extra[key] = value[key];
+				}
+			}
 			form.set(value);
 			// Panel only for a persisted monitor whose *saved* config
 			// has audio.enable true — an unsaved toggle or a scan
@@ -1305,7 +1313,8 @@ function newAudioField(csrfToken, getMonitorId, monitors) {
 			if (value.enable === true && savedEnable) {
 				panel.show();
 				// Persisted marks disable controls before any `caps`.
-				applyAudioMarks(panel.elem, unsupported || []);
+				const marks = /** @type {string[]|undefined} */ (extra.unsupported);
+				applyAudioMarks(panel.elem, marks || []);
 			} else {
 				panel.hide();
 			}
