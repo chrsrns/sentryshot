@@ -51,6 +51,30 @@ export function newAudioController(csrfToken, getMonitorId, errorElem) {
 	/** The pointer that initiated the active talk hold. */
 	let talkPointerId;
 
+	/** Mic gain ∈ [0.25, 4] — loaded from localStorage at use time
+	 * (the monitor id resolves lazily — ⊥ cache the key). */
+	let gainValue = 1;
+	const gainKey = () => `audioGain-${getMonitorId()}`;
+	const loadGain = () => {
+		const v = localStorage.getItem(gainKey());
+		if (v === null) {
+			return 1;
+		}
+		const n = Number(v);
+		return Number.isFinite(n) ? Math.min(4, Math.max(0.25, n)) : 1;
+	};
+	/** Re-read the stored gain for the current monitor — call on
+	 * capture start and panel show. Returns the live value. */
+	const refreshGain = () => {
+		gainValue = loadGain();
+		return gainValue;
+	};
+	/** @param {number} v */
+	const setGain = (v) => {
+		gainValue = Math.min(4, Math.max(0.25, v));
+		localStorage.setItem(gainKey(), String(gainValue));
+	};
+
 	// --- audio plumbing -------------------------------------------------
 
 	/** @type {AudioContext|undefined} */
@@ -85,8 +109,15 @@ export function newAudioController(csrfToken, getMonitorId, errorElem) {
 
 	/** Mic capture → 8 kHz Int16 → binary frames. */
 	const startCapture = async () => {
+		refreshGain();
 		micStream = await navigator.mediaDevices.getUserMedia({
-			audio: { channelCount: 1, sampleRate: 8000 },
+			audio: {
+				channelCount: 1,
+				sampleRate: 8000,
+				echoCancellation: true,
+				noiseSuppression: true,
+				autoGainControl: true,
+			},
 		});
 		captureCtx = new AudioContext({ sampleRate: 8000 });
 		const source = captureCtx.createMediaStreamSource(micStream);
@@ -113,7 +144,7 @@ export function newAudioController(csrfToken, getMonitorId, errorElem) {
 			for (let i = pending.length; i < merged.length; i++) {
 				const s = Math.max(
 					-1,
-					Math.min(1, input[(i - pending.length) * decimation]),
+					Math.min(1, input[(i - pending.length) * decimation] * gainValue),
 				);
 				merged[i] = s < 0 ? s * 32768 : s * 32767;
 			}
@@ -184,6 +215,9 @@ export function newAudioController(csrfToken, getMonitorId, errorElem) {
 	};
 
 	// --- controls -------------------------------------------------------
+
+	/** @returns {number} */
+	const getGain = () => gainValue;
 
 	/** @type {HTMLButtonElement|undefined} */
 	let listenBtn;
@@ -378,6 +412,9 @@ export function newAudioController(csrfToken, getMonitorId, errorElem) {
 		},
 		/** Re-emit caps marks — call after binding both controls. */
 		applyAudioCaps,
+		setGain,
+		getGain,
+		refreshGain,
 		/** Feed a server `caps` payload through mark/busy handling —
 		 * used by harnesses that drive the wire directly. */
 		onCaps(caps) {

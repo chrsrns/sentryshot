@@ -1331,6 +1331,11 @@ function newAudioPanel(csrfToken, getMonitorId) {
 			<div class="flex gap-2 items-center p-2 border border-color3 rounded-lg w-max">
 				<span class="js-audio-wrap"><button type="button" class="js-audio-listen ${glyphBtn}">listen</button></span>
 				<span class="js-audio-wrap js-audio-talk-wrap"><button type="button" class="js-audio-talk ${glyphBtn}">hold to talk</button></span>
+				<label class="flex items-center gap-1 text-1.5 text-color">
+					mic gain
+					<input type="range" class="js-audio-gain" min="0.25" max="4" step="0.05">
+					<span class="js-audio-gain-val"></span>
+				</label>
 				<div class="js-audio-error text-red"></div>
 			</div>
 		</li>
@@ -1340,6 +1345,22 @@ function newAudioPanel(csrfToken, getMonitorId) {
 	controller.bindListen(elem);
 	controller.bindTalk(elem);
 	controller.attach();
+	const gainInput = /** @type {HTMLInputElement} */ (elem.querySelector(".js-audio-gain"));
+	const gainVal = elem.querySelector(".js-audio-gain-val");
+	const showGain = () => {
+		const g = controller.refreshGain();
+		gainInput.value = `${g}`;
+		if (gainVal !== null) {
+			gainVal.textContent = `×${g.toFixed(2)}`;
+		}
+	};
+	gainInput.addEventListener("input", () => {
+		controller.setGain(Number(gainInput.value));
+		const g = controller.getGain();
+		if (gainVal !== null) {
+			gainVal.textContent = `×${g.toFixed(2)}`;
+		}
+	});
 	if (!window.isSecureContext) {
 		const talk = /** @type {HTMLButtonElement} */ (elem.querySelector(".js-audio-talk"));
 		talk.disabled = true;
@@ -1351,6 +1372,7 @@ function newAudioPanel(csrfToken, getMonitorId) {
 	return {
 		elem,
 		show() {
+			showGain();
 			elem.removeAttribute("hidden");
 		},
 		hide() {

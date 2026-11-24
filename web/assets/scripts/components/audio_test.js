@@ -72,6 +72,7 @@ const mkFetchToken = () => {
 beforeEach(() => {
 	uidReset();
 	MockWebSocket.instances = [];
+	localStorage.clear();
 	// @ts-ignore
 	global.WebSocket = MockWebSocket;
 });
@@ -224,10 +225,9 @@ describe("audio controller", () => {
 		expect(err.textContent).toBe("session overrun");
 	});
 
-	test("talk capture sends only full 160-sample frames", async () => {
-		// Context running at a foreign rate (48 kHz — a browser may
-		// ignore the requested sampleRate) decimates to sub-frame
-		// chunks; the carry must hold them to 160 boundaries.
+	/** Mock the capture chain (48 kHz context — a browser may ignore
+	 * the requested rate), open the talk hold, return the harness. */
+	const mkCapture = async (monitorId) => {
 		const proc = { connect() {}, onaudioprocess: undefined };
 		class MockAudioContext {
 			constructor() {
@@ -254,7 +254,7 @@ describe("audio controller", () => {
 		});
 		mkFetchToken();
 		const err = mkErrorElem();
-		const c = newAudioController("csrf", () => "m1", err);
+		const c = newAudioController("csrf", () => monitorId, err);
 		const root = mkRoot();
 		c.bindListen(root);
 		c.bindTalk(root);
@@ -271,7 +271,14 @@ describe("audio controller", () => {
 		await new Promise((resolve) => {
 			setTimeout(resolve, 0);
 		});
-		expect(typeof proc.onaudioprocess).toBe("function");
+		if (typeof proc.onaudioprocess !== "function") {
+			throw new TypeError("onaudioprocess never wired");
+		}
+		return { proc, ws, controller: c };
+	};
+
+	test("talk capture sends only full 160-sample frames", async () => {
+		const { proc, ws } = await mkCapture("m1");
 
 		const binarySent = () => ws.sent.filter((f) => typeof f !== "string");
 		/** @param {number} n */
@@ -293,6 +300,74 @@ describe("audio controller", () => {
 		}
 
 		delete global.AudioContext;
+	});
+
+	test("setGain scales sent frames live mid-capture + stores", async () => {
+		const { proc, ws, controller } = await mkCapture("m9");
+		const binarySent = () => ws.sent.filter((f) => typeof f !== "string");
+		/** @param {number} n */
+		const fire = (n) =>
+			proc.onaudioprocess({
+				inputBuffer: {
+					getChannelData: () => new Float32Array(n).fill(0.25),
+				},
+			});
+		fire(512);
+		fire(512); // ≥170 decimated samples → first frame out
+		const f1 = /** @type {ArrayBuffer} */ (binarySent().at(-1));
+		const amp1 = new Int16Array(f1)[0];
+
+		controller.setGain(2);
+		// The ≤159-sample carry is pre-gain — fire past one frame so
+		// the last frame is entirely post-change.
+		for (let i = 0; i < 4; i++) {
+			fire(512);
+		}
+		const f2 = /** @type {ArrayBuffer} */ (binarySent().at(-1));
+		const amp2 = new Int16Array(f2)[0];
+
+		expect(amp2).toBeGreaterThan(amp1 * 1.8);
+		expect(localStorage.getItem("audioGain-m9")).toBe("2");
+		localStorage.clear();
+		delete global.AudioContext;
+	});
+
+	test("stored gain applies at capture start", async () => {
+		localStorage.setItem("audioGain-m9", "2");
+		const { proc, ws } = await mkCapture("m9");
+		const binarySent = () => ws.sent.filter((f) => typeof f !== "string");
+		/** @param {number} n */
+		const fire = (n) =>
+			proc.onaudioprocess({
+				inputBuffer: {
+					getChannelData: () => new Float32Array(n).fill(0.25),
+				},
+			});
+		fire(512);
+		fire(512);
+		const f = /** @type {ArrayBuffer} */ (binarySent().at(-1));
+		// 0.25 × 2 → ≈0.5 → ~16383 vs the 8191 of gain 1.
+		expect(new Int16Array(f)[0]).toBeGreaterThan(15000);
+		localStorage.clear();
+		delete global.AudioContext;
+	});
+
+	test("storage edges — NaN default, range clamp, per-monitor key", () => {
+		let id = "a";
+		const c = newAudioController("csrf", () => id, mkErrorElem());
+		expect(c.refreshGain()).toBe(1); // empty storage
+		localStorage.setItem("audioGain-a", "abc");
+		expect(c.refreshGain()).toBe(1); // NaN
+		localStorage.setItem("audioGain-a", "99");
+		expect(c.refreshGain()).toBe(4); // clamp high
+		localStorage.setItem("audioGain-a", "0.01");
+		expect(c.refreshGain()).toBe(0.25); // clamp low
+		c.setGain(2);
+		id = "b";
+		expect(c.refreshGain()).toBe(1); // b unset — no bleed
+		id = "a";
+		expect(c.refreshGain()).toBe(2); // a's pref restored
+		localStorage.clear();
 	});
 
 	test("session mint failure surfaces status", async () => {
