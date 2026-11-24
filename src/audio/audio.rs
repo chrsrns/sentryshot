@@ -22,6 +22,7 @@ mod rtsp;
 mod sdp;
 mod service;
 mod session;
+mod v380;
 mod vigi;
 
 pub use rtsp::{Interleaved, Response, RtspClient};
@@ -31,6 +32,10 @@ pub use service::{
     TOKEN_TTL, WS_PING_CADENCE,
 };
 pub use session::RtspAudioClient;
+pub use v380::{
+    IMA_BLOCK_BYTES, IMA_BLOCK_SAMPLES, ImaEncoder, LoginResponse, Reassembler, V380Conn,
+    ima_decode_block, is_login_resp, login_result,
+};
 pub use vigi::{VigiProbe, VigiTalk};
 
 /// Decoded PCM frame — Int16 little-endian, 8 kHz, mono.
