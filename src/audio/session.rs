@@ -529,6 +529,147 @@ fn session_timeout(resp: &crate::rtsp::Response) -> Duration {
 /// Listen-path state — decoded PCM fans out on a broadcast.
 struct ListenState {
     rx: Mutex<broadcast::Receiver<PcmChunk>>,
+    /// The parked broadcast's sender ∀ attach-claimed listen
+    /// (V283) — keeps `recv()` open while unclaimed; `close`
+    /// drops it for EOS. `None` ∀ the RTSP pump path.
+    tx: Mutex<Option<broadcast::Sender<PcmChunk>>>,
+    lazy_v380: Option<LazyV380Stream>,
+}
+
+/// An installed V380 stream conn — the pump task owns both
+/// halves; drop aborts it and the conn closes (B122).
+struct V380Streamer {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for V380Streamer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Attach-claimed stream-conn slot (V283) — `Claiming` publishes
+/// the outcome so a concurrent first-listen attach joins it (⊥ a
+/// second `:8800` dial); a release ∨ the last interest drop
+/// mid-claim supersedes the in-flight outcome.
+enum ListenSlot {
+    /// Never claimed ∨ released.
+    Idle,
+    /// In-flight claim — the sender publishes once.
+    Claiming(watch::Sender<Option<Result<(), String>>>),
+    /// Claimed + pumping — the streamer is held for its `Drop`
+    /// (pump-task abort + conn close), ⊥ field reads.
+    Live(#[allow(dead_code)] V380Streamer),
+}
+
+/// Attach-claimed V380 `:8800` stream conn (V283) — the talk
+/// claim's posture on the listen side: connect outside locks,
+/// install under the slot write lock gated on a live session +
+/// live listen-interest.
+struct LazyV380Stream {
+    slot: Mutex<ListenSlot>,
+    claim: V380Claim,
+    /// Live listen-interest mirrored by the entry — the install
+    /// gate + the release-on-zero trigger.
+    interest: std::sync::atomic::AtomicUsize,
+    /// Non-`22` audio-type signal — the entry marks `listen`
+    /// session-classed + errors the ctrl.
+    bad_tx: watch::Sender<bool>,
+}
+
+impl LazyV380Stream {
+    fn new(claim: V380Claim) -> Self {
+        Self {
+            slot: Mutex::new(ListenSlot::Idle),
+            claim,
+            interest: std::sync::atomic::AtomicUsize::new(0),
+            bad_tx: watch::channel(false).0,
+        }
+    }
+
+    /// Fresh-conn stream claim — `1167` login → `301`+`401` →
+    /// `303` (V283). `Ok` = conn halves post-stream-start.
+    async fn claim(
+        claim: &V380Claim,
+    ) -> Result<(crate::v380::V380Reader, crate::v380::V380Writer), Error> {
+        let mut conn = crate::v380::V380Conn::connect(&claim.host).await?;
+        let resp = conn
+            .login(claim.device_id, &claim.user, &claim.pass)
+            .await?;
+        if resp.result != crate::v380::login_result::OK {
+            return Err(Error::Protocol(format!(
+                "v380 stream login ({})",
+                resp.result
+            )));
+        }
+        let result = conn
+            .stream_open(claim.device_id, resp.ticket, claim.channel, claim.version)
+            .await?;
+        if result != crate::v380::login_result::OK {
+            return Err(Error::Protocol(format!("v380 stream-open ({result})")));
+        }
+        conn.stream_start().await?;
+        Ok(conn.into_split())
+    }
+}
+
+/// Stream-conn pump (V283) — `0x7f` fragments reassemble into
+/// audio frames: `type@1` = `22` ⇒ IMA-ADPCM ⇒ the listen
+/// broadcast; other audio-typed frames flag the entry once (⊥
+/// silent drop); a conn fault signals session transport death
+/// (V256 teardown applies).
+async fn v380_listen_pump(
+    mut rd: crate::v380::V380Reader,
+    mut wr: crate::v380::V380Writer,
+    channel: u32,
+    tx: broadcast::Sender<PcmChunk>,
+    bad_tx: watch::Sender<bool>,
+    dead_tx: watch::Sender<bool>,
+) {
+    let mut reasm = crate::v380::Reassembler::new();
+    let mut tick = tokio::time::interval(Duration::from_millis(2_500));
+    tick.tick().await; // skip the immediate first tick
+    loop {
+        tokio::select! {
+            frag = rd.next_fragment() => {
+                let Ok(frag) = frag else {
+                    _ = dead_tx.send(true);
+                    return;
+                };
+                match reasm.push(&frag) {
+                    Ok(Some(frame)) if frag.type_ == crate::v380::AUDIO_TYPE_IMA => {
+                        let mut pcm =
+                            Vec::with_capacity(crate::v380::IMA_BLOCK_SAMPLES);
+                        for blk in frame.chunks_exact(crate::v380::IMA_BLOCK_BYTES)
+                        {
+                            pcm.extend_from_slice(&crate::v380::ima_decode_block(
+                                blk.try_into().expect("block-sized chunk"),
+                            ));
+                        }
+                        _ = tx.send(pcm); // zero listeners ≠ death
+                    }
+                    Ok(Some(_)) => {
+                        // Audio-typed frame ∀ a codec we can't
+                        // decode — session-classed `Listen` mark +
+                        // `error` ctrl upstream.
+                        _ = bad_tx.send(true);
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        _ = dead_tx.send(true);
+                        return;
+                    }
+                }
+            }
+            _ = tick.tick() => {
+                // `8449`+channel+audio-`4097` keepalive ≤3 s (V283).
+                if wr.keepalive_stream(channel, true).await.is_err() {
+                    _ = dead_tx.send(true);
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// Where the pacer writes talk media — RTSP interleaved or a
@@ -688,12 +829,13 @@ struct V380Claim {
     pass: String,
     /// `chNN` index from the monitor's RTSP path, oracle-clamped.
     channel: u32,
+    /// Login's `version` — `stream_open`'s comms-ver gate (V283).
+    version: u8,
 }
 
 /// A V380 dialect proven at open — the claim descriptor the lazy
 /// talker (V282) and the attach-claimed stream conn (V283)
 /// re-authenticate with; `serves_*` = the login's caps oracle.
-#[allow(dead_code)] // `serves_*` + reuse lands with the listen claim.
 struct ComposedV380 {
     claim: V380Claim,
     serves_listen: bool,
@@ -797,6 +939,7 @@ async fn probe_v380(
                     user,
                     pass: rtsp_pass.to_owned(),
                     channel,
+                    version: resp.version,
                 },
                 n_audio_pri: resp.n_audio_pri > 0,
                 n_speaker: resp.n_speaker > 0,
@@ -909,10 +1052,9 @@ impl RtspSession {
         let (dead_tx, _) = watch::channel(false);
 
         // Listen pump — interleaved → RTP → seq-check → G.711 → PCM.
-        // A V380-served listen allocates the broadcast at compose
-        // but parks unclaimed — `recv()` waits on it (⊥ EOS, V283);
-        // the stream-conn claim + pump land in T156.
-        let v380_listen = v380.as_ref().is_some_and(|v| v.serves_listen);
+        // A V380-served listen (V283) allocates the broadcast at
+        // compose and parks unclaimed — the `tx` is held so `recv()`
+        // waits (⊥ EOS); the first-attach stream-conn claim pumps it.
         let listen_state = listen
             .and_then(|b| media_rx.map(|rx| (b, rx)))
             .map(|(b, media_rx)| {
@@ -920,12 +1062,20 @@ impl RtspSession {
                 let mut channels: HashMap<u8, (u8, sdp::Codec)> = HashMap::new();
                 channels.insert(b.channel, (b.pt, b.codec));
                 tasks.push(tokio::spawn(pump(media_rx, channels, tx, dead_tx.clone())));
-                ListenState { rx: Mutex::new(rx) }
+                ListenState {
+                    rx: Mutex::new(rx),
+                    tx: Mutex::new(None),
+                    lazy_v380: None,
+                }
             })
             .or_else(|| {
-                v380_listen.then(|| {
-                    let (_tx, rx) = broadcast::channel(PCM_BROADCAST);
-                    ListenState { rx: Mutex::new(rx) }
+                v380.as_ref().filter(|v| v.serves_listen).map(|v| {
+                    let (tx, rx) = broadcast::channel(PCM_BROADCAST);
+                    ListenState {
+                        rx: Mutex::new(rx),
+                        tx: Mutex::new(Some(tx)),
+                        lazy_v380: Some(LazyV380Stream::new(v.claim.clone())),
+                    }
                 })
             });
 
@@ -1233,6 +1383,14 @@ impl AudioSession for RtspSession {
         // ACTIVE close of a held `:8800` talker (V275/B122 — the
         // device slot must free, ⊥ Arc-drop reliance).
         self.drop_talker().await;
+        // V283 — release the claimed stream conn the same way, and
+        // drop the parked broadcast sender so `recv()` EOSes.
+        if let Some(l) = &self.listen {
+            if let Some(lazy) = &l.lazy_v380 {
+                *lazy.slot.lock().await = ListenSlot::Idle;
+            }
+            l.tx.lock().await.take();
+        }
     }
 
     fn dead_rx(&self) -> watch::Receiver<bool> {
@@ -1329,6 +1487,105 @@ impl AudioSession for RtspSession {
             .map_or(0, |l| l.claim_gen.load(Ordering::Relaxed))
     }
 
+    fn claims_listen_lazily(&self) -> bool {
+        self.lazy_stream().is_some()
+    }
+
+    /// V283 — live listen-interest mirror: `+1` per listen attach,
+    /// `-1` per detach; reaching `0` releases the conn (B122).
+    async fn note_listen(&self, delta: i64) {
+        let Some(lazy) = self.lazy_stream() else {
+            return;
+        };
+        if delta > 0 {
+            lazy.interest
+                .fetch_add(usize::try_from(delta).unwrap_or(1), Ordering::Relaxed);
+            return;
+        }
+        let n = usize::try_from(delta.unsigned_abs()).unwrap_or(1);
+        let zeroed = lazy
+            .interest
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                Some(c.saturating_sub(n))
+            })
+            .is_ok_and(|prev| prev <= n);
+        if zeroed {
+            *lazy.slot.lock().await = ListenSlot::Idle;
+        }
+    }
+
+    /// V283 — connect outside locks, single-flight (joiners
+    /// subscribe to the in-flight outcome — ⊥ a second dial),
+    /// install under the slot write lock gated on a live session
+    /// + live listen-interest (a stale claim drops its conn).
+    async fn claim_listen(&self) -> Result<(), Error> {
+        let Some(l_state) = &self.listen else {
+            return Ok(());
+        };
+        let Some(lazy) = &l_state.lazy_v380 else {
+            return Ok(());
+        };
+        let join = {
+            let mut slot = lazy.slot.lock().await;
+            match &*slot {
+                ListenSlot::Live(_) => return Ok(()),
+                ListenSlot::Claiming(tx) => Some(tx.subscribe()),
+                ListenSlot::Idle => {
+                    let (tx, _rx) = watch::channel(None);
+                    *slot = ListenSlot::Claiming(tx);
+                    None
+                }
+            }
+        };
+        if let Some(mut rx) = join {
+            _ = rx.wait_for(Option::is_some).await;
+            return match rx.borrow().clone() {
+                Some(Ok(())) => Ok(()),
+                Some(Err(e)) => Err(Error::Protocol(e)),
+                None => Err(Error::Protocol("listen claim aborted".into())),
+            };
+        }
+        // We claim — the handshake runs outside the slot lock.
+        let claimed = LazyV380Stream::claim(&lazy.claim).await;
+        let mut slot = lazy.slot.lock().await;
+        let ListenSlot::Claiming(publisher) = &*slot else {
+            // Released mid-claim — drop the conn (⊥ installs).
+            return Err(Error::Protocol("listen claim superseded".into()));
+        };
+        let publisher = publisher.clone();
+        let parked = l_state.tx.lock().await.clone();
+        let (outcome, next) = match claimed {
+            Err(e) => (Err(e.to_string()), ListenSlot::Idle),
+            Ok((rd, wr)) => {
+                let stale = self.dead() || lazy.interest.load(Ordering::Relaxed) == 0;
+                match (parked, stale) {
+                    (Some(tx), false) => (
+                        Ok(()),
+                        ListenSlot::Live(V380Streamer {
+                            task: tokio::spawn(v380_listen_pump(
+                                rd,
+                                wr,
+                                lazy.claim.channel,
+                                tx,
+                                lazy.bad_tx.clone(),
+                                self.dead_tx.clone(),
+                            )),
+                        }),
+                    ),
+                    _ => (Err("listen claim superseded".to_owned()), ListenSlot::Idle),
+                }
+            }
+        };
+        *slot = next;
+        drop(slot);
+        _ = publisher.send(Some(outcome.clone()));
+        outcome.map_err(Error::Protocol)
+    }
+
+    fn bad_listen_rx(&self) -> Option<watch::Receiver<bool>> {
+        self.lazy_stream().map(|l| l.bad_tx.subscribe())
+    }
+
     fn dead(&self) -> bool {
         self.closed.load(Ordering::Relaxed) || *self.dead_tx.borrow()
     }
@@ -1351,6 +1608,12 @@ impl RtspSession {
         }
     }
 
+    /// The attach-claimed stream-conn slot, when this session's
+    /// listen rides V380 (V283).
+    fn lazy_stream(&self) -> Option<&LazyV380Stream> {
+        self.listen.as_ref()?.lazy_v380.as_ref()
+    }
+
     /// Drop the installed `:8800` talker — TCP close frees the
     /// device-side single-talker slot (R63).
     async fn drop_talker(&self) {
@@ -1364,7 +1627,11 @@ impl RtspSession {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::as_conversions,
+    clippy::cast_possible_truncation
+)]
 mod tests {
     use super::*;
     use crate::{Codec, Direction};
@@ -3056,6 +3323,364 @@ mod tests {
         assert!(matches!(sess.claim_talk().await, TalkClaim::Ready));
         assert_eq!(v.conns.load(std::sync::atomic::Ordering::Relaxed), 3);
         drop(v);
+        sess.close().await;
+    }
+
+    struct V380StreamStub {
+        conns: std::sync::Arc<std::sync::atomic::AtomicU32>,
+        /// Feed raw `0x7f` fragment bytes onto stream conns.
+        feed: broadcast::Sender<Vec<u8>>,
+        /// `8449` keepalives observed — the channel field.
+        ka: tmpsc::Receiver<u32>,
+        /// One event per `303` stream-start.
+        started: tmpsc::Receiver<()>,
+        /// Conn EOF/kill observed — the conn index.
+        closed: tmpsc::Receiver<u32>,
+        /// Kill every live conn.
+        kill: std::sync::Arc<tokio::sync::Notify>,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    /// `:8800` stream stub — `1167` → `301` → `303`, then feed
+    /// mode: scripted fragments out, `8449` keepalives + conn
+    /// EOF/kill reported. Caps ride the `1168` reply.
+    #[allow(clippy::too_many_lines)]
+    async fn v380_stream_stub(audio_pri: u8, speaker: u8) -> Option<V380StreamStub> {
+        let lis = TcpListener::bind("127.0.0.1:8800").await.ok()?;
+        let conns = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (feed_tx, _) = broadcast::channel::<Vec<u8>>(16);
+        let (ka_tx, ka) = tmpsc::channel::<u32>(64);
+        let (started_tx, started) = tmpsc::channel::<()>(16);
+        let (closed_tx, closed) = tmpsc::channel::<u32>(64);
+        let kill = std::sync::Arc::new(tokio::sync::Notify::new());
+        let conns2 = conns.clone();
+        let kill2 = kill.clone();
+        let feed_tx2 = feed_tx.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = lis.accept().await else {
+                    return;
+                };
+                let idx = conns2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut feed_rx = feed_tx2.subscribe();
+                let (ka_tx, started_tx, closed_tx) =
+                    (ka_tx.clone(), started_tx.clone(), closed_tx.clone());
+                let kill = kill2.clone();
+                tokio::spawn(async move {
+                    let (mut rd, mut wr) = stream.into_split();
+                    // Dialect sniff — non-`1167` heads close
+                    // instantly, ⊥ stall on a partial packet.
+                    let mut head = [0_u8; 4];
+                    if rd.read_exact(&mut head).await.is_err() {
+                        return;
+                    }
+                    if u32::from_le_bytes(head) != 1167 {
+                        return;
+                    }
+                    let mut pkt = [0_u8; 256];
+                    pkt[0..4].copy_from_slice(&head);
+                    if rd.read_exact(&mut pkt[4..]).await.is_err() {
+                        return;
+                    }
+                    if wr
+                        .write_all(&v380_reply(1001, 3, audio_pri, speaker))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    // `301` stream-open (256 B) → `401`+`1001`.
+                    let mut open = [0_u8; 256];
+                    if rd.read_exact(&mut open).await.is_err() {
+                        _ = closed_tx.send(idx).await;
+                        return;
+                    }
+                    if u32::from_le_bytes(open[0..4].try_into().unwrap()) != 301 {
+                        _ = closed_tx.send(idx).await;
+                        return;
+                    }
+                    let mut resp = [0_u8; 32];
+                    resp[0..4].copy_from_slice(&401_u32.to_le_bytes());
+                    resp[4..8].copy_from_slice(&1001_i32.to_le_bytes());
+                    resp[8..10].copy_from_slice(&20_u16.to_le_bytes());
+                    if wr.write_all(&resp).await.is_err() {
+                        return;
+                    }
+                    // `303` stream-start (256 B) → feed mode.
+                    let mut start = [0_u8; 256];
+                    if rd.read_exact(&mut start).await.is_err() {
+                        _ = closed_tx.send(idx).await;
+                        return;
+                    }
+                    if u32::from_le_bytes(start[0..4].try_into().unwrap()) != 303 {
+                        _ = closed_tx.send(idx).await;
+                        return;
+                    }
+                    _ = started_tx.send(()).await;
+                    let mut ka_buf = Vec::new();
+                    loop {
+                        tokio::select! {
+                            f = feed_rx.recv() => {
+                                match f {
+                                    Ok(bytes) => {
+                                        if wr.write_all(&bytes).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                                    Err(_) => break,
+                                }
+                            }
+                            r = rd.read_buf(&mut ka_buf) => {
+                                match r {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(_) => {
+                                        while ka_buf.len() >= 16 {
+                                            if u32::from_le_bytes(
+                                                ka_buf[0..4].try_into().unwrap(),
+                                            ) == 8449
+                                            {
+                                                _ = ka_tx
+                                                    .send(u32::from_le_bytes(
+                                                        ka_buf[4..8]
+                                                            .try_into()
+                                                            .unwrap(),
+                                                    ))
+                                                    .await;
+                                            }
+                                            ka_buf.drain(..16);
+                                        }
+                                    }
+                                }
+                            }
+                            () = kill.notified() => break,
+                        }
+                    }
+                    _ = closed_tx.send(idx).await;
+                });
+            }
+        });
+        Some(V380StreamStub {
+            conns,
+            feed: feed_tx,
+            ka,
+            started,
+            closed,
+            kill,
+            _task: task,
+        })
+    }
+
+    /// `0x7f` fragment — `type`@1, `total`@3, `idx`@5, `len`@7.
+    fn v380_frag(type_: u8, total: u16, idx: u16, payload: &[u8]) -> Vec<u8> {
+        let mut f = Vec::with_capacity(12 + payload.len());
+        f.extend_from_slice(&[0x7f, type_, 0]);
+        f.extend_from_slice(&total.to_le_bytes());
+        f.extend_from_slice(&idx.to_le_bytes());
+        f.extend_from_slice(
+            &u16::try_from(payload.len())
+                .unwrap_or(u16::MAX)
+                .to_le_bytes(),
+        );
+        f.extend_from_slice(&[0, 0, 0]);
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// A typed audio frame — 20 B inner hdr (`codecType`@4) +
+    /// `blocks` × 256 B IMA blocks.
+    fn v380_audio_frame(type_: u16, blocks: &[[u8; 256]]) -> Vec<u8> {
+        let mut f = vec![0_u8; 20];
+        f[4..6].copy_from_slice(&type_.to_le_bytes());
+        for b in blocks {
+            f.extend_from_slice(b);
+        }
+        f
+    }
+
+    /// Parked broadcast ⇒ `recv()` blocks unclaimed (⊥ EOS);
+    /// claim ⇒ `301`/`303` then fragmented `22` frames ⇒ PCM,
+    /// `8449` keepalives flow.
+    #[tokio::test]
+    async fn v380_listen_parks_then_streams_pcm() {
+        let _g = PORT_8800.lock().await;
+        let Some(mut st) = v380_stream_stub(1, 1).await else {
+            return;
+        };
+        let rtsp = stub_scripted(|_| "200 OK", VIDEO_SDP, 60).await;
+        let client = RtspAudioClient::new(url_creds(rtsp.port), None, v380_cfg());
+        let sess = client.open(true).await.unwrap();
+        assert!(sess.caps().listen, "{:?}", sess.caps());
+        assert!(sess.claims_listen_lazily());
+        // Unclaimed `recv()` parks — ⊥ EOS.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), sess.recv())
+                .await
+                .is_err(),
+            "recv() must park on an unclaimed lazy listen"
+        );
+        sess.note_listen(1).await;
+        sess.claim_listen().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), st.started.recv())
+            .await
+            .expect("303 within 2s")
+            .expect("started channel");
+        // `22` frame split over two fragments ⇒ decoded PCM.
+        let frame = v380_audio_frame(
+            22,
+            &[crate::v380::ImaEncoder::new()
+                .encode_block(&[0_i16; crate::v380::IMA_BLOCK_SAMPLES])],
+        );
+        let half = frame.len() / 2;
+        st.feed.send(v380_frag(22, 2, 0, &frame[..half])).unwrap();
+        st.feed.send(v380_frag(22, 2, 1, &frame[half..])).unwrap();
+        let pcm = tokio::time::timeout(Duration::from_secs(2), sess.recv())
+            .await
+            .expect("pcm within 2s")
+            .expect("broadcast open");
+        assert_eq!(pcm.len(), crate::v380::IMA_BLOCK_SAMPLES);
+        // `8449`+channel keepalive ≤3 s.
+        let ch = tokio::time::timeout(Duration::from_secs(4), st.ka.recv())
+            .await
+            .expect("keepalive within 4s")
+            .expect("ka channel");
+        assert_eq!(ch, 0, "ch00 channel");
+        drop(rtsp);
+        sess.close().await;
+    }
+
+    /// Interleaved video fragments ⊥ reset the pending audio
+    /// assembly — the `22` frame still completes.
+    #[tokio::test]
+    async fn v380_listen_video_frag_keeps_assembly() {
+        let _g = PORT_8800.lock().await;
+        let Some(mut st) = v380_stream_stub(1, 1).await else {
+            return;
+        };
+        let rtsp = stub_scripted(|_| "200 OK", VIDEO_SDP, 60).await;
+        let client = RtspAudioClient::new(url_creds(rtsp.port), None, v380_cfg());
+        let sess = client.open(true).await.unwrap();
+        sess.note_listen(1).await;
+        sess.claim_listen().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), st.started.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let frame = v380_audio_frame(
+            22,
+            &[crate::v380::ImaEncoder::new()
+                .encode_block(&[0_i16; crate::v380::IMA_BLOCK_SAMPLES])],
+        );
+        let half = frame.len() / 2;
+        st.feed.send(v380_frag(22, 2, 0, &frame[..half])).unwrap();
+        // Video fragments interleaved mid-audio — skipped ⊥ reset.
+        st.feed.send(v380_frag(1, 3, 0, &[0xff; 64])).unwrap();
+        st.feed.send(v380_frag(1, 3, 1, &[0xee; 64])).unwrap();
+        st.feed.send(v380_frag(22, 2, 1, &frame[half..])).unwrap();
+        let pcm = tokio::time::timeout(Duration::from_secs(2), sess.recv())
+            .await
+            .expect("pcm within 2s")
+            .expect("broadcast open");
+        assert_eq!(pcm.len(), crate::v380::IMA_BLOCK_SAMPLES);
+        drop(rtsp);
+        sess.close().await;
+    }
+
+    /// An audio-typed frame ∀ a codec ≠ `22` ⇒ the bad-media signal
+    /// fires (the entry marks `listen` session-classed + errors).
+    #[tokio::test]
+    async fn v380_listen_bad_type_flags() {
+        let _g = PORT_8800.lock().await;
+        let Some(mut st) = v380_stream_stub(1, 1).await else {
+            return;
+        };
+        let rtsp = stub_scripted(|_| "200 OK", VIDEO_SDP, 60).await;
+        let client = RtspAudioClient::new(url_creds(rtsp.port), None, v380_cfg());
+        let sess = client.open(true).await.unwrap();
+        let mut bad = sess.bad_listen_rx().expect("bad_listen_rx");
+        sess.note_listen(1).await;
+        sess.claim_listen().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), st.started.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        st.feed
+            .send(v380_frag(21, 1, 0, &v380_audio_frame(21, &[[7_u8; 256]])))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), bad.wait_for(|b| *b))
+            .await
+            .expect("bad-media signal within 2s")
+            .expect("signal");
+        // The session survives — only the codec was foreign.
+        assert!(!*sess.dead_rx().borrow());
+        drop(rtsp);
+        sess.close().await;
+    }
+
+    /// Mid-session conn death ⇒ session transport fault —
+    /// `wait_dead` resolves (V256 teardown applies).
+    #[tokio::test]
+    async fn v380_listen_conn_death_fires_dead() {
+        let _g = PORT_8800.lock().await;
+        let Some(mut st) = v380_stream_stub(1, 1).await else {
+            return;
+        };
+        let rtsp = stub_scripted(|_| "200 OK", VIDEO_SDP, 60).await;
+        let client = RtspAudioClient::new(url_creds(rtsp.port), None, v380_cfg());
+        let sess = client.open(true).await.unwrap();
+        sess.note_listen(1).await;
+        sess.claim_listen().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), st.started.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        st.kill.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(3), sess.wait_dead())
+            .await
+            .expect("session death within 3s");
+        drop(rtsp);
+    }
+
+    /// Last-interest release ⇒ conn EOFs server-side + the slot
+    /// frees; a re-attach claims a fresh conn (`301`/`303` again).
+    #[tokio::test]
+    async fn v380_listen_release_closes_and_reclaims() {
+        let _g = PORT_8800.lock().await;
+        let Some(mut st) = v380_stream_stub(1, 1).await else {
+            return;
+        };
+        let rtsp = stub_scripted(|_| "200 OK", VIDEO_SDP, 60).await;
+        let client = RtspAudioClient::new(url_creds(rtsp.port), None, v380_cfg());
+        let sess = client.open(true).await.unwrap();
+        sess.note_listen(1).await;
+        sess.claim_listen().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), st.started.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // The claim conn is idx 1 (the open probe was idx 0).
+        assert_eq!(st.conns.load(std::sync::atomic::Ordering::Relaxed), 2);
+        sess.note_listen(-1).await;
+        let saw_close = tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(idx) = st.closed.recv().await {
+                if idx == 1 {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(saw_close, "last detach must close the stream conn");
+        // Re-attach re-claims — a fresh conn runs `301`/`303`.
+        sess.note_listen(1).await;
+        sess.claim_listen().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), st.started.recv())
+            .await
+            .expect("second 303 within 3s")
+            .expect("started channel");
+        assert_eq!(st.conns.load(std::sync::atomic::Ordering::Relaxed), 3);
+        drop(rtsp);
         sess.close().await;
     }
 }

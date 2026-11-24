@@ -179,6 +179,16 @@ impl AudioEntry {
         *self.talk_owner.lock().await == Some(consumer)
     }
 
+    /// Whether this consumer holds listen interest (V283 —
+    /// a re-attach ⊥ double-counts the claim's install gate).
+    async fn owns_listen(&self, consumer: ConsumerId) -> bool {
+        self.consumers
+            .lock()
+            .await
+            .get(&consumer)
+            .is_some_and(|c| c.interest.listen)
+    }
+
     /// Talk lock currently held — drives the `talkFree` caps field.
     pub async fn talk_owned(&self) -> bool {
         self.talk_owner.lock().await.is_some()
@@ -235,9 +245,27 @@ impl AudioEntry {
         true
     }
 
+    /// Mirror a listen-interest drop to the session (V283) —
+    /// the last release closes the claimed stream conn.
+    async fn release_listen(&self, consumer: ConsumerId) {
+        let held = self
+            .consumers
+            .lock()
+            .await
+            .get(&consumer)
+            .is_some_and(|c| c.interest.listen);
+        if !held {
+            return;
+        }
+        if let SessionSlot::Open(open) = &*self.slot.read().await {
+            open.session.note_listen(-1).await;
+        }
+    }
+
     /// Detach a consumer entirely (WS close path).
     async fn detach(&self, id: ConsumerId) {
         self.release_talk(id).await;
+        self.release_listen(id).await;
         self.consumers.lock().await.remove(&id);
         self.close_if_idle().await;
     }
@@ -335,6 +363,21 @@ impl AudioEntry {
             serde_json::json!({
                 "type": "error",
                 "message": "talk claim lost",
+            })
+            .to_string(),
+        );
+        self.broadcast_caps().await;
+    }
+
+    /// V283 — a non-`22` audio-typed frame marks `listen`
+    /// session-classed + errors the ctrl (⊥ session death,
+    /// ⊥ silent drop).
+    async fn listen_bad_media(&self) {
+        self.session_marks.lock().await.insert("listen".to_owned());
+        _ = self.ctrl_tx.send(
+            serde_json::json!({
+                "type": "error",
+                "message": "unsupported camera audio codec",
             })
             .to_string(),
         );
@@ -596,13 +639,34 @@ impl AudioService {
                     }
                     return Attach::Full;
                 }
+                // V283 — the stream-conn claim fires on first
+                // listen attach: interest mirrors BEFORE the claim
+                // so its install gate sees it; a claim fault is
+                // non-fatal (`error` ctrl to the listener, ⊥ mark)
+                // and the consumer attaches to the parked broadcast.
+                let new_listen = direction == Direction::Listen
+                    && open.session.claims_listen_lazily()
+                    && !entry.owns_listen(consumer).await;
                 entry.add_interest(consumer, direction).await;
+                let ctrl_rx = entry.ctrl_tx.subscribe();
+                if new_listen {
+                    open.session.note_listen(1).await;
+                    if open.session.claim_listen().await.is_err() {
+                        _ = entry.ctrl_tx.send(
+                            serde_json::json!({
+                                "type": "error",
+                                "message": "listen unavailable",
+                            })
+                            .to_string(),
+                        );
+                    }
+                }
                 let pcm = if direction == Direction::Listen {
                     entry.subscribe_pcm().await
                 } else {
                     None
                 };
-                Attach::Open(open.caps, pcm, entry.ctrl_tx.subscribe())
+                Attach::Open(open.caps, pcm, ctrl_rx)
             }
             Err(e) => {
                 if direction == Direction::Talk {
@@ -624,6 +688,9 @@ impl AudioService {
         if direction == Direction::Talk {
             entry.release_talk(consumer).await;
             self.broadcast_caps(entry).await;
+        }
+        if direction == Direction::Listen {
+            entry.release_listen(consumer).await;
         }
         if !entry.remove_interest(consumer, direction).await {
             entry.detach(consumer).await;
@@ -815,6 +882,69 @@ impl AudioService {
         }
     }
 
+    /// Session-death + claim-death + bad-media watcher — receiver
+    /// clones hold ⊥ the session Arc (B122): sender drop ends the
+    /// wait on close.
+    fn spawn_dead_watch(
+        entry: &Arc<AudioEntry>,
+        session: &ArcAudioSession,
+    ) -> tokio::task::JoinHandle<()> {
+        let weak = Arc::downgrade(entry);
+        let mut dead_rx = session.dead_rx();
+        let mut talk_dead_rx = session.talk_dead_rx();
+        let mut bad_listen_rx = session.bad_listen_rx();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    r = async {
+                        dead_rx.wait_for(|d| *d).await.map(|_| ())
+                    } => {
+                        if r.is_ok() {
+                            if let Some(e) = weak.upgrade() {
+                                e.session_died().await;
+                            }
+                        }
+                        return;
+                    }
+                    r = async {
+                        match &mut talk_dead_rx {
+                            Some(rx) => rx
+                                .wait_for(|g| *g != 0)
+                                .await
+                                .map(|g| *g),
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        match r {
+                            Ok(claim_gen) => {
+                                if let Some(e) = weak.upgrade() {
+                                    e.talker_died(claim_gen).await;
+                                }
+                            }
+                            Err(_) => talk_dead_rx = None,
+                        }
+                    }
+                    r = async {
+                        match &mut bad_listen_rx {
+                            Some(rx) => rx.wait_for(|b| *b).await.map(|_| ()),
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        // One-shot (V283) — the mark is
+                        // session-sticky; a repeat signal adds
+                        // nothing.
+                        bad_listen_rx = None;
+                        if r.is_ok() {
+                            if let Some(e) = weak.upgrade() {
+                                e.listen_bad_media().await;
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     /// `client.open` + mark bookkeeping — capability marks persist
     /// via the sink, the rest land session-only.
     async fn do_open(
@@ -850,46 +980,7 @@ impl AudioService {
                     Self::revoke_talk(entry).await;
                 }
                 self.broadcast_caps(entry).await;
-                // Session-death + claim-death watcher — receiver
-                // clones hold ⊥ the session Arc (B122): sender
-                // drop ends the wait on close.
-                let weak = Arc::downgrade(entry);
-                let mut dead_rx = session.dead_rx();
-                let mut talk_dead_rx = session.talk_dead_rx();
-                let dead_watch = tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            r = async {
-                                dead_rx.wait_for(|d| *d).await.map(|_| ())
-                            } => {
-                                if r.is_ok() {
-                                    if let Some(e) = weak.upgrade() {
-                                        e.session_died().await;
-                                    }
-                                }
-                                return;
-                            }
-                            r = async {
-                                match &mut talk_dead_rx {
-                                    Some(rx) => rx
-                                        .wait_for(|g| *g != 0)
-                                        .await
-                                        .map(|g| *g),
-                                    None => std::future::pending().await,
-                                }
-                            } => {
-                                match r {
-                                    Ok(claim_gen) => {
-                                        if let Some(e) = weak.upgrade() {
-                                            e.talker_died(claim_gen).await;
-                                        }
-                                    }
-                                    Err(_) => talk_dead_rx = None,
-                                }
-                            }
-                        }
-                    }
-                });
+                let dead_watch = Self::spawn_dead_watch(entry, &session);
                 let (pcm_tx, _) = broadcast::channel(64);
                 let pump = if caps.listen {
                     let (tx, session) = (pcm_tx.clone(), session.clone());
@@ -950,6 +1041,15 @@ mod tests {
         gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     }
 
+    /// Lazy-listen stub (V283) — counts claims + the interest
+    /// mirror, scripted claim outcome, bad-media signal channel.
+    struct StubLazyListen {
+        claims: AtomicUsize,
+        interest: std::sync::atomic::AtomicI64,
+        fault: bool,
+        bad_tx: watch::Sender<bool>,
+    }
+
     struct StubSession {
         caps: AudioCaps,
         marks: Vec<(Direction, FaultClass)>,
@@ -960,6 +1060,7 @@ mod tests {
         /// mimics a living session (a dropped sender ends the watch).
         dead_keep: watch::Sender<bool>,
         lazy: Option<StubLazy>,
+        lazy_listen: Option<StubLazyListen>,
     }
 
     #[async_trait::async_trait]
@@ -1025,6 +1126,28 @@ mod tests {
         }
         fn talk_dead_rx(&self) -> Option<watch::Receiver<u64>> {
             self.lazy.as_ref().map(|l| l.dead_tx.subscribe())
+        }
+        fn claims_listen_lazily(&self) -> bool {
+            self.lazy_listen.is_some()
+        }
+        async fn note_listen(&self, delta: i64) {
+            if let Some(l) = &self.lazy_listen {
+                l.interest.fetch_add(delta, Ordering::SeqCst);
+            }
+        }
+        async fn claim_listen(&self) -> Result<(), Error> {
+            let Some(l) = &self.lazy_listen else {
+                return Ok(());
+            };
+            l.claims.fetch_add(1, Ordering::SeqCst);
+            if l.fault {
+                Err(Error::Protocol("claim refused".into()))
+            } else {
+                Ok(())
+            }
+        }
+        fn bad_listen_rx(&self) -> Option<watch::Receiver<bool>> {
+            self.lazy_listen.as_ref().map(|l| l.bad_tx.subscribe())
         }
     }
 
@@ -1104,6 +1227,28 @@ mod tests {
             dead: std::sync::Mutex::new(None),
             dead_keep: watch::channel(false).0,
             lazy: None,
+            lazy_listen: None,
+        })
+    }
+
+    fn listen_lazy_session(fault: bool) -> Arc<StubSession> {
+        Arc::new(StubSession {
+            caps: AudioCaps {
+                listen: true,
+                talk: true,
+            },
+            marks: Vec::new(),
+            talked: Mutex::new(Vec::new()),
+            closed: AtomicUsize::new(0),
+            dead: std::sync::Mutex::new(None),
+            dead_keep: watch::channel(false).0,
+            lazy: None,
+            lazy_listen: Some(StubLazyListen {
+                claims: AtomicUsize::new(0),
+                interest: std::sync::atomic::AtomicI64::new(0),
+                fault,
+                bad_tx: watch::channel(false).0,
+            }),
         })
     }
 
@@ -1125,6 +1270,7 @@ mod tests {
                 dead_tx: watch::channel(0).0,
                 gate: Mutex::new(None),
             }),
+            lazy_listen: None,
         })
     }
 
@@ -1523,6 +1669,7 @@ mod tests {
             dead: std::sync::Mutex::new(None),
             dead_keep: watch::channel(false).0,
             lazy: None,
+            lazy_listen: None,
         });
         let client = Arc::new(StubClient {
             session: Ok(sess),
@@ -1696,6 +1843,7 @@ mod tests {
             dead: std::sync::Mutex::new(None),
             dead_keep: watch::channel(false).0,
             lazy: None,
+            lazy_listen: None,
         });
         let client = Arc::new(StubClient {
             session: Ok(sess),
@@ -1724,5 +1872,155 @@ mod tests {
         );
         assert!(!e.persisted.lock().await.contains("talk"));
         assert!(persisted.lock().await.is_empty());
+    }
+
+    /// V283 — a listen-claim fault is non-fatal: the attach still
+    /// opens (parked broadcast), the `error` rides the ctrl, and
+    /// no mark lands.
+    #[tokio::test]
+    async fn listen_claim_fault_opens_with_error_ctrl() {
+        let sess = listen_lazy_session(true);
+        let client = stub_client(sess.clone());
+        let (svc, _, _) = svc(client.clone());
+        let e = entry_of(&svc, &client);
+        let (drop_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        match svc
+            .attach(&e, &mid(), 1, Direction::Listen, &[], &drop_tx)
+            .await
+        {
+            Attach::Open(caps, pcm, mut ctrl) => {
+                assert!(caps.listen);
+                assert!(pcm.is_some());
+                let msg = tokio::time::timeout(Duration::from_secs(2), ctrl.recv())
+                    .await
+                    .expect("error ctrl within 2s")
+                    .expect("ctrl channel");
+                assert!(msg.contains("\"error\""), "{msg}");
+            }
+            other => panic!("expected open, got {other:?}"),
+        }
+        let l = sess.lazy_listen.as_ref().unwrap();
+        assert_eq!(l.claims.load(Ordering::SeqCst), 1);
+        assert_eq!(l.interest.load(Ordering::SeqCst), 1);
+        assert!(e.session_marks.lock().await.is_empty(), "⊥ mark");
+    }
+
+    /// V283 — last detach releases the claim; a re-attach re-claims.
+    #[tokio::test]
+    async fn listen_reattach_reclaims() {
+        let sess = listen_lazy_session(false);
+        let client = stub_client(sess.clone());
+        let (svc, _, _) = svc(client.clone());
+        let e = entry_of(&svc, &client);
+        let (drop_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        match svc
+            .attach(&e, &mid(), 1, Direction::Listen, &[], &drop_tx)
+            .await
+        {
+            Attach::Open(..) => {}
+            other => panic!("expected open, got {other:?}"),
+        }
+        let l = sess.lazy_listen.as_ref().unwrap();
+        assert_eq!(l.claims.load(Ordering::SeqCst), 1);
+        svc.detach(&e, 1).await;
+        assert_eq!(
+            l.interest.load(Ordering::SeqCst),
+            0,
+            "detach mirrors the interest drop"
+        );
+        match svc
+            .attach(&e, &mid(), 2, Direction::Listen, &[], &drop_tx)
+            .await
+        {
+            Attach::Open(..) => {}
+            other => panic!("expected open, got {other:?}"),
+        }
+        assert_eq!(l.claims.load(Ordering::SeqCst), 2, "re-attach re-claims");
+        svc.detach(&e, 2).await;
+    }
+
+    /// V283 — a shared listen claim counts every interested
+    /// consumer: a mid-set detach keeps the conn; the last one
+    /// releases it.
+    #[tokio::test]
+    async fn listen_interest_counts_shared_consumers() {
+        let sess = listen_lazy_session(false);
+        let client = stub_client(sess.clone());
+        let (svc, _, _) = svc(client.clone());
+        let e = entry_of(&svc, &client);
+        let (drop_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        for consumer in 1..=2 {
+            match svc
+                .attach(&e, &mid(), consumer, Direction::Listen, &[], &drop_tx)
+                .await
+            {
+                Attach::Open(..) => {}
+                other => panic!("expected open, got {other:?}"),
+            }
+        }
+        let l = sess.lazy_listen.as_ref().unwrap();
+        assert_eq!(l.interest.load(Ordering::SeqCst), 2);
+        svc.remove_direction(&e, 1, Direction::Listen).await;
+        assert_eq!(
+            l.interest.load(Ordering::SeqCst),
+            1,
+            "one listener left — conn stays"
+        );
+        svc.remove_direction(&e, 2, Direction::Listen).await;
+        assert_eq!(
+            l.interest.load(Ordering::SeqCst),
+            0,
+            "last detach releases the claim"
+        );
+    }
+
+    /// V283 — the bad-media signal marks `listen` session-classed +
+    /// errors the ctrl (⊥ session death, ⊥ silent drop).
+    #[tokio::test]
+    async fn listen_bad_media_marks_session() {
+        let sess = listen_lazy_session(false);
+        let client = stub_client(sess.clone());
+        let (svc, _, _) = svc(client.clone());
+        let e = entry_of(&svc, &client);
+        let (drop_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctrl = match svc
+            .attach(&e, &mid(), 1, Direction::Listen, &[], &drop_tx)
+            .await
+        {
+            Attach::Open(.., ctrl) => ctrl,
+            other => panic!("expected open, got {other:?}"),
+        };
+        sess.lazy_listen
+            .as_ref()
+            .unwrap()
+            .bad_tx
+            .send(true)
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if e.session_marks.lock().await.contains("listen") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session mark within 2s");
+        // The error + caps follow the mark.
+        let mut saw_error = false;
+        let mut saw_caps = false;
+        for _ in 0..4 {
+            let Ok(Ok(msg)) = tokio::time::timeout(Duration::from_secs(2), ctrl.recv()).await
+            else {
+                break;
+            };
+            saw_error |= msg.contains("\"error\"");
+            saw_caps |= msg.contains("\"listen\"") && msg.contains("caps");
+            if saw_error && saw_caps {
+                break;
+            }
+        }
+        assert!(saw_error && saw_caps, "error ctrl + caps broadcast");
+        assert!(!sess.marks().iter().any(|(d, _)| *d == Direction::Listen));
     }
 }

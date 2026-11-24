@@ -210,6 +210,32 @@ pub trait AudioSession: Send + Sync {
         0
     }
 
+    /// Whether listen rides an attach-claimed vendor stream conn
+    /// (V283) — `false` ∀ negotiated recvonly sessions.
+    fn claims_listen_lazily(&self) -> bool {
+        false
+    }
+
+    /// Live listen-interest mirror (V283) — `+1` per listen
+    /// attach, `-1` per detach; a claim install requires `>0` and
+    /// reaching `0` releases the claimed conn (B122).
+    async fn note_listen(&self, _delta: i64) {}
+
+    /// Connect + install the `:8800` stream conn (V283) —
+    /// single-flighted (a concurrent attach joins the in-flight
+    /// outcome, ⊥ a second dial); install is generation-scoped.
+    /// No-op `Ok` ∀ non-lazy sessions.
+    async fn claim_listen(&self) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Non-`22` audio-type signal (V283) — `Some` ∀ lazy-listen
+    /// sessions; the entry session-marks `listen` + errors the
+    /// ctrl on the first foreign codec (⊥ silent drop).
+    fn bad_listen_rx(&self) -> Option<watch::Receiver<bool>> {
+        None
+    }
+
     /// Session dead flag — install-validation input (V275).
     fn dead(&self) -> bool {
         false

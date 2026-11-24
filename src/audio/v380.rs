@@ -235,6 +235,47 @@ impl V380Conn {
         self.write_all(&pkt).await
     }
 
+    /// Split a post-`303` stream conn — the read side pumps `0x7f`
+    /// fragments while the write side rides `8449` keepalives.
+    /// `buf` carry-over moves to the reader.
+    pub fn into_split(self) -> (V380Reader, V380Writer) {
+        let (rd, wr) = self.stream.into_split();
+        (
+            V380Reader {
+                stream: rd,
+                buf: self.buf,
+            },
+            V380Writer { stream: wr },
+        )
+    }
+
+    async fn read_some(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+        tokio::time::timeout(IO_TIMEOUT, self.stream.read(out))
+            .await
+            .map_err(|_| Error::Timeout("v380 read"))?
+            .map_err(Error::from)
+    }
+
+    async fn write_all(&mut self, data: &[u8]) -> Result<(), Error> {
+        tokio::time::timeout(IO_TIMEOUT, self.stream.write_all(data))
+            .await
+            .map_err(|_| Error::Timeout("v380 write"))??;
+        Ok(())
+    }
+}
+
+/// Read half of a post-`303` stream conn — `0x7f` fragments.
+pub struct V380Reader {
+    stream: tokio::net::tcp::OwnedReadHalf,
+    buf: Vec<u8>,
+}
+
+/// Write half of a post-`303` stream conn — `8449` keepalives.
+pub struct V380Writer {
+    stream: tokio::net::tcp::OwnedWriteHalf,
+}
+
+impl V380Reader {
     /// Next `0x7f` fragment off the stream conn — byte-wise sync
     /// scan (control bytes `0x1f`/`0x6f` and any non-`0x7f` run are
     /// skipped; a >64 KiB sync gap is a framing fault).
@@ -289,16 +330,17 @@ impl V380Conn {
         self.buf.extend_from_slice(&tmp[..n]);
         Ok(())
     }
+}
 
-    async fn read_some(&mut self, out: &mut [u8]) -> Result<usize, Error> {
-        tokio::time::timeout(IO_TIMEOUT, self.stream.read(out))
-            .await
-            .map_err(|_| Error::Timeout("v380 read"))?
-            .map_err(Error::from)
-    }
-
-    async fn write_all(&mut self, data: &[u8]) -> Result<(), Error> {
-        tokio::time::timeout(IO_TIMEOUT, self.stream.write_all(data))
+impl V380Writer {
+    /// `8449` audio-toggle keepalive (16 B) — cmd@0, channel u32@4,
+    /// flag `4097`/`4096`@8.
+    pub async fn keepalive_stream(&mut self, channel: u32, audio_on: bool) -> Result<(), Error> {
+        let mut pkt = [0_u8; 16];
+        pkt[0..4].copy_from_slice(&CMD_AUDIO_TOGGLE.to_le_bytes());
+        pkt[4..8].copy_from_slice(&channel.to_le_bytes());
+        pkt[8..12].copy_from_slice(&if audio_on { 4097_u32 } else { 4096_u32 }.to_le_bytes());
+        tokio::time::timeout(IO_TIMEOUT, self.stream.write_all(&pkt))
             .await
             .map_err(|_| Error::Timeout("v380 write"))??;
         Ok(())
@@ -1037,8 +1079,9 @@ mod tests {
             pkt.extend_from_slice(&[10, 11, 12, 13]);
             s.write_all(&pkt).await.unwrap();
         });
-        let mut conn = test_conn(&host).await;
-        let f = conn.next_fragment().await.unwrap();
+        let conn = test_conn(&host).await;
+        let (mut rd, _wr) = conn.into_split();
+        let f = rd.next_fragment().await.unwrap();
         assert_eq!(f.type_, 22);
         assert_eq!(f.total, 1);
         assert_eq!(f.index, 0);
