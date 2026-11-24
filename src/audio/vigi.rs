@@ -146,6 +146,11 @@ pub struct VigiTalk {
     wr: OwnedWriteHalf,
     session_id: String,
     mux: TsMuxer,
+    /// Last seen RTP timestamp — deltas accumulate into `pts`.
+    last_ts: Option<u32>,
+    /// Running PTS in raw ts-delta units, anchored at 0 (go2rtc
+    /// accumulates `timestamp - prev` unscaled — ⊥ 8 k→90 k rescale).
+    pts: u32,
     drain: tokio::task::JoinHandle<()>,
 }
 
@@ -198,6 +203,9 @@ impl VigiTalk {
         else {
             return (VigiProbe::Unreachable, Settle::Keep);
         };
+        // Real-time audio parts ride this conn — Nagle's 40 ms+
+        // batching starves the device decoder between bursts.
+        stream.set_nodelay(true).ok();
         let (rd, mut wr) = stream.into_split();
         let mut rd = tokio::io::BufReader::new(rd);
 
@@ -284,6 +292,8 @@ impl VigiTalk {
             wr,
             session_id,
             mux: TsMuxer::new(),
+            last_ts: None,
+            pts: 0,
             drain: tokio::spawn(async move {
                 let mut buf = [0_u8; 4096];
                 loop {
@@ -315,13 +325,15 @@ impl VigiTalk {
     }
 
     /// One talk chunk → `audio/mp2t` part. `ts8k` is the running RTP
-    /// timestamp (8 kHz clock); converted to 90 kHz PTS (R48).
+    /// timestamp; PTS accumulates its deltas anchored at 0 —
+    /// unscaled, matching go2rtc (`pes.PTS += ts - prev_ts`).
     pub async fn send(&mut self, pcm: &[i16], ts8k: u32) -> Result<(), Error> {
         let pcma = g711::encode(Codec::Pcma, pcm);
-        let pts = u64::from(ts8k) * 90000 / 8000;
-        let body = self
-            .mux
-            .payload(u32::try_from(pts).unwrap_or(u32::MAX), &pcma);
+        if let Some(last) = self.last_ts {
+            self.pts = self.pts.wrapping_add(ts8k.wrapping_sub(last));
+        }
+        self.last_ts = Some(ts8k);
+        let body = self.mux.payload(self.pts, &pcma);
         self.send_part(&body).await.map_err(Error::Transport)
     }
 }
@@ -543,11 +555,13 @@ fn psi_header(out: &mut Vec<u8>, table_id: u8, size: u16) {
 }
 
 fn write_pts(out: &mut Vec<u8>, t: u32) {
-    out.push(0x20 | u8::try_from(t >> 29).unwrap_or(0) << 1 | 1);
-    out.push(u8::try_from(t >> 22).unwrap_or(0));
-    out.push(u8::try_from(t >> 14).unwrap_or(0) << 1 | 1);
-    out.push(u8::try_from(t >> 7).unwrap_or(0));
-    out.push(u8::try_from(t << 1).unwrap_or(0) | 1);
+    // Canonical 33-bit PTS (go2rtc `WriteTime` parity): 3+8+7+8+7
+    // bit fields with marker-1 separators; '0010' = PTS-only flag.
+    out.push(0x20 | u8::try_from(t >> 30 & 0x7).unwrap_or(0) << 1 | 1);
+    out.push(u8::try_from(t >> 22 & 0xFF).unwrap_or(0));
+    out.push(u8::try_from(t >> 15 & 0x7F).unwrap_or(0) << 1 | 1);
+    out.push(u8::try_from(t >> 7 & 0xFF).unwrap_or(0));
+    out.push(u8::try_from(t << 1 & 0xFF).unwrap_or(0) | 1);
 }
 
 // Verbatim go2rtc table — kept unseparated for diff parity.
@@ -600,6 +614,52 @@ fn checksum(data: &[u8]) -> u32 {
 mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+
+    /// Canonical 33-bit PTS decode — the spec layout the camera
+    /// demuxes: '0010' + PTS[32:30] + 1 / PTS[29:22] / PTS[21:15]
+    /// + 1 / PTS[14:7] / PTS[6:0] + 1.
+    fn decode_pts(b: &[u8]) -> u64 {
+        (u64::from(b[0] >> 1 & 0x7) << 30)
+            | (u64::from(b[1]) << 22)
+            | (u64::from(b[2] >> 1 & 0x7F) << 15)
+            | (u64::from(b[3]) << 7)
+            | u64::from(b[4] >> 1 & 0x7F)
+    }
+
+    /// go2rtc parity — PTS = Σ(ts deltas), anchored at 0, unscaled.
+    #[test]
+    fn pts_accumulates_deltas_zero_anchored() {
+        let mut last_ts = None;
+        let mut pts = 0_u32;
+        let step = |t: u32, last_ts: &mut Option<u32>, pts: &mut u32| {
+            if let Some(last) = *last_ts {
+                *pts = pts.wrapping_add(t.wrapping_sub(last));
+            }
+            *last_ts = Some(t);
+            *pts
+        };
+        assert_eq!(step(0x1234_5600, &mut last_ts, &mut pts), 0);
+        assert_eq!(step(0x1234_56A0, &mut last_ts, &mut pts), 160);
+        assert_eq!(step(0x1234_5740, &mut last_ts, &mut pts), 320);
+        // Wrap continuity — a rebase back-jump ⊥ panics (wrapping).
+        assert_eq!(
+            step(0x10, &mut last_ts, &mut pts),
+            320_u32.wrapping_add(0x10_u32.wrapping_sub(0x1234_5740))
+        );
+    }
+
+    #[test]
+    fn write_pts_roundtrips_canonical() {
+        for t in [0_u32, 1, 160, 1800, 0x1234_5678, 0x4000_0000, u32::MAX] {
+            let mut b = Vec::new();
+            write_pts(&mut b, t);
+            assert_eq!(decode_pts(&b), u64::from(t), "t={t:#x}");
+            assert_eq!(b[0] & 1, 1, "marker b0 t={t:#x}");
+            assert_eq!(b[2] & 1, 1, "marker b2 t={t:#x}");
+            assert_eq!(b[4] & 1, 1, "marker b4 t={t:#x}");
+            assert_eq!(b[0] & 0xF0, 0x20, "pts-only prefix t={t:#x}");
+        }
+    }
     use tokio::net::TcpListener;
     use tokio::sync::mpsc as tmpsc;
 
