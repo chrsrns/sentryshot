@@ -208,6 +208,21 @@ Server→client messages:
   endpoint/credential change tears the session down and closes its
   consumers.
 
+Two optional monitor-config keys steer the V380 private-protocol
+fallback probed on `:8800` when the RTSP negotiation and the VIGI
+dialect leave a wanted direction uncovered:
+
+- `audio.v380DeviceId` — decimal u32 device id sent in the `1167`
+  login. Empty derives it from the ONVIF `GetDeviceInformation`
+  serial (low 8 hex digits) at open; the derive needs request
+  credentials and is skipped without them.
+- `audio.v380User` — login username. Empty tries `Admin`, then the
+  RTSP userinfo username. The channel id always derives from the
+  RTSP path's `chNN` suffix.
+
+Both are write-only overrides: the settings UI round-trips unknown
+`audio` keys untouched on save but renders no input for them.
+
 
 ### POST /api/scan
 
