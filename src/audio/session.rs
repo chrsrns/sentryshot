@@ -3860,4 +3860,112 @@ mod tests {
             }
         }
     }
+
+    /// `v380_live_talk_busy_probe` — env-gated, `#[ignore]`:
+    /// `V380_LIVE_HOST=<ip> V380_LIVE_USER=Admin V380_LIVE_PASS=<pw>
+    ///  V380_LIVE_DEVID=<id> cargo test v380_live_talk_busy -- --ignored --nocapture`
+    /// Reproduces the "talk busy" report: (a) re-`377` right after a
+    /// released talk conn — does the camera linger the slot? (b) `377`
+    /// while a `301` listen-stream conn is open — shared media slot?
+    #[tokio::test]
+    #[ignore = "needs a live V380 camera on :8800"]
+    #[allow(clippy::too_many_lines)]
+    async fn v380_live_talk_busy_probe() {
+        let host = std::env::var("V380_LIVE_HOST").expect("V380_LIVE_HOST");
+        let user = std::env::var("V380_LIVE_USER").unwrap_or_else(|_| "Admin".into());
+        let pass = std::env::var("V380_LIVE_PASS").expect("V380_LIVE_PASS");
+        let device_id: u32 = std::env::var("V380_LIVE_DEVID")
+            .expect("V380_LIVE_DEVID")
+            .parse()
+            .unwrap();
+        let channel: u32 = std::env::var("V380_LIVE_CH")
+            .unwrap_or_else(|_| "0".into())
+            .parse()
+            .unwrap();
+
+        /// `1167` + `377` on a fresh conn → `477` result code.
+        async fn talk_claim(
+            host: &str,
+            dev: u32,
+            user: &str,
+            pass: &str,
+            ch: u32,
+        ) -> Result<crate::v380::V380Conn, String> {
+            let mut conn = crate::v380::V380Conn::connect(host)
+                .await
+                .map_err(|e| format!("connect {e}"))?;
+            let resp = conn
+                .login(dev, user, pass)
+                .await
+                .map_err(|e| format!("login {e}"))?;
+            if resp.result != crate::v380::login_result::OK {
+                return Err(format!("login result {}", resp.result));
+            }
+            // Raw `377` — dump the reply bytes so a refused/failed
+            // open shows what the camera actually sent.
+            let mut pkt = [0_u8; 85];
+            pkt[0..4].copy_from_slice(&377_u32.to_le_bytes());
+            pkt[4..8].copy_from_slice(&dev.to_le_bytes());
+            pkt[8..12].copy_from_slice(&resp.ticket.to_le_bytes());
+            pkt[12..16].copy_from_slice(&ch.to_le_bytes());
+            conn.write_all(&pkt).await.map_err(|e| format!("write {e}"))?;
+            let mut raw = [0_u8; 128];
+            let n = match tokio::time::timeout(
+                Duration::from_secs(3),
+                conn.read_some(&mut raw),
+            )
+            .await
+            {
+                Ok(Ok(n)) => n,
+                other => return Err(format!("read {other:?}")),
+            };
+            if n < 8 || u32::from_le_bytes(raw[0..4].try_into().unwrap()) != 477 {
+                return Err(format!("raw n={n} {:02x?}", &raw[..n.min(48)]));
+            }
+            let r = i32::from_le_bytes(raw[4..8].try_into().unwrap());
+            if r != crate::v380::login_result::OK {
+                return Err(format!("477 result {r}"));
+            }
+            Ok(conn)
+        }
+
+        // (a) claim → drop → immediate re-claims.
+        let a = talk_claim(&host, device_id, &user, &pass, channel).await;
+        eprintln!("claim A: {}", a.as_ref().map(|_| "1001".to_owned()).unwrap_or_else(|e| e.clone()));
+        drop(a);
+        for i in 0..8 {
+            let b = talk_claim(&host, device_id, &user, &pass, channel).await;
+            eprintln!(
+                "re-claim #{i} (t+{i}s): {}",
+                b.as_ref().map(|_| "1001".to_owned()).unwrap_or_else(|e| e.clone())
+            );
+            if b.is_ok() {
+                break;
+            }
+            drop(b);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+        // (b) listen stream conn open ⇒ talk claim outcome.
+        let mut login_conn = crate::v380::V380Conn::connect(&host).await.unwrap();
+        let resp = login_conn
+            .login(device_id, &user, &pass)
+            .await
+            .unwrap();
+        let mut stream = crate::v380::V380Conn::connect(&host).await.unwrap();
+        let (r, ver) = stream
+            .stream_open(device_id, resp.ticket, channel, resp.version)
+            .await
+            .unwrap();
+        eprintln!("stream_open: result={r} comms_ver={ver}");
+        stream.stream_start().await.unwrap();
+        let c = talk_claim(&host, device_id, &user, &pass, channel).await;
+        eprintln!(
+            "claim while 301-conn open: {}",
+            c.as_ref().map(|_| "1001".to_owned()).unwrap_or_else(|e| e.clone())
+        );
+        drop(c);
+        drop(stream);
+        drop(login_conn);
+    }
 }

@@ -275,14 +275,14 @@ impl V380Conn {
         )
     }
 
-    async fn read_some(&mut self, out: &mut [u8]) -> Result<usize, Error> {
+    pub(crate) async fn read_some(&mut self, out: &mut [u8]) -> Result<usize, Error> {
         tokio::time::timeout(IO_TIMEOUT, self.stream.read(out))
             .await
             .map_err(|_| Error::Timeout("v380 read"))?
             .map_err(Error::from)
     }
 
-    async fn write_all(&mut self, data: &[u8]) -> Result<(), Error> {
+    pub(crate) async fn write_all(&mut self, data: &[u8]) -> Result<(), Error> {
         tokio::time::timeout(IO_TIMEOUT, self.stream.write_all(data))
             .await
             .map_err(|_| Error::Timeout("v380 write"))??;
