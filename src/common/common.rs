@@ -795,16 +795,6 @@ pub fn write_file(path: &Path, buf: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
-pub async fn write_file2<T>(rt_handle: Handle, path: PathBuf, buf: T) -> std::io::Result<()>
-where
-    T: AsRef<[u8]> + Send + Sync + 'static,
-{
-    rt_handle
-        .spawn_blocking(move || write_file(&path, buf.as_ref()))
-        .await
-        .expect("join")
-}
-
 // It may be important that the temp path is on the same drive partition.
 pub fn write_file_atomic(path: &Path, temp_path: &Path, buf: &[u8]) -> std::io::Result<()> {
     let mut file = std::fs::OpenOptions::new()

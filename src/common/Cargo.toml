@@ -15,7 +15,6 @@ doctest = false
 
 [dependencies]
 async-trait.workspace = true
-bytes.workspace = true
 bytesize.workspace = true
 http.workspace = true
 jiff.workspace = true

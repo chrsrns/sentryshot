@@ -477,7 +477,6 @@ name = "common"
 version = "0.3.11"
 dependencies = [
  "async-trait",
- "bytes",
  "bytesize",
  "http",
  "jiff",
