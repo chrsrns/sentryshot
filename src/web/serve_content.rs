@@ -420,7 +420,7 @@ fn trim_text_proto_string(s: Option<String>) -> Option<String> {
         s = s[1..].to_string();
     }
     while !s.is_empty() && is_ascii_space(*s.as_bytes().last().unwrap()) {
-        s = s.as_bytes().last().unwrap().to_string();
+        s.pop();
     }
     if s.is_empty() {
         return None;

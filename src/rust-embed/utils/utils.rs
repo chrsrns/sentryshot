@@ -2,8 +2,8 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::{fs, io};
+use std::path::PathBuf;
+use std::fs;
 
 pub struct FileEntry {
     pub relative_path: String,
@@ -46,9 +46,3 @@ pub type EmbeddedFile = Cow<'static, [u8]>;
 /// `HashMap` of filepath and `EmbeddedFile` pairs.
 pub type EmbeddedFiles = HashMap<String, EmbeddedFile>;
 
-pub fn read_file_from_fs(file_path: &Path) -> io::Result<EmbeddedFile> {
-    let data = fs::read(file_path)?;
-    let data = Cow::from(data);
-
-    Ok(data)
-}
