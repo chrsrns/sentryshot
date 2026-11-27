@@ -30,8 +30,6 @@ label_map = "https://codeberg.org/Curid/TF-CCTV/raw/branch/master/labels/person-
 device = "/sys/bus/usb/devices/x"
 
 
-# WebUI documentation: ./plugins/object_detection/README.md
-#
 #
 # The sha256sum is for the tflite file.
 # The label maps are sanitized and don't need a checksum.
