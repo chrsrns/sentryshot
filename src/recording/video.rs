@@ -495,11 +495,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_meta_header_version_errors() {
-        let v0 = &[0u8; 20];
+        let v0 = &[0_u8; 20];
         let got = MetaHeader::from_reader(&mut Cursor::new(v0)).await;
         assert!(matches!(got, Err(HeaderFromReaderError::OldVersion)));
 
-        let v3 = &[3u8; 20];
+        let v3 = &[3_u8; 20];
         let got = MetaHeader::from_reader(&mut Cursor::new(v3)).await;
         assert!(matches!(
             got,
