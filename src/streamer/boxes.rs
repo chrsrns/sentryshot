@@ -160,7 +160,7 @@ fn generate_trak(params: &TrackParameters) -> mp4::Boxes {
                 mp4::Url {
                     full_box: mp4::FullBox {
                         version: 0,
-                        flags: [0, 0, 1],
+                        flags: mp4::u32_to_flags(mp4::URL_NOPT),
                     },
                     location: String::new(),
                 },
@@ -360,7 +360,7 @@ fn generate_traf(
         mp4::Boxes::new(mp4::Tfhd {
             full_box: mp4::FullBox {
                 version: 0,
-                flags: [2, 0, 0],
+                flags: mp4::u32_to_flags(mp4::TFHD_DEFAULT_BASE_IS_MOOF),
             },
             track_id: VIDEO_TRACK_ID,
             ..mp4::Tfhd::default()

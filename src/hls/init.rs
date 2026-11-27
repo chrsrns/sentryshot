@@ -150,7 +150,7 @@ fn generate_trak(params: &TrackParameters) -> mp4::Boxes {
                 mp4::Url {
                     full_box: mp4::FullBox {
                         version: 0,
-                        flags: [0, 0, 1],
+                        flags: mp4::u32_to_flags(mp4::URL_NOPT),
                     },
                     location: String::new(),
                 },
