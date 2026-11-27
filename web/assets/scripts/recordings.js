@@ -300,7 +300,9 @@ function init(uiData) {
 	viewer.reset();
 
 	window.addEventListener("resize", viewer.lazyLoadRecordings);
-	window.addEventListener("orientation", viewer.lazyLoadRecordings);
+	// Lazy-load on viewport changes: rotation and resize.
+	window.addEventListener("orientationchange", viewer.lazyLoadRecordings);
+	window.addEventListener("resize", viewer.lazyLoadRecordings);
 	document
 		.querySelector("#js-content-grid-wrapper")
 		.addEventListener("scroll", viewer.lazyLoadRecordings);
