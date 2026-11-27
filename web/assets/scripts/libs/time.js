@@ -424,33 +424,6 @@ function pad3(n) {
  * @param {Date} date
  * @param {string} timeZone
  */
-function toUTC(date, timeZone) {
-	try {
-		const tmp1 = new Date(date.toLocaleString("en-US", { timeZone: "utc" }));
-		const unix1 = tmp1.getTime();
-
-		const tmp2 = new Date(date.toLocaleString("en-US", { timeZone }));
-		const unix2 = tmp2.getTime();
-
-		let utc;
-		if (unix1 > unix2) {
-			const offset = unix1 - unix2;
-			utc = new Date(date.getTime() + offset);
-		} else {
-			const offset = unix2 - unix1;
-			utc = new Date(date.getTime() - offset);
-		}
-		utc.setMilliseconds(date.getMilliseconds());
-		return utc;
-	} catch (error) {
-		alert(error);
-	}
-}
-
-/**
- * @param {Date} date
- * @param {string} timeZone
- */
 function fromUTC(date, timeZone) {
 	try {
 		const tmp1 = new Date(date.toLocaleString("en-US", { timeZone: "utc" }));
@@ -502,4 +475,4 @@ function fromUTC2(date, timeZone) {
 	};
 }
 
-export { NS_MILLISECOND, newTime, newTimeNow, toUTC, fromUTC, fromUTC2 };
+export { NS_MILLISECOND, newTime, newTimeNow, fromUTC, fromUTC2 };

@@ -251,6 +251,8 @@ function globals() {
 
 /** @param {String} pathname */
 function relativePathname(pathname) {
+	// Test-only fallback: uiData is injected by the page template and
+	// is always set in production; jest tests run without it.
 	// @ts-ignore
 	if (window.uiData === undefined) {
 		return `http://test.com/${pathname}`;
@@ -296,6 +298,9 @@ function sleep(abortSignal, ms) {
 }
 
 // Memoization is 25% faster.
+// Bounded — html strings can interpolate dynamic values, so the key
+// space isn't fixed; evict the oldest entry past the cap.
+const ELEM_CACHE_MAX = 200;
 const elemCache = {};
 
 /**
@@ -311,6 +316,10 @@ function htmlToElem(html, children = []) {
 		return elem;
 	}
 
+	const cacheKeys = Object.keys(elemCache);
+	if (cacheKeys.length >= ELEM_CACHE_MAX) {
+		delete elemCache[cacheKeys[0]];
+	}
 	const template = document.createElement("template");
 	template.innerHTML = html;
 	//if (template.content.childElementCount !== 1) {

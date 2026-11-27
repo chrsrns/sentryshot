@@ -23,7 +23,7 @@ const hlsConfig = {
 /**
  * @typedef {Object} Feed
  * @property {Element} elem
- * @property {() => void} enableDebugging
+ * @property {() => void=} enableDebugging
  * @property {() => void} destroy
  */
 
@@ -138,7 +138,6 @@ function newFeed(Hls, monitor, preferLowRes, buttons = []) {
 
 	return {
 		elem,
-		enableDebugging() {},
 		destroy() {
 			hls.destroy();
 		},
