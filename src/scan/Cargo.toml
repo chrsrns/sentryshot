@@ -15,6 +15,7 @@ doctest = false
 
 
 [dependencies]
+audio.path = "../audio"
 common.path = "../common"
 onvif.path = "../onvif"
 

@@ -9,6 +9,7 @@
 * 24/7 recording to custom database
 * TFlite object detection with [custom model](https://codeberg.org/Curid/TF-CCTV)
 * Mobile-friendly web interface
+* Two-way audio — listen to a camera's mic and hold-to-talk to its speaker
 
 
 ## Documentation

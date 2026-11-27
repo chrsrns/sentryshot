@@ -26,12 +26,14 @@ monitor.path = "../monitor"
 monitor_groups.path = "../monitor_groups"
 plugin.path = "../plugin"
 ptz.path = "../ptz"
+audio.path = "../audio"
 recdb.path = "../recdb"
 recording.path = "../recording"
 streamer.path = "../streamer"
 vod.path = "../vod"
 web.path = "../web"
 rust-embed.path = "../rust-embed"
+serde_json.workspace = true
 
 axum.workspace = true
 bytesize.workspace = true

@@ -137,6 +137,9 @@ pub struct Config {
 
     #[serde(default)]
     pub ptz: PtzConfig,
+
+    #[serde(default)]
+    pub audio: AudioConfig,
 }
 
 /// PTZ section of a monitor config — persisted under `"ptz"`.
@@ -152,6 +155,87 @@ pub struct PtzConfig {
     /// capability marks (V254). Cleared when the endpoint changes.
     #[serde(default)]
     unsupported: Vec<String>,
+}
+
+/// Two-way audio section of a monitor config — persisted under
+/// `"audio"`. Absent = disabled; pre-feature configs deserialize
+/// unchanged via `#[serde(default)]`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct AudioConfig {
+    #[serde(default)]
+    enable: bool,
+
+    /// Capability names the camera disproved — persisted marks
+    /// written by audio ops on capability faults only; transport
+    /// faults never land here.
+    #[serde(default)]
+    unsupported: Vec<String>,
+
+    /// V380 numeric cloud device ID as a decimal string —
+    /// lenient-parsed at use (malformed ⇒ unset, ⊥ deser fail).
+    /// Overrides the ONVIF-serial derivation when set.
+    #[serde(default, rename = "v380DeviceId", deserialize_with = "de_loose_scalar")]
+    v380_device_id: String,
+
+    /// V380 app-account username — case-sensitive (`Admin` on
+    /// v3-era firmware). Wins the username candidate order.
+    #[serde(default, rename = "v380User", deserialize_with = "de_loose_str")]
+    v380_user: String,
+}
+
+/// Lenient scalar deser — a JSON string or number becomes its
+/// string form; anything else ⇒ empty (unset). A malformed value
+/// can never fail monitor-config load.
+fn de_loose_scalar<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::String(s) => s,
+        Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    })
+}
+
+/// Lenient string deser — a JSON string passes, anything else ⇒
+/// empty (unset).
+fn de_loose_str<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(match Value::deserialize(d)? {
+        Value::String(s) => s,
+        _ => String::new(),
+    })
+}
+
+impl AudioConfig {
+    #[must_use]
+    pub fn new(enable: bool) -> Self {
+        Self {
+            enable,
+            unsupported: Vec::new(),
+            v380_device_id: String::new(),
+            v380_user: String::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn enable(&self) -> bool {
+        self.enable
+    }
+
+    #[must_use]
+    pub fn unsupported(&self) -> &[String] {
+        &self.unsupported
+    }
+
+    /// Configured V380 device ID — the decimal string parsed to
+    /// `u32`; empty ∨ malformed ⇒ `None` (unset, never fatal).
+    #[must_use]
+    pub fn v380_device_id(&self) -> Option<u32> {
+        self.v380_device_id.parse().ok()
+    }
+
+    /// Configured V380 username — `None` when unset.
+    #[must_use]
+    pub fn v380_user(&self) -> Option<&str> {
+        (!self.v380_user.is_empty()).then_some(self.v380_user.as_str())
+    }
 }
 
 impl PtzConfig {
@@ -522,6 +606,16 @@ pub trait IMonitorManager {
     async fn monitors_info(&self) -> Option<HashMap<MonitorId, MonitorInfo>>;
     async fn monitor_config(&self, monitor_id: MonitorId) -> Option<Option<MonitorConfig>>;
     async fn monitor_configs(&self) -> Option<MonitorConfigs>;
+
+    /// Raw-patch removal of `names` from `audio.unsupported` —
+    /// the server-owned unmark path for composed-direction healing.
+    /// NOT a `monitor_set` RMW: `union_audio_marks` would resurrect
+    /// a reduced set. Atomic-write + configs update, actor-serial.
+    async fn monitor_unmark_audio(
+        &self,
+        id: MonitorId,
+        names: Vec<String>,
+    ) -> Option<Result<(), MonitorSetError>>;
 }
 
 #[async_trait]
@@ -605,5 +699,51 @@ mod tests {
         assert!(!ok("http://cam/x#f"));
         assert!(!ok("rtsp://cam"));
         assert!(!ok("not a url"));
+    }
+
+    #[test]
+    fn audio_v380_fields_lenient() {
+        let parse = |audio: serde_json::Value| {
+            let mut v = minimal_monitor_json();
+            v["audio"] = audio;
+            serde_json::from_value::<MonitorConfig>(v)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .config()
+                .audio
+                .clone()
+        };
+        let a = parse(serde_json::json!(
+            {"v380DeviceId": "46078507", "v380User": "bob"}
+        ));
+        assert_eq!(Some(46078507), a.v380_device_id());
+        assert_eq!(Some("bob"), a.v380_user());
+        // A JSON number is lenient-parsed too.
+        assert_eq!(
+            Some(46078507),
+            parse(serde_json::json!({"v380DeviceId": 46078507})).v380_device_id()
+        );
+        // Malformed ⇒ unset, never a deser failure.
+        assert_eq!(
+            None,
+            parse(serde_json::json!({"v380DeviceId": "nope"})).v380_device_id()
+        );
+        assert_eq!(
+            None,
+            parse(serde_json::json!({"v380DeviceId": true})).v380_device_id()
+        );
+        assert_eq!(
+            None,
+            parse(serde_json::json!({"v380DeviceId": "123abc"})).v380_device_id()
+        );
+        assert_eq!(None, parse(serde_json::json!({"v380User": 42})).v380_user());
+        // Absent ⇒ unset.
+        assert_eq!(None, parse(serde_json::json!({})).v380_device_id());
+        assert_eq!(None, parse(serde_json::json!({})).v380_user());
+        // Existing fields still parse alongside.
+        let b =
+            parse(serde_json::json!({"enable": true, "unsupported": ["talk"], "v380User": "x"}));
+        assert!(b.enable());
+        assert_eq!(&["talk"], b.unsupported());
+        assert_eq!(Some("x"), b.v380_user());
     }
 }

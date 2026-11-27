@@ -18,6 +18,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f26201604c87b1e01bd3d98f8d5d9a8fcbb815e8cedb41ffccbeb4bf593a35fe"
 
 [[package]]
+name = "aes"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -121,6 +132,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio"
+version = "0.3.11"
+dependencies = [
+ "aes",
+ "async-trait",
+ "axum 0.8.1",
+ "base64 0.22.1",
+ "common",
+ "md5",
+ "onvif",
+ "pretty_assertions",
+ "rand 0.9.0",
+ "serde",
+ "serde_json",
+ "sha2",
+ "test-case",
+ "thiserror 2.0.11",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "auth_basic"
 version = "0.3.11"
 dependencies = [
@@ -195,6 +228,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d6fd624c75e18b3b4c6b9caf42b1afe24437daaee904069137d8bab077be8b8"
 dependencies = [
  "axum-core 0.5.0",
+ "base64 0.22.1",
  "bytes",
  "form_urlencoded",
  "futures-util",
@@ -214,8 +248,10 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
+ "sha1",
  "sync_wrapper",
  "tokio",
+ "tokio-tungstenite",
  "tower 0.5.2",
  "tower-layer",
  "tower-service",
@@ -399,6 +435,16 @@ checksum = "57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9"
 dependencies = [
  "ciborium-io",
  "half",
+]
+
+[[package]]
+name = "cipher"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
+dependencies = [
+ "crypto-common",
+ "inout",
 ]
 
 [[package]]
@@ -616,6 +662,12 @@ dependencies = [
  "serde",
  "test-case",
 ]
+
+[[package]]
+name = "data-encoding"
+version = "2.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "diff"
@@ -964,6 +1016,7 @@ name = "handler"
 version = "0.3.11"
 dependencies = [
  "async-trait",
+ "audio",
  "axum 0.8.1",
  "common",
  "eventdb",
@@ -987,6 +1040,7 @@ dependencies = [
  "thiserror 2.0.11",
  "tokio",
  "tokio-util",
+ "url",
  "vod",
  "web",
 ]
@@ -1259,6 +1313,15 @@ checksum = "7b0b929d511467233429c45a44ac1dcaa21ba0f5ba11e4879e6ed28ddb4f9df4"
 dependencies = [
  "equivalent",
  "hashbrown 0.14.3",
+]
+
+[[package]]
+name = "inout"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
+dependencies = [
+ "generic-array",
 ]
 
 [[package]]
@@ -1710,6 +1773,7 @@ dependencies = [
  "rand 0.9.0",
  "roxmltree",
  "sha1",
+ "sha2",
  "thiserror 2.0.11",
  "tokio",
  "url",
@@ -2287,6 +2351,7 @@ name = "scan"
 version = "0.3.11"
 dependencies = [
  "async-trait",
+ "audio",
  "axum 0.8.1",
  "base64 0.22.1",
  "bytes",
@@ -2331,6 +2396,7 @@ dependencies = [
 name = "sentryshot"
 version = "0.3.11"
 dependencies = [
+ "audio",
  "axum 0.8.1",
  "bytesize",
  "common",
@@ -2355,6 +2421,7 @@ dependencies = [
  "recording",
  "rust-embed",
  "scan",
+ "serde_json",
  "streamer",
  "test-case",
  "thiserror 2.0.11",
@@ -2839,6 +2906,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-tungstenite"
+version = "0.26.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a9daff607c6d2bf6c16fd681ccb7eecc83e4e2cdc1ca067ffaadfca5de7f084"
+dependencies = [
+ "futures-util",
+ "log 0.4.21",
+ "tokio",
+ "tungstenite",
+]
+
+[[package]]
 name = "tokio-util"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3019,6 +3098,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "tungstenite"
+version = "0.26.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4793cb5e56680ecbb1d843515b23b6de9a75eb04b66643e256a396d43be33c13"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log 0.4.21",
+ "rand 0.9.0",
+ "sha1",
+ "thiserror 2.0.11",
+ "utf-8",
+]
+
+[[package]]
 name = "typenum"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3088,6 +3184,12 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
+
+[[package]]
+name = "utf-8"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
 
 [[package]]
 name = "valuable"

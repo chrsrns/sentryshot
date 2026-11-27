@@ -7,7 +7,7 @@ use axum::{
 use bytesize::ByteSize;
 use common::{
     ArcAuth, ArcLogger, ArcStorage, DynEnvConfig, EnvConfig, ILogger, LogEntry, LogLevel,
-    monitor::{ArcMonitorManager, ArcStreamer},
+    monitor::{ArcMonitorManager, ArcStreamer, IMonitorManager},
     time::Duration,
 };
 use env::{EnvConf, EnvConfigNewError};
@@ -280,6 +280,26 @@ impl App {
             self.env.flags(),
         ));
 
+        let persist_monitors = self.monitor_manager.clone();
+        let unmark_monitors = self.monitor_manager.clone();
+        let audio_service = Arc::new(audio::AudioService::new(
+            Arc::new(|url, alt, cfg| -> audio::ArcAudioClient {
+                Arc::new(audio::RtspAudioClient::new(url, alt, cfg))
+            }),
+            Arc::new(move |monitor_id, marks| {
+                let monitors = persist_monitors.clone();
+                Box::pin(persist_audio_marks(monitors, monitor_id, marks))
+            }),
+            Arc::new(move |monitor_id, names| {
+                let monitors = unmark_monitors.clone();
+                Box::pin(async move {
+                    // Server-owned raw-patch removal — the union in
+                    // `monitor_set` would resurrect a reduced set.
+                    drop(monitors.monitor_unmark_audio(monitor_id, names).await);
+                })
+            }),
+        ));
+
         let mut router = self
             .router
             .clone()
@@ -354,11 +374,17 @@ impl App {
             // Monitor.
             .route_admin(
                 "/api/monitor",
-                delete(monitor_delete_handler).with_state(self.monitor_manager.clone()),
+                delete(monitor_delete_handler).with_state(MonitorLifecycleState {
+                    monitors: self.monitor_manager.clone(),
+                    audio: audio_service.clone(),
+                }),
             )
             .route_admin(
                 "/api/monitor",
-                put(monitor_put_handler).with_state(self.monitor_manager.clone()),
+                put(monitor_put_handler).with_state(MonitorLifecycleState {
+                    monitors: self.monitor_manager.clone(),
+                    audio: audio_service.clone(),
+                }),
             )
             // Monitor restart.
             .route_admin(
@@ -392,6 +418,23 @@ impl App {
                     service: PtzService::new(Arc::new(|endpoint, creds| {
                         Arc::new(ptz::OnvifPtz::new(endpoint, creds)) as ptz::ArcPtzClient
                     })),
+                })),
+            )
+            // Two-way audio — token mint is admin+CSRF; the WS
+            // upgrade authenticates on the consumed token (browser
+            // WS can't set the CSRF header).
+            .route_admin(
+                "/api/monitor/audio-session",
+                post(audio_session_handler).with_state(Arc::new(AudioRouteState {
+                    monitors: self.monitor_manager.clone(),
+                    service: audio_service.clone(),
+                })),
+            )
+            .route_no_auth(
+                "/api/monitor/audio",
+                get(audio_ws_handler).with_state(Arc::new(AudioRouteState {
+                    monitors: self.monitor_manager.clone(),
+                    service: audio_service.clone(),
                 })),
             )
             // Recording delete.
@@ -609,4 +652,48 @@ pub async fn prune_loop(
             () = tokio::time::sleep(interval) => {}
         }
     }
+}
+
+/// Persist audio capability marks — unions names into the stored
+/// monitor's `audio.unsupported` via `monitor_set` (which itself
+/// unions stored ∪ incoming before the endpoint-change clear).
+/// Best-effort: a monitor deleted mid-open just loses the mark.
+async fn persist_audio_marks(
+    monitors: ArcMonitorManager,
+    monitor_id: common::MonitorId,
+    marks: Vec<String>,
+) {
+    let Some(Some(mut stored)) = monitors.monitor_config(monitor_id).await else {
+        return;
+    };
+    let mut merged: Vec<String> = stored.config().audio.unsupported().to_vec();
+    for mark in &marks {
+        if !merged.contains(mark) {
+            merged.push(mark.clone());
+        }
+    }
+    merged.sort();
+    let audio_obj = stored
+        .raw_mut()
+        .as_object_mut()
+        .and_then(|raw| raw.get_mut("audio"))
+        .and_then(serde_json::Value::as_object_mut);
+    match audio_obj {
+        Some(obj) => {
+            obj.insert("unsupported".to_owned(), serde_json::json!(merged));
+        }
+        None => {
+            stored.raw_mut().as_object_mut().map(|raw| {
+                raw.insert(
+                    "audio".to_owned(),
+                    serde_json::json!({"enable": true, "unsupported": merged}),
+                )
+            });
+        }
+    }
+    let Ok(stored) = serde_json::from_value::<common::monitor::MonitorConfig>(stored.raw().clone())
+    else {
+        return;
+    };
+    drop(monitors.monitor_set(stored).await);
 }

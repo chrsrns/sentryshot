@@ -26,6 +26,7 @@ import {
 } from "./components/form.js";
 import { newModal } from "./components/modal.js";
 import { applyPtzCapabilities, newPtzController } from "./components/ptz.js";
+import { applyAudioMarks, newAudioController } from "./components/audio.js";
 
 /** @typedef {import("./components/form.js").InputRule} InputRule */
 
@@ -379,7 +380,7 @@ function newScanModal(token) {
 			if (cam.ptz) {
 				badges.push("ptz");
 			}
-			if (cam.backchannel) {
+			if (cam.backchannel || cam.vigiTalk) {
 				badges.push("audio");
 			}
 			if (badges.length > 0) {
@@ -510,6 +511,12 @@ function newScanModal(token) {
 						},
 						name: sanitizeMonitorName(cam.name, cam.ip),
 					};
+					if (cam.backchannel === true || cam.vigiTalk === true) {
+						// ONVIF backchannel or VIGI :8800 probe hit →
+						// prefill audio; the user can still un-toggle it.
+						// @ts-ignore
+						prefill.audio = { enable: true };
+					}
 					if (cam.ptz === true) {
 						// First http XAddr; none → empty, derived at
 						// command time from the main stream host.
@@ -1245,6 +1252,145 @@ const ptzOnvifAddrRules = [
 	[/[#?]/, "query and fragment not allowed"],
 ];
 
+
+/**
+ * @typedef {Object} AudioConfig
+ * @property {boolean} enable
+ * @property {string[]=} unsupported
+ * @property {string=} v380DeviceId
+ * @property {string=} v380User
+ */
+
+/**
+ * Monitor `audio` section — enable toggle + a test row carrying the
+ * live tile's affordances. The row renders only for a persisted
+ * monitor saved with `audio.enable` true.
+ *
+ * @param {string} csrfToken
+ * @param {() => string} getMonitorId
+ * @returns {Field<AudioConfig>}
+ */
+function newAudioField(csrfToken, getMonitorId, monitors) {
+	const fields = {
+		enable: fieldTemplate.toggle("Two-way audio", false),
+	};
+	const panel = newAudioPanel(csrfToken, getMonitorId);
+
+	const form = newForm(fields);
+	/** @type {Record<string, unknown>} */
+	let extra = {};
+	return {
+		elems: [...fields.enable.elems, panel.elem],
+		value() {
+			/** @type {AudioConfig} */
+			const value = { enable: false };
+			form.get(value);
+			// Keys this field does not own — server-managed capability
+			// marks, hand-edited V380 creds — round-tripped untouched.
+			for (const key of Object.keys(extra)) {
+				value[key] = extra[key];
+			}
+			return value;
+		},
+		set(input) {
+			const value = input === undefined ? {} : input;
+			extra = {};
+			for (const key of Object.keys(value)) {
+				if (key !== "enable") {
+					extra[key] = value[key];
+				}
+			}
+			form.set(value);
+			// Panel only for a persisted monitor whose *saved* config
+			// has audio.enable true — an unsaved toggle or a scan
+			// prefill on a monitor that doesn't exist yet would mint
+			// tokens against nothing.
+			const persisted = monitors[getMonitorId()];
+			const savedEnable =
+				persisted !== undefined &&
+				persisted.audio !== undefined &&
+				persisted.audio.enable === true;
+			if (value.enable === true && savedEnable) {
+				panel.show();
+				// Persisted marks disable controls before any `caps`.
+				const marks = /** @type {string[]|undefined} */ (extra.unsupported);
+				applyAudioMarks(panel.elem, marks || []);
+			} else {
+				panel.hide();
+			}
+		},
+		validate() {
+			return form.validate();
+		},
+	};
+}
+
+/**
+ * Audio test row: speaker listen toggle + mic hold-to-talk against the
+ * stored monitor. Same context gates as the /live cluster — talk
+ * requires `isSecureContext`.
+ *
+ * @param {string} csrfToken
+ * @param {() => string} getMonitorId
+ */
+function newAudioPanel(csrfToken, getMonitorId) {
+	const glyphBtn = "ptz-glyph px-2 rounded-lg bg-color2 hover:bg-color3";
+	const elem = /** @type {HTMLElement} */ (htmlToElem(/* HTML */ `
+		<li class="audio-panel form-item" hidden>
+			<div class="flex gap-2 items-center p-2 border border-color3 rounded-lg w-max">
+				<span class="js-audio-wrap"><button type="button" class="js-audio-listen ${glyphBtn}">listen</button></span>
+				<span class="js-audio-wrap js-audio-talk-wrap"><button type="button" class="js-audio-talk ${glyphBtn}">hold to talk</button></span>
+				<label class="flex items-center gap-1 text-1.5 text-color">
+					mic gain
+					<input type="range" class="js-audio-gain" min="0.25" max="4" step="0.05">
+					<span class="js-audio-gain-val"></span>
+				</label>
+				<div class="js-audio-error text-red"></div>
+			</div>
+		</li>
+	`));
+	const errorElem = /** @type {HTMLElement} */ (elem.querySelector(".js-audio-error"));
+	const controller = newAudioController(csrfToken, getMonitorId, errorElem);
+	controller.bindListen(elem);
+	controller.bindTalk(elem);
+	controller.attach();
+	const gainInput = /** @type {HTMLInputElement} */ (elem.querySelector(".js-audio-gain"));
+	const gainVal = elem.querySelector(".js-audio-gain-val");
+	const showGain = () => {
+		const g = controller.refreshGain();
+		gainInput.value = `${g}`;
+		if (gainVal !== null) {
+			gainVal.textContent = `×${g.toFixed(2)}`;
+		}
+	};
+	gainInput.addEventListener("input", () => {
+		controller.setGain(Number(gainInput.value));
+		const g = controller.getGain();
+		if (gainVal !== null) {
+			gainVal.textContent = `×${g.toFixed(2)}`;
+		}
+	});
+	if (!window.isSecureContext) {
+		const talk = /** @type {HTMLButtonElement} */ (elem.querySelector(".js-audio-talk"));
+		talk.disabled = true;
+		const wrap = elem.querySelector(".js-audio-talk-wrap");
+		if (wrap !== null) {
+			wrap.setAttribute("title", "requires a secure context");
+		}
+	}
+	return {
+		elem,
+		show() {
+			showGain();
+			elem.removeAttribute("hidden");
+		},
+		hide() {
+			controller.detach();
+			elem.setAttribute("hidden", "");
+		},
+	};
+}
+
 /**
  * @param {string} csrfToken
  * @param {() => string} getMonitorId
@@ -1465,6 +1611,7 @@ function init(uiData) {
 	monitorFields.alwaysRecord = fieldTemplate.toggle("Always record", false);
 	monitorFields.videoLength = fieldTemplate.number("Video length (min)", "15", 15);
 	monitorFields.ptz = newPtzField(uiData.csrfToken, getMonitorId);
+	monitorFields.audio = newAudioField(uiData.csrfToken, getMonitorId, uiData.monitors);
 	//timestampOffset: fieldTemplate.integer("Timestamp offset (ms)", "500", "500"),
 	/* SETTINGS_LAST_MONITOR_FIELD */
 
@@ -1508,4 +1655,4 @@ function init(uiData) {
 		.replaceChildren(...rendererCategories([monitor, group, account]));
 }
 
-export { init, newScanModal, newPtzField, newPtzPanel };
+export { init, newScanModal, newPtzField, newPtzPanel, newAudioField };

@@ -18,6 +18,7 @@ use hyper_util::{
 };
 use roxmltree::Document;
 use sha1::Digest as _;
+use std::fmt::Write as _;
 use std::{
     net::IpAddr,
     sync::atomic::{AtomicBool, AtomicI64, Ordering},
@@ -339,20 +340,25 @@ pub struct DigestChallenge {
     nonce: String,
     qop: Option<String>,
     algorithm: Option<String>,
+    opaque: Option<String>,
 }
 
 /// Parse a `WWW-Authenticate` header; `None` when not Digest or
 /// missing the mandatory `realm`/`nonce`.
 #[must_use]
 pub fn parse_digest_challenge(header: &str) -> Option<DigestChallenge> {
-    let rest = header.strip_prefix("Digest")?;
+    let rest = header
+        .get(..6)
+        .filter(|s| s.eq_ignore_ascii_case("digest"))
+        .map(|_| &header[6..])?;
     let mut c = DigestChallenge {
         realm: String::new(),
         nonce: String::new(),
         qop: None,
         algorithm: None,
+        opaque: None,
     };
-    for part in rest.split(',') {
+    for part in split_quoted(rest, ',') {
         let mut kv = part.trim().splitn(2, '=');
         let (k, v) = (kv.next()?, kv.next()?);
         let v = v.trim().trim_matches('"').to_owned();
@@ -361,6 +367,7 @@ pub fn parse_digest_challenge(header: &str) -> Option<DigestChallenge> {
             "nonce" => c.nonce = v,
             "qop" => c.qop = Some(v),
             "algorithm" => c.algorithm = Some(v),
+            "opaque" => c.opaque = Some(v),
             _ => {}
         }
     }
@@ -370,7 +377,30 @@ pub fn parse_digest_challenge(header: &str) -> Option<DigestChallenge> {
     Some(c)
 }
 
+/// Split on `sep` ignoring separators inside double-quoted spans —
+/// Digest params like `qop="auth,auth-int"` carry literal commas.
+fn split_quoted(s: &str, sep: char) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '"' => quoted = !quoted,
+            c if c == sep && !quoted => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
+}
+
 /// Build a Digest `Authorization` header value for one request.
+/// Honors the challenge `algorithm` (MD5 default, SHA-256, and
+/// `-sess` variants) and emits `qop`/`nc`/`cnonce`/`opaque`/`algorithm`
+/// fields when the challenge carries them.
 #[must_use]
 pub fn digest_authorization(
     challenge: &DigestChallenge,
@@ -379,35 +409,71 @@ pub fn digest_authorization(
     uri: &str,
     method: &str,
 ) -> String {
-    let ha1 = format!(
-        "{:x}",
-        md5::compute(format!("{user}:{}:{pass}", challenge.realm))
-    );
-    let ha2 = format!("{:x}", md5::compute(format!("{method}:{uri}")));
-    let (cnonce, nc) = (
-        format!("{:x}", md5::compute(rand::random::<u64>().to_string())),
-        "00000001",
-    );
-    let response = match challenge.qop.as_deref() {
-        Some(qop) => format!(
-            "{:x}",
-            md5::compute(format!(
-                "{ha1}:{}:{nc}:{cnonce}:{qop}:{ha2}",
-                challenge.nonce
-            ))
-        ),
-        None => format!(
-            "{:x}",
-            md5::compute(format!("{ha1}:{}:{ha2}", challenge.nonce))
-        ),
+    let cnonce = format!("{:x}", md5::compute(rand::random::<u64>().to_string()));
+    digest_authorization_with(challenge, user, pass, uri, method, &cnonce)
+}
+
+/// Deterministic core of `digest_authorization` — the caller
+/// supplies the cnonce (RFC 7616 wants it unpredictable; tests
+/// pin it).
+fn digest_authorization_with(
+    challenge: &DigestChallenge,
+    user: &str,
+    pass: &str,
+    uri: &str,
+    method: &str,
+    cnonce: &str,
+) -> String {
+    let sha256 = challenge
+        .algorithm
+        .as_deref()
+        .is_some_and(|a| a.to_ascii_lowercase().starts_with("sha-256"));
+    let sess = challenge
+        .algorithm
+        .as_deref()
+        .is_some_and(|a| a.to_ascii_lowercase().ends_with("-sess"));
+    let hash = |v: &str| -> String {
+        if sha256 {
+            format!("{:x}", sha2::Sha256::digest(v.as_bytes()))
+        } else {
+            format!("{:x}", md5::compute(v))
+        }
     };
-    format!(
-        "Digest username=\"{user}\", realm=\"{}\", nonce=\"{}\", uri=\"{uri}\", response=\"{response}\", cnonce=\"{cnonce}\", nc={nc}",
+    let mut ha1 = hash(&format!("{user}:{}:{pass}", challenge.realm));
+    if sess {
+        ha1 = hash(&format!("{ha1}:{}:{cnonce}", challenge.nonce));
+    }
+    let ha2 = hash(&format!("{method}:{uri}"));
+    // `qop` may arrive as a comma list — `auth` is the only form
+    // supported; an auth-int-only challenge gets `auth` anyway
+    // (universal camera posture).
+    let qop = challenge.qop.as_deref().map(|_| "auth");
+    let nc = "00000001";
+    let response = match qop {
+        Some(q) => hash(&format!(
+            "{ha1}:{}:{nc}:{cnonce}:{q}:{ha2}",
+            challenge.nonce
+        )),
+        None => hash(&format!("{ha1}:{}:{ha2}", challenge.nonce)),
+    };
+    let mut out = format!(
+        "Digest username=\"{user}\", realm=\"{}\", nonce=\"{}\", uri=\"{uri}\", response=\"{response}\"",
         challenge.realm, challenge.nonce
-    )
+    );
+    if let Some(a) = &challenge.algorithm {
+        write!(out, ", algorithm={a}").ok();
+    }
+    if let Some(o) = &challenge.opaque {
+        write!(out, ", opaque=\"{o}\"").ok();
+    }
+    if let Some(q) = qop {
+        write!(out, ", qop={q}, nc={nc}, cnonce=\"{cnonce}\"").ok();
+    }
+    out
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
@@ -421,6 +487,70 @@ mod tests {
         assert!(auth.contains("realm=\"cam\""));
         assert!(auth.contains("response=\""));
         assert!(auth.contains("uri=\"/x\""));
+    }
+
+    // RFC 7616 §3.9.1 — MD5 response with qop=auth.
+    #[test]
+    fn digest_rfc7616_md5() {
+        let c = parse_digest_challenge(
+            r#"Digest realm="testrealm@host.com", qop="auth,auth-int", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", opaque="5ccc069c403ebaf9f0171e9517f40e41""#,
+        )
+        .unwrap();
+        let auth = digest_authorization_with(
+            &c,
+            "Mufasa",
+            "Circle Of Life",
+            "/dir/index.html",
+            "GET",
+            "0a4f113b",
+        );
+        assert!(
+            auth.contains("response=\"6629fae49393a05397450978507c4ef1\""),
+            "{auth}"
+        );
+        assert!(auth.contains("qop=auth"), "{auth}");
+        assert!(auth.contains("nc=00000001"), "{auth}");
+        assert!(auth.contains("cnonce=\"0a4f113b\""), "{auth}");
+        assert!(
+            auth.contains("opaque=\"5ccc069c403ebaf9f0171e9517f40e41\""),
+            "{auth}"
+        );
+    }
+
+    // RFC 7616 §3.9.1 — SHA-256 response with qop=auth (the
+    // example's params differ from the MD5 one).
+    #[test]
+    fn digest_rfc7616_sha256() {
+        let c = parse_digest_challenge(
+            r#"Digest realm="http-auth@example.org", qop="auth,auth-int", nonce="7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v", opaque="FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS", algorithm=SHA-256"#,
+        )
+        .unwrap();
+        let auth = digest_authorization_with(
+            &c,
+            "Mufasa",
+            "Circle of Life",
+            "/dir/index.html",
+            "GET",
+            "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ",
+        );
+        assert!(
+            auth.contains(
+                "response=\"753927fa0e85d155564e2e272a28d1802ca10daf4496794697cf8db5856cb6c1\""
+            ),
+            "{auth}"
+        );
+        assert!(auth.contains("algorithm=SHA-256"), "{auth}");
+    }
+
+    // qop-less challenge: no qop/nc/cnonce fields emitted, legacy
+    // HA1:nonce:HA2 response form.
+    #[test]
+    fn digest_no_qop() {
+        let c = parse_digest_challenge(r#"Digest realm="cam", nonce="abc123""#).unwrap();
+        let auth = digest_authorization_with(&c, "admin", "pass", "/x", "GET", "zz");
+        assert!(!auth.contains("qop"), "{auth}");
+        assert!(!auth.contains("cnonce"), "{auth}");
+        assert!(auth.contains("response=\""), "{auth}");
     }
 
     #[test]
@@ -450,10 +580,10 @@ mod tests {
             creds_from_url("rtsp://admin:p%40ss@cam/x")
         );
         assert_eq!(
-            ("".to_owned(), "".to_owned()),
+            (String::new(), String::new()),
             creds_from_url("rtsp://cam/x")
         );
-        assert_eq!(("".to_owned(), "".to_owned()), creds_from_url("not a url"));
+        assert_eq!((String::new(), String::new()), creds_from_url("not a url"));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 // @ts-check
 
 import { jest } from "@jest/globals";
-import { newScanModal, newPtzField } from "./settings.js";
+import { newScanModal, newPtzField, newAudioField } from "./settings.js";
 
 describe("newScanModal", () => {
 	test("open attaches modal to the document", () => {
@@ -1238,6 +1238,38 @@ describe("scan pick ptz prefill", () => {
 		expect(picked.ptz).toEqual({ enable: true, onvifAddr: "" });
 	});
 
+	test("vigiTalk camera prefills audio and shows the badge", async () => {
+		document.body.replaceChildren();
+		const modal = newScanModal("token");
+		let picked;
+		modal.onPick = (p) => {
+			picked = p;
+		};
+		await runScan(modal, {
+			cameras: [
+				{
+					ip: "10.0.0.9",
+					name: "Cam",
+					xaddrs: ["http://cam/onvif"],
+					ptz: false,
+					backchannel: false,
+					vigiTalk: true,
+					needsAuth: false,
+					streams: [
+						{ role: "main", rtspUrl: "rtsp://10.0.0.9/main", videoCodec: "h264" },
+					],
+				},
+			],
+			truncated: false,
+		});
+		expect(modal.elem.textContent).toContain("audio");
+		const useBtn = [...modal.elem.querySelectorAll("button")].find(
+			(b) => b.textContent.trim() === "Use",
+		);
+		useBtn.click();
+		expect(picked.audio).toEqual({ enable: true });
+	});
+
 	test("non-ptz camera adds no ptz prefill", async () => {
 		document.body.replaceChildren();
 		const modal = newScanModal("token");
@@ -1266,5 +1298,48 @@ describe("scan pick ptz prefill", () => {
 		);
 		useBtn.click();
 		expect(picked.ptz).toBeUndefined();
+	});
+});
+
+describe("newAudioField", () => {
+	const getId = () => "cam1";
+	const panelOf = (field) =>
+		field.elems.find((e) => e.classList.contains("audio-panel"));
+
+	test("panel hidden when monitor is not persisted", () => {
+		// Scan prefill on a monitor with no saved config.
+		const field = newAudioField("token", getId, {});
+		field.set({ enable: true });
+		expect(panelOf(field).hasAttribute("hidden")).toBe(true);
+	});
+
+	test("panel shows for a persisted monitor saved with enable", () => {
+		const field = newAudioField("token", getId, {
+			cam1: { audio: { enable: true } },
+		});
+		field.set({ enable: true });
+		expect(panelOf(field).hasAttribute("hidden")).toBe(false);
+	});
+
+	test("panel hidden when saved config has enable false", () => {
+		const field = newAudioField("token", getId, {
+			cam1: { audio: { enable: false } },
+		});
+		field.set({ enable: true });
+		expect(panelOf(field).hasAttribute("hidden")).toBe(true);
+	});
+
+	test("non-owned keys survive a panel save byte-identical", () => {
+		const field = newAudioField("token", getId, {
+			cam1: { audio: { enable: true } },
+		});
+		const cfg = {
+			enable: true,
+			unsupported: ["talk"],
+			v380DeviceId: "12345678",
+			v380User: "Admin",
+		};
+		field.set(cfg);
+		expect(field.value()).toEqual(cfg);
 	});
 });

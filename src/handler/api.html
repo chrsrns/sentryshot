@@ -612,6 +612,72 @@
 				</button>
 			<pre></pre>
 		</article>
+		<article class="js-post-audio-session">
+			<span>POST /api/monitor/audio-session?id=</span>
+			<input type="text" value="123" placeholder="MONITOR_ID" class="js-id" />
+			<button
+				style="margin-left: 0"
+				onclick='
+				(async () => {
+					const element = document.querySelector(".js-post-audio-session");
+					const token = await fetch("api/account/my-token");
+					const id = element.querySelector(".js-id").value;
+					const res = await fetch(`api/monitor/audio-session?id=${id}`, {
+						headers: { "X-CSRF-TOKEN": token },
+						method: "post",
+					});
+					element.querySelector("pre").textContent =
+						`${res.status}\n${await res.text()}`;
+				})();
+				'
+				>
+					Submit
+				</button>
+			<pre></pre>
+		</article>
+		<article class="js-get-audio">
+			<span>GET /api/monitor/audio — mint + open + send `listen`</span>
+			<input type="text" value="123" placeholder="MONITOR_ID" class="js-id" />
+			<button
+				style="margin-left: 0"
+				onclick='
+				(async () => {
+					const element = document.querySelector(".js-get-audio");
+					const log = (m) => {
+						element.querySelector("pre").textContent += `${m}\n`;
+					};
+					const token = await fetch("api/account/my-token");
+					const id = element.querySelector(".js-id").value;
+					const res = await fetch(`api/monitor/audio-session?id=${id}`, {
+						headers: { "X-CSRF-TOKEN": token },
+						method: "post",
+					});
+					if (res.status !== 200) {
+						log(`${res.status} ${await res.text()}`);
+						return;
+					}
+					const { token: wsToken } = await res.json();
+					const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+					const ws = new WebSocket(
+						`${scheme}//${location.host}/api/monitor/audio?token=${wsToken}`,
+					);
+					ws.onopen = () => {
+						log("open — sending listen");
+						ws.send(JSON.stringify({ type: "listen" }));
+					};
+					ws.onmessage = (ev) => {
+						log(typeof ev.data === "string" ? ev.data : `[binary ${ev.data.byteLength}B]`);
+					};
+					ws.onerror = () => log("socket error");
+					ws.onclose = (ev) => log(`close ${ev.code}`);
+					setTimeout(() => ws.close(), 15000);
+				})();
+				'
+				>
+					Submit
+				</button>
+			<pre></pre>
+		</article>
 		<article class="js-post-scan">
 			<span>POST /api/scan</span>
 			<textarea style="width: 12rem; height: 4rem">

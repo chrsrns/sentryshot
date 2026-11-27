@@ -161,6 +161,7 @@ enum MonitorManagerRequest {
     MonitorsInfo(oneshot::Sender<HashMap<MonitorId, MonitorInfo>>),
     MonitorConfig((oneshot::Sender<Option<MonitorConfig>>, MonitorId)),
     MonitorConfigs(oneshot::Sender<MonitorConfigs>),
+    MonitorUnmarkAudio((oneshot::Sender<Result<(), MonitorSetError>>, MonitorId, Vec<String>)),
     Cancel(oneshot::Sender<()>),
 }
 
@@ -319,6 +320,20 @@ impl IMonitorManager for MonitorManager {
         }
         Some(rx.await.expect("actor should respond"))
     }
+
+    async fn monitor_unmark_audio(
+        &self,
+        id: MonitorId,
+        names: Vec<String>,
+    ) -> Option<Result<(), MonitorSetError>> {
+        let (tx, rx) = oneshot::channel();
+        let req = MonitorManagerRequest::MonitorUnmarkAudio((tx, id, names));
+        if self.0.send(req).await.is_err() {
+            // Cancelled.
+            return None;
+        }
+        Some(rx.await.expect("actor should respond"))
+    }
 }
 
 struct MonitorManagerState {
@@ -376,6 +391,9 @@ async fn run_monitor_manager(mut rx: mpsc::Receiver<MonitorManagerRequest>) {
                 _ = res.send(state.get().configs.get(&monitor_id).cloned());
             }
             MonitorManagerRequest::MonitorConfigs(res) => _ = res.send(state.get().configs.clone()),
+            MonitorManagerRequest::MonitorUnmarkAudio((res, monitor_id, names)) => {
+                _ = res.send(state.get().monitor_unmark_audio(&monitor_id, &names).await);
+            }
             MonitorManagerRequest::Cancel(res) => {
                 state.0.expect("initialized").cancel().await;
                 res.send(()).expect("caller should receive response");
@@ -498,9 +516,19 @@ impl MonitorManagerState {
                     config = fresh;
                 }
             }
+
+            union_audio_marks(old, &mut config);
         }
 
         // Endpoint surface changed → stale capability marks are dropped.
+        let endpoint_changed =
+            self.configs
+                .get(&id)
+                .is_some_and(|old| match (old.source(), config.source()) {
+                    (SourceConfig::Rtsp(a), SourceConfig::Rtsp(b)) => {
+                        a.main_stream != b.main_stream
+                    }
+                });
         let stale_marks = self.configs.get(&id).is_some_and(|old| {
             if config.config().ptz.unsupported().is_empty() {
                 return false;
@@ -508,9 +536,7 @@ impl MonitorManagerState {
             if old.config().ptz.onvif_addr() != config.config().ptz.onvif_addr() {
                 return true;
             }
-            match (old.source(), config.source()) {
-                (SourceConfig::Rtsp(a), SourceConfig::Rtsp(b)) => a.main_stream != b.main_stream,
-            }
+            endpoint_changed
         });
         if stale_marks {
             if let Some(ptz) = config
@@ -522,6 +548,21 @@ impl MonitorManagerState {
             }
             // Typed views deserialize once — re-parse so the stored
             // config reflects the patched raw.
+            if let Ok(fresh) = serde_json::from_value::<MonitorConfig>(config.raw().clone()) {
+                config = fresh;
+            }
+        }
+
+        // Audio marks clear on the same mainStream/creds change —
+        // the session endpoint key is the main stream URL itself.
+        if endpoint_changed && !config.config().audio.unsupported().is_empty() {
+            if let Some(audio) = config
+                .raw_mut()
+                .get_mut("audio")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                audio.insert("unsupported".to_owned(), serde_json::json!([]));
+            }
             if let Ok(fresh) = serde_json::from_value::<MonitorConfig>(config.raw().clone()) {
                 config = fresh;
             }
@@ -547,6 +588,58 @@ impl MonitorManagerState {
         Ok(created)
     }
 
+    /// Remove `names` from `audio.unsupported` — the V281 raw-patch
+    /// removal op. NOT a `monitor_set` RMW: `union_audio_marks`
+    /// unions stored ∪ incoming and would resurrect a reduced set.
+    /// Patches `raw` directly, atomic-writes, updates `configs` —
+    /// the endpoint-clear posture. A missing monitor ∨ absent
+    /// mark set is a no-op.
+    pub async fn monitor_unmark_audio(
+        &mut self,
+        id: &MonitorId,
+        names: &[String],
+    ) -> Result<(), MonitorSetError> {
+        let Some(config) = self.configs.get(id) else {
+            return Ok(());
+        };
+        let remaining: Vec<String> = config
+            .config()
+            .audio
+            .unsupported()
+            .iter()
+            .filter(|m| !names.contains(m))
+            .cloned()
+            .collect();
+        if remaining.len() == config.config().audio.unsupported().len() {
+            return Ok(()); // nothing to remove
+        }
+        let mut config = config.clone();
+        let raw = config.raw_mut();
+        match raw
+            .get_mut("audio")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            Some(audio) => {
+                audio.insert("unsupported".to_owned(), serde_json::json!(remaining));
+            }
+            None => return Ok(()), // no audio object ⇒ no marks stored
+        }
+        // Typed views deserialize once — re-parse so the stored
+        // config reflects the patched raw.
+        if let Ok(fresh) = serde_json::from_value::<MonitorConfig>(config.raw().clone()) {
+            config = fresh;
+        }
+        let path = self.config_path(id);
+        let mut temp_path = path.clone();
+        temp_path.set_file_name(id.to_string() + ".json.tmp");
+        let json = serde_json::to_vec_pretty(&config)?;
+        write_file_atomic2(Handle::current(), path, temp_path, json)
+            .await
+            .map_err(MonitorSetError::WriteFile)?;
+        self.configs.insert(id.clone(), config);
+        Ok(())
+    }
+
     pub async fn monitor_set_and_restart(
         &mut self,
         config: MonitorConfig,
@@ -567,7 +660,7 @@ impl MonitorManagerState {
             monitor.stop().await;
             self.log(LogLevel::Debug, id, "stopped");
             self.started_monitors.remove(id);
-        };
+        }
 
         if self.configs.remove(id).is_none() {
             return Err(NotExist(id.to_string()));
@@ -728,6 +821,39 @@ impl MonitorManagerState {
 }
 
 #[allow(clippy::needless_pass_by_value, clippy::unwrap_used)]
+
+/// Server-owned union for `audio.unsupported` — stored ∪ incoming,
+/// written back through `raw` so a payload lacking the `audio`
+/// object still preserves stored marks (V260).
+fn union_audio_marks(old: &MonitorConfig, config: &mut MonitorConfig) {
+    let mut union: Vec<String> = old.config().audio.unsupported().to_vec();
+    for mark in config.config().audio.unsupported() {
+        if !union.contains(mark) {
+            union.push(mark.clone());
+        }
+    }
+    if union == config.config().audio.unsupported() {
+        return;
+    }
+    let raw = config.raw_mut();
+    if let Some(audio) = raw
+        .get_mut("audio")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        audio.insert("unsupported".to_owned(), serde_json::json!(union));
+    } else if let Some(obj) = raw.as_object_mut() {
+        // Third-party PUT with no `audio` object at all — stored
+        // marks still survive.
+        obj.insert(
+            "audio".to_owned(),
+            serde_json::json!({"unsupported": union}),
+        );
+    }
+    if let Ok(fresh) = serde_json::from_value::<MonitorConfig>(config.raw().clone()) {
+        *config = fresh;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -912,6 +1038,7 @@ mod tests {
                 always_record: false,
                 video_length: 0.0,
                 ptz: PtzConfig::default(),
+                audio: common::monitor::AudioConfig::default(),
             },
             SourceConfig::Rtsp(SourceRtspConfig {
                 protocol: Protocol::Tcp,
@@ -967,6 +1094,7 @@ mod tests {
                 always_record: false,
                 video_length: 0.0,
                 ptz: PtzConfig::default(),
+                audio: common::monitor::AudioConfig::default(),
             },
             SourceConfig::Rtsp(SourceRtspConfig {
                 protocol: Protocol::Tcp,
@@ -1053,6 +1181,7 @@ mod tests {
                 always_record: false,
                 video_length: 0.0,
                 ptz: PtzConfig::new(true, "https://cam".to_owned()),
+                audio: common::monitor::AudioConfig::default(),
             },
             SourceConfig::Rtsp(SourceRtspConfig {
                 protocol: Protocol::Tcp,
@@ -1218,6 +1347,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn monitor_set_unions_audio_marks_even_without_audio_key() {
+        let (token, tracker, _temp_dir, _, manager) = new_test_manager().await;
+        let base = || {
+            json!({
+                "id": "cam", "name": "cam", "enable": false,
+                "source": "rtsp",
+                "sourcertsp": {"protocol": "tcp", "mainStream": "rtsp://x1"},
+                "alwaysRecord": false, "videoLength": 0.0,
+                "audio": {"enable": true, "unsupported": ["talk", "listen"]},
+            })
+        };
+
+        manager
+            .monitor_set(serde_json::from_value(base()).unwrap())
+            .await
+            .unwrap();
+
+        // Third-party PUT with no `audio` object at all — stored
+        // marks still survive the union.
+        let mut bare = base();
+        bare.as_object_mut().unwrap().remove("audio");
+        manager
+            .monitor_set(serde_json::from_value(bare).unwrap())
+            .await
+            .unwrap();
+        let got = manager.monitor_config(m_id("cam")).await.unwrap().unwrap();
+        assert_eq!(&["talk", "listen"], got.config().audio.unsupported());
+
+        // Endpoint change still clears the marks.
+        let mut changed = base();
+        changed["sourcertsp"]["mainStream"] = json!("rtsp://x2");
+        manager
+            .monitor_set(serde_json::from_value(changed).unwrap())
+            .await
+            .unwrap();
+        let got = manager.monitor_config(m_id("cam")).await.unwrap().unwrap();
+        assert!(got.config().audio.unsupported().is_empty());
+
+        stop_manager(token, tracker).await;
+    }
+
+    #[tokio::test]
     async fn test_monitor_configs() {
         let (token, tracker, _temp_dir, _, manager) = new_test_manager().await;
 
@@ -1234,6 +1405,7 @@ mod tests {
                         always_record: false,
                         video_length: 0.0,
                         ptz: PtzConfig::default(),
+                        audio: common::monitor::AudioConfig::default(),
                     },
                     SourceConfig::Rtsp(SourceRtspConfig {
                         protocol: Protocol::Tcp,
@@ -1265,6 +1437,7 @@ mod tests {
                         always_record: false,
                         video_length: 0.0,
                         ptz: PtzConfig::default(),
+                        audio: common::monitor::AudioConfig::default(),
                     },
                     SourceConfig::Rtsp(SourceRtspConfig {
                         protocol: Protocol::Udp,
@@ -1324,5 +1497,47 @@ mod tests {
         ) -> Result<Option<(ArcStreamerMuxer, DynH264Writer)>, DynError> {
             Ok(None)
         }
+    }
+    /// Raw-patch `audio.unsupported` removal — named marks drop
+    /// from the live config AND the atomic file write, others
+    /// survive; ⊥-matching removals are no-ops.
+    #[allow(clippy::unwrap_used)]
+    #[tokio::test]
+    async fn monitor_unmark_audio_removes_named_marks() {
+        let (token, tracker, _temp_dir, config_dir, manager) = new_test_manager().await;
+        let base = || {
+            json!({
+                "id": "cam", "name": "cam", "enable": false,
+                "source": "rtsp",
+                "sourcertsp": {"protocol": "tcp", "mainStream": "rtsp://x1"},
+                "alwaysRecord": false, "videoLength": 0.0,
+                "audio": {"enable": true, "unsupported": ["talk", "listen", "ptz"]},
+            })
+        };
+        manager
+            .monitor_set(serde_json::from_value(base()).unwrap())
+            .await
+            .unwrap();
+        let id = m_id("cam");
+        manager
+            .monitor_unmark_audio(id.clone(), vec!["talk".to_owned()])
+            .await
+            .unwrap();
+        let got = manager.monitor_config(id.clone()).await.unwrap().unwrap();
+        assert_eq!(got.config().audio.unsupported(), &["listen", "ptz"]);
+        // Atomic write reached disk too.
+        let on_disk = read_config(config_dir.join("cam.json"));
+        assert_eq!(on_disk.config().audio.unsupported(), &["listen", "ptz"]);
+        // ⊥-matching removal = no-op, no fault.
+        manager
+            .monitor_unmark_audio(id.clone(), vec!["talk".to_owned()])
+            .await
+            .unwrap();
+        // Unknown monitor = no-op.
+        manager
+            .monitor_unmark_audio(m_id("ghost"), vec!["talk".to_owned()])
+            .await
+            .unwrap();
+        stop_manager(token, tracker).await;
     }
 }

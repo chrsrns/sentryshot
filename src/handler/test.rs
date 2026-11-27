@@ -125,6 +125,34 @@ mod ptz {
         async fn monitor_configs(&self) -> Option<MonitorConfigs> {
             unimplemented!()
         }
+        async fn monitor_unmark_audio(
+            &self,
+            _id: MonitorId,
+            names: Vec<String>,
+        ) -> Option<Result<(), MonitorSetError>> {
+            let mut cfg = self.config.lock().unwrap();
+            if let Some(c) = cfg.as_mut() {
+                let rem: Vec<String> = c
+                    .config()
+                    .audio
+                    .unsupported()
+                    .iter()
+                    .filter(|m| !names.contains(m))
+                    .cloned()
+                    .collect();
+                if let Some(a) = c
+                    .raw_mut()
+                    .get_mut("audio")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    a.insert("unsupported".to_owned(), serde_json::json!(rem));
+                }
+                if let Ok(f) = serde_json::from_value::<MonitorConfig>(c.raw().clone()) {
+                    *c = f;
+                }
+            }
+            Some(Ok(()))
+        }
     }
 
     struct StubPtz {
@@ -218,6 +246,7 @@ mod ptz {
                 always_record: false,
                 video_length: 0.0,
                 ptz: PtzConfig::new(enable_ptz, String::new()),
+                audio: common::monitor::AudioConfig::default(),
             },
             SourceConfig::Rtsp(SourceRtspConfig {
                 protocol: Protocol::Tcp,
@@ -617,3 +646,300 @@ mod ptz {
         assert_eq!(vec!["home"], *calls.lock().unwrap());
     }
 }
+
+// SPDX-SnippetBegin
+// SPDX-Snippet-CopyrightText: two-way audio route tests
+#[cfg(test)]
+mod audio_tests {
+    use crate::{
+        AudioRouteState, MonitorIdQuery, audio_session_handler, busy_ctrl, close_frame,
+        origin_matches_host,
+    };
+    use async_trait::async_trait;
+    use axum::extract::{Query, State};
+    use common::{
+        MonitorId,
+        monitor::{MonitorConfig, MonitorConfigs, MonitorSetError},
+    };
+    use http::{HeaderMap, HeaderValue, StatusCode, header};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+
+    struct StubManager {
+        config: Mutex<Option<MonitorConfig>>,
+        saved: Arc<Mutex<Vec<MonitorConfig>>>,
+    }
+
+    #[async_trait]
+    impl common::monitor::IMonitorManager for StubManager {
+        async fn monitor_restart(
+            &self,
+            _id: MonitorId,
+        ) -> Option<Result<(), common::monitor::MonitorRestartError>> {
+            unimplemented!()
+        }
+        async fn monitor_set(
+            &self,
+            config: MonitorConfig,
+        ) -> Option<Result<bool, MonitorSetError>> {
+            *self.config.lock().unwrap() = Some(config.clone());
+            self.saved.lock().unwrap().push(config);
+            Some(Ok(false))
+        }
+        async fn monitor_set_and_restart(
+            &self,
+            _c: MonitorConfig,
+        ) -> Option<Result<bool, common::monitor::MonitorSetAndRestartError>> {
+            unimplemented!()
+        }
+        async fn monitor_delete(
+            &self,
+            _id: MonitorId,
+        ) -> Option<Result<(), common::monitor::MonitorDeleteError>> {
+            unimplemented!()
+        }
+        async fn monitors_info(&self) -> Option<HashMap<MonitorId, common::monitor::MonitorInfo>> {
+            unimplemented!()
+        }
+        async fn monitor_config(&self, _id: MonitorId) -> Option<Option<MonitorConfig>> {
+            Some(self.config.lock().unwrap().clone())
+        }
+        async fn monitor_configs(&self) -> Option<MonitorConfigs> {
+            unimplemented!()
+        }
+        async fn monitor_unmark_audio(
+            &self,
+            _id: MonitorId,
+            names: Vec<String>,
+        ) -> Option<Result<(), MonitorSetError>> {
+            let mut cfg = self.config.lock().unwrap();
+            if let Some(c) = cfg.as_mut() {
+                let rem: Vec<String> = c
+                    .config()
+                    .audio
+                    .unsupported()
+                    .iter()
+                    .filter(|m| !names.contains(m))
+                    .cloned()
+                    .collect();
+                if let Some(a) = c
+                    .raw_mut()
+                    .get_mut("audio")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    a.insert("unsupported".to_owned(), serde_json::json!(rem));
+                }
+                if let Ok(f) = serde_json::from_value::<MonitorConfig>(c.raw().clone()) {
+                    *c = f;
+                }
+            }
+            Some(Ok(()))
+        }
+    }
+
+    fn monitor_config_audio(enable: bool, marks: &[&str]) -> MonitorConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": "m1", "name": "m", "enable": true,
+            "source": "rtsp",
+            "sourcertsp": {
+                "protocol": "tcp",
+                "mainStream": "rtsp://u%40x:p%40ss@cam/main",
+            },
+            "alwaysRecord": false, "videoLength": 0.0,
+            "ptz": {"enable": false, "onvifAddr": ""},
+            "audio": {"enable": enable, "unsupported": marks},
+        }))
+        .unwrap()
+    }
+
+    /// The stub session never actually opens — attach paths that
+    /// reach `open` would hang, so route tests only exercise the
+    /// pre-attach surface (token mint + statuses).
+    fn service() -> (
+        Arc<audio::AudioService>,
+        Arc<Mutex<Vec<(MonitorId, Vec<String>)>>>,
+    ) {
+        let persisted = Arc::new(Mutex::new(Vec::<(MonitorId, Vec<String>)>::new()));
+        let p = persisted.clone();
+        (
+            Arc::new(audio::AudioService::new(
+                Arc::new(|url, alt, cfg| {
+                    Arc::new(audio::RtspAudioClient::new(url, alt, cfg)) as audio::ArcAudioClient
+                }),
+                Arc::new(move |id: MonitorId, marks: Vec<String>| {
+                    let p = p.clone();
+                    Box::pin(async move {
+                        p.lock().unwrap().push((id, marks));
+                    })
+                }),
+                Arc::new(|_id: MonitorId, _names: Vec<String>| Box::pin(async move {})),
+            )),
+            persisted,
+        )
+    }
+
+    fn harness(
+        config: Option<MonitorConfig>,
+    ) -> (
+        State<Arc<AudioRouteState>>,
+        Query<MonitorIdQuery>,
+        Arc<Mutex<Vec<MonitorConfig>>>,
+    ) {
+        let saved = Arc::new(Mutex::new(Vec::new()));
+        let (service, _) = service();
+        (
+            State(Arc::new(AudioRouteState {
+                monitors: Arc::new(StubManager {
+                    config: Mutex::new(config),
+                    saved: saved.clone(),
+                }),
+                service,
+            })),
+            Query(MonitorIdQuery {
+                id: "m1".to_owned().try_into().unwrap(),
+            }),
+            saved,
+        )
+    }
+
+    #[tokio::test]
+    async fn audio_session_missing_monitor_is_404() {
+        let (state, query, _) = harness(None);
+        let resp = audio_session_handler(state, query).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn audio_session_disabled_is_409() {
+        let (state, query, _) = harness(Some(monitor_config_audio(false, &[])));
+        let resp = audio_session_handler(state, query).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn audio_session_all_marked_is_409() {
+        let (state, query, _) = harness(Some(monitor_config_audio(true, &["listen", "talk"])));
+        let resp = audio_session_handler(state, query).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn audio_session_partial_marks_mints_token() {
+        let (state, query, _) = harness(Some(monitor_config_audio(true, &["talk"])));
+        let resp = audio_session_handler(state, query).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+    }
+
+    #[tokio::test]
+    async fn audio_session_enabled_mints_single_use_token() {
+        let (state, query, _) = harness(Some(monitor_config_audio(true, &[])));
+        let resp = audio_session_handler(state.clone(), query).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let service = &state.0.service;
+        // Minted tokens resolve once.
+        let token = service
+            .mint_token("m1".to_owned().try_into().unwrap())
+            .await;
+        assert!(service.consume_token(&token).await.is_some());
+        assert!(service.consume_token(&token).await.is_none());
+    }
+
+    #[test]
+    fn origin_host_match() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("cam.local:8080"));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://cam.local:8080"),
+        );
+        assert!(origin_matches_host(&headers));
+    }
+
+    #[test]
+    fn origin_host_default_port() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("cam.local"));
+        headers.insert(header::ORIGIN, HeaderValue::from_static("http://cam.local"));
+        assert!(origin_matches_host(&headers));
+    }
+
+    #[test]
+    fn origin_mismatch_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("cam.local:8080"));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://evil.example:8080"),
+        );
+        assert!(!origin_matches_host(&headers));
+    }
+
+    #[test]
+    fn origin_port_mismatch_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("cam.local:8080"));
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://cam.local:9090"),
+        );
+        assert!(!origin_matches_host(&headers));
+    }
+
+    #[test]
+    fn origin_absent_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("cam.local:8080"));
+        assert!(!origin_matches_host(&headers));
+    }
+
+    #[test]
+    fn busy_ctrl_carries_the_denied_verb() {
+        let axum::extract::ws::Message::Text(text) = busy_ctrl() else {
+            panic!("busy must be a text ctrl");
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["type"], "busy");
+        assert_eq!(v["command"], "talk-start");
+    }
+
+    #[test]
+    fn close_frame_carries_code() {
+        let axum::extract::ws::Message::Close(Some(frame)) = close_frame(1008) else {
+            panic!("expected close frame");
+        };
+        assert_eq!(frame.code, 1008);
+    }
+
+    #[test]
+    fn audio_entry_key_covers_sub_stream() {
+        let base = monitor_config_audio(true, &[]);
+        let k1 = crate::audio_key(&base);
+        assert!(!k1.contains('|'), "{k1}");
+
+        // Same mainStream, different subStream → different key —
+        // the 429-retry URL must force an entry rebuild.
+        let with_sub: MonitorConfig = serde_json::from_value(serde_json::json!({
+            "id": "m1", "name": "m", "enable": true,
+            "source": "rtsp",
+            "sourcertsp": {
+                "protocol": "tcp",
+                "mainStream": "rtsp://u%40x:p%40ss@cam/main",
+                "subStream": "rtsp://u%40x:p%40ss@cam/sub",
+            },
+            "alwaysRecord": false, "videoLength": 0.0,
+            "ptz": {"enable": false, "onvifAddr": ""},
+            "audio": {"enable": true, "unsupported": []},
+        }))
+        .unwrap();
+        let k2 = crate::audio_key(&with_sub);
+        assert_ne!(k1, k2);
+        assert!(k2.contains("sub"), "{k2}");
+    }
+}
+// SPDX-SnippetEnd
