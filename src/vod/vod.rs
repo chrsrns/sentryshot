@@ -10,7 +10,9 @@ use common::{
 };
 use pin_project::pin_project;
 use recdb::{CrawlerError, RecDb, RecDbQuery, RecordingResponse};
-use recording::{GenerateMp4Error, ReadMetaError, Sample, generate_mp4, read_meta};
+use recording::{
+    GenerateMp4Error, ReadMetaError, Sample, TrackParameters, generate_mp4, read_meta,
+};
 use serde::Deserialize;
 use std::{
     future::Future,
@@ -82,8 +84,11 @@ pub enum CreateVodReaderError {
     #[error("open file: {0}")]
     OpenFile(std::io::Error),
 
-    #[error("mismatched params")]
-    MismatchedParams,
+    #[error("mismatched params between recordings {first} and {second}")]
+    MismatchedParams {
+        first: RecordingId,
+        second: RecordingId,
+    },
 
     #[error("read meta: {0}")]
     ReadMeta(#[from] ReadMetaError),
@@ -126,6 +131,13 @@ impl VodReader {
     pub fn size(&self) -> u64 {
         u64::try_from(self.r.size).expect("u64 fit usize")
     }
+}
+
+// Codec family of an RFC 6381 codec string: the prefix before the first
+// '.', e.g. "avc1" for "avc1.64001E". v1 metas carry only the family, so
+// a v1↔v2 recording boundary must not compare full strings.
+fn codec_family(codec: &str) -> &str {
+    codec.split('.').next().unwrap_or(codec)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -187,7 +199,7 @@ async fn execute_query(
     }
 
     let mut recs = Vec::new();
-    let mut params = None;
+    let mut params: Option<(RecordingId, TrackParameters)> = None;
 
     for rec in &recordings {
         let RecordingResponse::Finalized(rec) = rec else {
@@ -215,7 +227,7 @@ async fn execute_query(
         );
 
         let (header, samples) = read_meta(&mut meta, meta_size).await?;
-        params = Some(header.params());
+        let rec_params = header.params();
 
         let samples: Vec<_> = samples
             .into_iter()
@@ -233,6 +245,23 @@ async fn execute_query(
             .collect();
 
         if let Some(first) = samples.first() {
+            // Only recordings contributing at least one kept sample
+            // participate in the params comparison.
+            if let Some((first_id, first_params)) = &params {
+                if codec_family(&first_params.codec) != codec_family(&rec_params.codec)
+                    || first_params.width != rec_params.width
+                    || first_params.height != rec_params.height
+                    || first_params.extra_data != rec_params.extra_data
+                {
+                    return Err(MismatchedParams {
+                        first: first_id.clone(),
+                        second: rec.id.clone(),
+                    });
+                }
+            } else {
+                params = Some((rec.id.clone(), rec_params));
+            }
+
             let data_start = usize::try_from(first.data_offset).expect("usize fit u32");
             let data_size: usize = samples
                 .iter()
@@ -277,7 +306,7 @@ async fn execute_query(
             &mut meta,
             q.start.into(),
             recs.iter().flat_map(|v| &v.samples),
-            &params.expect("should be Some"),
+            &params.expect("should be Some").1,
         )
         .await?,
     )
@@ -937,6 +966,198 @@ mod tests {
         assert!(matches!(result, Err(CreateVodReaderError::MaxDuration)));
     }
 
+    fn test_header(start_time: UnixH264, codec: &str) -> MetaHeader {
+        MetaHeader {
+            version: 2,
+            start_time,
+            width: 640,
+            height: 480,
+            codec: codec.to_owned(),
+            extra_data: vec![0x33],
+        }
+    }
+
+    fn test_samples(start_time: UnixH264) -> Vec<VideoSample> {
+        vec![
+            VideoSample {
+                pts: start_time,
+                dts_offset: DtsOffset::new(0),
+                avcc: Arc::new(PaddedBytes::new(vec![0x1])),
+                random_access_present: true,
+                duration: DurationH264::new(1),
+            },
+            VideoSample {
+                pts: start_time + UnixH264::new(1),
+                avcc: Arc::new(PaddedBytes::new(vec![0x2])),
+                duration: DurationH264::new(1),
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn test_vod_mismatched_codec() {
+        let year_2000: UnixH264 = UnixNano::new(946_684_800 * SECOND).into();
+        let start_time = year_2000 + UnixNano::new(10 * MINUTE).into() + UnixH264::new(89998);
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut rec_db = new_test_recdb(temp_dir.path()).await;
+
+        save_recording_with_header(
+            &mut rec_db,
+            start_time,
+            start_time + UnixH264::new(2),
+            test_samples(start_time),
+            test_header(start_time, "avc1"),
+        )
+        .await;
+        save_recording_with_header(
+            &mut rec_db,
+            start_time + UnixH264::new(2),
+            start_time + UnixH264::new(4),
+            test_samples(start_time + UnixH264::new(2)),
+            test_header(start_time + UnixH264::new(2), "hvc1"),
+        )
+        .await;
+
+        let query = VodQuery {
+            monitor_id: "x".to_owned().try_into().unwrap(),
+            start: start_time.into(),
+            end: (start_time + UnixH264::new(16)).into(),
+            cache_id: 0,
+        };
+        let result = VodReader::new(&rec_db, &VodCache::new(), query).await;
+        assert!(matches!(
+            result,
+            Err(CreateVodReaderError::MismatchedParams { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_vod_mismatched_width() {
+        let year_2000: UnixH264 = UnixNano::new(946_684_800 * SECOND).into();
+        let start_time = year_2000 + UnixNano::new(10 * MINUTE).into() + UnixH264::new(89998);
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut rec_db = new_test_recdb(temp_dir.path()).await;
+
+        save_recording_with_header(
+            &mut rec_db,
+            start_time,
+            start_time + UnixH264::new(2),
+            test_samples(start_time),
+            test_header(start_time, "avc1"),
+        )
+        .await;
+        save_recording_with_header(
+            &mut rec_db,
+            start_time + UnixH264::new(2),
+            start_time + UnixH264::new(4),
+            test_samples(start_time + UnixH264::new(2)),
+            MetaHeader {
+                width: 320,
+                ..test_header(start_time + UnixH264::new(2), "avc1")
+            },
+        )
+        .await;
+
+        let query = VodQuery {
+            monitor_id: "x".to_owned().try_into().unwrap(),
+            start: start_time.into(),
+            end: (start_time + UnixH264::new(16)).into(),
+            cache_id: 0,
+        };
+        let result = VodReader::new(&rec_db, &VodCache::new(), query).await;
+        assert!(matches!(
+            result,
+            Err(CreateVodReaderError::MismatchedParams { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_vod_v1_v2_codec_boundary() {
+        // A v1 meta reads as codec "avc1"; a v2 rec carrying the
+        // full RFC 6381 string "avc1.64001E" is the same codec family
+        // and must not be rejected at a v1↔v2 recording boundary.
+        let year_2000: UnixH264 = UnixNano::new(946_684_800 * SECOND).into();
+        let start_time = year_2000 + UnixNano::new(10 * MINUTE).into() + UnixH264::new(89998);
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut rec_db = new_test_recdb(temp_dir.path()).await;
+
+        save_recording_with_header(
+            &mut rec_db,
+            start_time,
+            start_time + UnixH264::new(2),
+            test_samples(start_time),
+            MetaHeader {
+                version: 1,
+                ..test_header(start_time, "avc1")
+            },
+        )
+        .await;
+        save_recording_with_header(
+            &mut rec_db,
+            start_time + UnixH264::new(2),
+            start_time + UnixH264::new(4),
+            test_samples(start_time + UnixH264::new(2)),
+            test_header(start_time + UnixH264::new(2), "avc1.64001E"),
+        )
+        .await;
+
+        let query = VodQuery {
+            monitor_id: "x".to_owned().try_into().unwrap(),
+            start: start_time.into(),
+            end: (start_time + UnixH264::new(16)).into(),
+            cache_id: 0,
+        };
+        VodReader::new(&rec_db, &VodCache::new(), query)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_vod_skipped_rec_params_ignored() {
+        // A recording inside the query window whose samples are all
+        // clipped out does not contribute and must not be compared.
+        let year_2000: UnixH264 = UnixNano::new(946_684_800 * SECOND).into();
+        let start_time = year_2000 + UnixNano::new(10 * MINUTE).into() + UnixH264::new(89998);
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut rec_db = new_test_recdb(temp_dir.path()).await;
+
+        save_recording_with_header(
+            &mut rec_db,
+            start_time,
+            start_time + UnixH264::new(2),
+            test_samples(start_time),
+            test_header(start_time, "avc1"),
+        )
+        .await;
+        // h265 rec inside the forward crawl window (end + 1s) but after
+        // the query end; all its samples are clipped out.
+        save_recording_with_header(
+            &mut rec_db,
+            start_time + UnixH264::new(200),
+            start_time + UnixH264::new(202),
+            test_samples(start_time + UnixH264::new(200)),
+            test_header(start_time + UnixH264::new(200), "hvc1"),
+        )
+        .await;
+
+        let query = VodQuery {
+            monitor_id: "x".to_owned().try_into().unwrap(),
+            start: start_time.into(),
+            end: (start_time + UnixH264::new(16)).into(),
+            cache_id: 0,
+        };
+        VodReader::new(&rec_db, &VodCache::new(), query)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     async fn new_test_recdb(path: &Path) -> RecDb {
         RecDb::new(DummyLogger::new(), path.to_path_buf(), DummyStorage::new()).await
     }
@@ -1558,6 +1779,30 @@ mod tests {
         end_time: UnixH264,
         samples: Vec<VideoSample>,
     ) {
+        save_recording_with_header(
+            rec_db,
+            start_time,
+            end_time,
+            samples,
+            MetaHeader {
+                version: 2,
+                start_time,
+                width: 640,
+                height: 480,
+                codec: "avc1".to_owned(),
+                extra_data: vec![0x33],
+            },
+        )
+        .await;
+    }
+
+    async fn save_recording_with_header(
+        rec_db: &mut RecDb,
+        start_time: UnixH264,
+        end_time: UnixH264,
+        samples: Vec<VideoSample>,
+        header: MetaHeader,
+    ) {
         let rec = rec_db
             .new_recording("x".to_owned().try_into().unwrap(), start_time)
             .await
@@ -1565,14 +1810,6 @@ mod tests {
 
         let mut meta = rec.new_file("meta").await.unwrap();
         let mut mdat = rec.new_file("mdat").await.unwrap();
-        let header = MetaHeader {
-            version: 2,
-            start_time,
-            width: 640,
-            height: 480,
-            codec: "avc1".to_owned(),
-            extra_data: vec![0x33],
-        };
 
         let mut w = VideoWriter::new(&mut *meta, &mut *mdat, header)
             .await
