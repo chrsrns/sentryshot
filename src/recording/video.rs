@@ -5,7 +5,7 @@ use common::{
     time::{DtsOffset, DurationH264, UnixH264},
 };
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 // Sample flags.
 const FLAG_RANDOM_ACCESS_PRESENT: u8 = 0b1000_0000;
@@ -98,9 +98,6 @@ pub enum WriteSampleError {
 
     #[error("flush: {0}")]
     Flush(std::io::Error),
-
-    #[error("sub")]
-    Sub,
 }
 
 impl<'a, W: AsyncWrite + Unpin> VideoWriter<'a, W> {
@@ -155,23 +152,6 @@ impl<'a, W: AsyncWrite + Unpin> VideoWriter<'a, W> {
 }
 
 // Reads a single meta file.
-#[allow(dead_code)]
-pub struct MetaReader<T: AsyncRead + AsyncSeek + Unpin> {
-    file: T,
-
-    header_size: u64,
-    sample_count: usize,
-}
-
-#[derive(Debug, Error)]
-pub enum CreateMetaReaderError {
-    #[error("unmarshal header {0}")]
-    UnmarshalHeader(#[from] HeaderFromReaderError),
-
-    #[error("{0}")]
-    TryFromInt(#[from] std::num::TryFromIntError),
-}
-
 #[derive(Debug, Error)]
 pub enum ReadMetaError {
     #[error("unmarshal header {0}")]
@@ -185,27 +165,6 @@ pub enum ReadMetaError {
 
     #[error("read: {0}")]
     Read(std::io::Error),
-}
-
-impl<T: AsyncRead + AsyncSeek + Unpin> MetaReader<T> {
-    pub async fn new(
-        mut file: T,
-        file_size: u64,
-    ) -> Result<(Self, MetaHeader), CreateMetaReaderError> {
-        let header = MetaHeader::from_reader(&mut file).await?;
-        let header_size = u64::try_from(header.size())?;
-
-        Ok((
-            Self {
-                file,
-                header_size,
-                sample_count: usize::try_from(
-                    (file_size - header_size) / u64::from(SAMPLE_SIZE_U8),
-                )?,
-            },
-            header,
-        ))
-    }
 }
 
 // Reads header and all samples.

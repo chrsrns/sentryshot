@@ -8,7 +8,7 @@ mod video_reader;
 pub use cache::VideoCache;
 pub use mp4_muxer::{GenerateMp4Error, Mp4Muxer, generate_mp4};
 pub use video::{
-    CreateVideoWriterError, MetaHeader, MetaReader, ReadMetaError, Sample, TrackParameters,
+    CreateVideoWriterError, MetaHeader, ReadMetaError, Sample, TrackParameters,
     VideoWriter, WriteSampleError, read_meta,
 };
 pub use video_reader::{CreateVideoReaderError, new_video_reader};
