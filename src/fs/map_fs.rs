@@ -13,7 +13,6 @@ pub struct MapFs(pub HashMap<PathBuf, MapEntry>);
 pub struct MapEntry {
     pub data: Vec<u8>,
     pub is_file: bool,
-    pub is_symlink: bool,
 }
 
 impl Fs for MapFs {
