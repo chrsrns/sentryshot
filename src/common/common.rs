@@ -684,6 +684,9 @@ impl StreamType {
     }
 }
 
+/// A video sample with a duration. `H264Data` is the same struct without
+/// `duration` — keep the two in sync; they are separate because the
+/// recording/vod/HLS paths need durations while monitor ingestion does not.
 #[derive(Clone, Debug, Default)]
 pub struct VideoSample {
     pub pts: UnixH264, // Absolute presentation timestamp, reported by the camera.
@@ -748,6 +751,10 @@ pub struct TrackParameters {
     pub extra_data: Vec<u8>,
 }
 
+/// A video sample without a duration. `VideoSample` is the same struct
+/// with `duration` — keep the two in sync; they are separate because
+/// ingestion produces duration-less frames while recording/vod/HLS
+/// consumers need durations.
 #[derive(Clone, Debug, Default)]
 pub struct H264Data {
     pub pts: UnixH264, // Absolute presentation timestamp, reported by the camera.
