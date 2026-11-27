@@ -11,7 +11,7 @@
 
 Enable the `mqtt` plugin and configure the external broker address in `sentryshot.toml`
 
-### sentryshot/events/tflite
+### sentryshot/events/object
 
 ``` json
 {
@@ -20,7 +20,7 @@ Enable the `mqtt` plugin and configure the external broker address in `sentrysho
   "label": "person",
   "score": 63.671875,
   "time": "2024-11-20T14:23:15.437494909Z",
-  "source": "tflite"
+  "source": "object"
 }
 ```
 
@@ -44,7 +44,7 @@ Enable the `mqtt` plugin and configure the external broker address in `sentrysho
 
 There is a `/api` page where you can try the endpoints.
 
-All requests require basic auth, POST, PUT and DELETE requests need to have a matching CSRF-token in the `X-CSRF-TOKEN` header.
+All requests require basic auth. Endpoints marked `Auth: admin + CSRF` additionally require a matching CSRF-token in the `X-CSRF-TOKEN` header on every method, including GET.
 
 ##### curl examples:
 
