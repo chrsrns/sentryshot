@@ -224,30 +224,18 @@ impl FsTester {
         let fentry = format_entry(entry);
         let fientry = format_info_entry2(&info);
 
-        // Note: mismatch here is OK for symlink, because Open dereferences symlink.
-        if fentry != fientry && !entry.is_symlink() {
+        if fentry != fientry {
             self.errorf(&format!(
                 "{path:?}: mismatch:\n\tentry = {fentry}\n\tfile.stat() = {fientry}"
             ));
         }
 
         let finfo = format_info2(&info);
-        if entry.is_symlink() {
-            // For symlink, just check that entry.Info matches entry on common fields.
-            // Open deferences symlink, so info itself may differ.
-            let feentry = format_entry(entry);
-            if fentry != feentry {
-                self.errorf(&format!(
-                    "{path:?}: mismatch\n\tentry = {fentry}\n\tentry.info() = {feentry}\n",
-                ));
-            }
-        } else {
-            let feinfo = format_info(entry);
-            if feinfo != finfo {
-                self.errorf(&format!(
-                    "{path:?}: mismatch\n\tentry = {feinfo}\n\tentry.stat() = {finfo}\n",
-                ));
-            }
+        let feinfo = format_info(entry);
+        if feinfo != finfo {
+            self.errorf(&format!(
+                "{path:?}: mismatch\n\tentry = {feinfo}\n\tentry.stat() = {finfo}\n",
+            ));
         }
 
         // Stat should be the same as Open+Stat, even for symlinks.
@@ -420,10 +408,9 @@ fn format_info_entry2(info: &Open) -> String {
 // formatInfo formats an fs.FileInfo into a string for error messages and comparison.
 fn format_info(info: &Entry) -> String {
     format!(
-        "{:?} is_dir={} is_symlink={} Size=x ModTime=x",
+        "{:?} is_dir={} Size=x ModTime=x",
         info.name(),
         info.is_dir(),
-        info.is_symlink(),
         //info.Size(),
         //info.ModTime(),
     )
@@ -432,10 +419,9 @@ fn format_info(info: &Entry) -> String {
 // formatInfo formats an fs.FileInfo into a string for error messages and comparison.
 fn format_info2(info: &Open) -> String {
     format!(
-        "{:?} is_dir={} is_symlink={} Size=x ModTime=x",
+        "{:?} is_dir={} Size=x ModTime=x",
         info.name(),
         info.is_dir(),
-        info.is_symlink(),
         //info.Size(),
         //info.ModTime(),
     )

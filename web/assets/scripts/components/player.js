@@ -2,10 +2,8 @@
 
 // @ts-check
 
-import { fromUTC } from "../libs/time.js";
+import { fromUTC, NS_MILLISECOND } from "../libs/time.js";
 import { uniqueID, fetchDelete, denormalize, htmlToElem } from "../libs/common.js";
-
-const millisecond = 1000000;
 
 /**
  * @typedef {Object} RecordingData
@@ -71,9 +69,9 @@ function newPlayer(data, isAdmin, token, onVideoLoad) {
 	const iconMaximizePath = "assets/icons/feather/maximize.svg";
 	const iconMinimizePath = "assets/icons/feather/minimize.svg";
 
-	const detectionRenderer = newDetectionRenderer(d.start / millisecond, d.events);
+	const detectionRenderer = newDetectionRenderer(d.start / NS_MILLISECOND, d.events);
 
-	const start = fromUTC(new Date(d.start / millisecond), d.timeZone);
+	const start = fromUTC(new Date(d.start / NS_MILLISECOND), d.timeZone);
 
 	/**
 	 * @param {Date} d
@@ -164,7 +162,6 @@ function newPlayer(data, isAdmin, token, onVideoLoad) {
 				type="checkbox"
 				class="js-checkbox player-overlay-checkbox absolute"
 				style="opacity: 0;"
-				type="checkbox"
 			/>
 		`);
 		/** @type {HTMLImageElement} */
@@ -478,8 +475,8 @@ function renderEvents(data) {
 	if (!data.start || !data.end || !data.events) {
 		return [];
 	}
-	const startMs = data.start / millisecond;
-	const endMs = data.end / millisecond;
+	const startMs = data.start / NS_MILLISECOND;
+	const endMs = data.end / NS_MILLISECOND;
 	const offset = endMs - startMs;
 
 	const resolution = 1000;
@@ -490,8 +487,8 @@ function renderEvents(data) {
 	 */
 	const timeline = Array.from({ length: resolution }).fill(false);
 	for (const e of data.events) {
-		const eventTimeMs = e.time / millisecond;
-		const eventDurationMs = e.duration / millisecond;
+		const eventTimeMs = e.time / NS_MILLISECOND;
+		const eventDurationMs = e.duration / NS_MILLISECOND;
 
 		const startTime = eventTimeMs - startMs;
 		const endTime = eventTimeMs + eventDurationMs - startMs;
@@ -602,8 +599,8 @@ function newDetectionRenderer(startTimeMs, events) {
 			let html = "";
 			if (events) {
 				for (const e of events) {
-					const eventStartMs = e.time / millisecond;
-					const eventDurationMs = e.duration / millisecond;
+					const eventStartMs = e.time / NS_MILLISECOND;
+					const eventDurationMs = e.duration / NS_MILLISECOND;
 					const eventEndMs = eventStartMs + eventDurationMs;
 
 					if (eventStartMs <= newDurationMs && newDurationMs < eventEndMs) {

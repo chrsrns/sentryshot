@@ -196,6 +196,13 @@ pub struct ValidateLoginResponse {
     pub stored_token: String,
 }
 
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).fold(0_u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 #[async_trait]
 impl Authenticator for BasicAuth {
     async fn validate_request(&self, headers: &HeaderMap<HeaderValue>) -> ValidateResponse {
@@ -208,7 +215,7 @@ impl Authenticator for BasicAuth {
             let Ok(csrf_string) = csrf_header.to_str() else {
                 return false;
             };
-            csrf_string == valid_login.stored_token
+            constant_time_eq(csrf_string.as_bytes(), valid_login.stored_token.as_bytes())
         };
 
         Some(AuthenticatedUser {
@@ -396,24 +403,6 @@ async fn logout(State(auth): State<ArcAuth>, headers: HeaderMap) -> impl IntoRes
     }
 }
 
-/*
-// MyToken return CSRF token for requesting user.
-func (a *Authenticator) MyToken() http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        w.WriteHeader(http.StatusOK)
-        auth := a.ValidateRequest(r)
-        token := auth.User.Token
-        if token == "" {
-            http.Error(w, "token does not exist", http.StatusInternalServerError)
-            return
-        }
-        if _, err := w.Write([]byte(token)); err != nil {
-            http.Error(w, "could not write", http.StatusInternalServerError)
-            return
-        }
-    })
-}
-*/
 
 // LogFailedLogin finds and logs the ip.
 pub fn log_failed_login(logger: &ArcLogger, username: &Username) {

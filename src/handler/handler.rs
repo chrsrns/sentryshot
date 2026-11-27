@@ -206,6 +206,8 @@ fn parse_path(path: String) -> Result<(String, String), ParsePathError> {
     if path.ends_with(".m3u8")
         || path.ends_with(".ts")
         || path.ends_with(".mp4")
+        // Safari can truncate ".mp4" requests to ".mp"; the HLS muxer
+        // maps them back (see the "Apple bug" arm in hls::Muxer::file).
         || path.ends_with(".mp")
     {
         let p = PathBuf::from(path);
@@ -375,7 +377,7 @@ pub async fn log_slow_poll_handler(
 ) -> Response {
     match poller.slow_poll(query.0).await {
         slow_poller::Response::Ok(v) => Json::from(v).into_response(),
-        slow_poller::Response::TooManyConncetions => StatusCode::TOO_MANY_REQUESTS.into_response(),
+        slow_poller::Response::TooManyConnections => StatusCode::TOO_MANY_REQUESTS.into_response(),
         slow_poller::Response::Cancelled => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -565,7 +567,6 @@ pub async fn streamer_play_handler(
             }
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         },
-        NotImplemented(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
         FramesExpired => StatusCode::GONE.into_response(),
         SessionNotExist => (
             StatusCode::PRECONDITION_REQUIRED,
@@ -577,7 +578,7 @@ pub async fn streamer_play_handler(
             "session cannot be polled concurrently",
         )
             .into_response(),
-        NotReady | MuxerNotExist | StreamerCancelled | MuxerCancelled => {
+        MuxerNotExist | StreamerCancelled | MuxerCancelled => {
             StatusCode::NOT_FOUND.into_response()
         }
     }

@@ -238,42 +238,6 @@ enum ReadState {
     State7,
 }
 
-// Sync version.
-/*impl<RS1: Read + Seek, RS2: Read + Seek> Read for VideoReader<RS1, RS2> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // STATE 1.
-
-        // EOF.
-        if self.pos >= self.meta_size + self.mdat_size {
-            return Ok(0);
-        }
-
-        // Read starts within meta.
-        if self.pos <= self.meta_size {
-            self.meta.seek(SeekFrom::Start(self.pos))?; // STATE 2.
-
-            // Read within meta.
-            if u64::try_from(buf.len()).unwrap() <= self.meta_size - self.pos {
-                let n = self.meta.read(buf)?; // STATE 3.
-                self.pos += u64::try_from(n).unwrap();
-                return Ok(n);
-            }
-
-            // Read across border.
-            let n = self.meta.read(buf)?; // STATE 4.
-            let n2 = self.mdat.read(&mut buf[n..])?; // STATE 5.
-            self.pos += u64::try_from(n + n2).unwrap();
-            return Ok(n + n2);
-        }
-
-        // Read within mdat.
-        self.mdat.seek(SeekFrom::Start(self.pos - self.meta_size))?; // STATE 6.
-        let n = self.mdat.read(buf)?; // STATE 7.
-        self.pos += u64::try_from(n).unwrap();
-
-        Ok(n)
-    }
-}*/
 
 impl<RS1, RS2> AsyncSeek for VideoReader<RS1, RS2>
 where
@@ -406,13 +370,6 @@ impl AsyncRead for MetaCursor {
         _: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        /*let len = self.pos.min(self.inner.buf.len() as u64);
-        let remaining_slice = &self.inner.buf[(len as usize)..];
-
-        buf.put_slice(remaining_slice);
-        self.pos += remaining_slice.len() as u64;
-
-        Poll::Ready(Ok(()))*/
 
         let pos = self.pos;
         let slice: &[u8] = &self.inner.buf;
@@ -433,17 +390,6 @@ impl AsyncRead for MetaCursor {
     }
 }
 
-/*
-impl Read for MetaCursor {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let len = self.pos.min(self.inner.buf.len() as u64);
-        let mut remaining_slice = &self.inner.buf[(len as usize)..];
-
-        let n = Read::read(&mut remaining_slice, buf)?;
-        self.pos += n as u64;
-        Ok(n)
-    }
-}*/
 
 impl AsyncSeek for MetaCursor {
     fn start_seek(mut self: Pin<&mut Self>, pos: SeekFrom) -> io::Result<()> {

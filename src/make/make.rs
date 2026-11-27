@@ -127,6 +127,11 @@ fn main() {
     }
 }
 
+// Plugin list — keep in sync with workspace members, the
+// [profile.release.package.*] strip blocks in the root Cargo.toml, and
+// [[plugin]] entries in src/env/default_config.tpl.
+// default_config.tpl intentionally omits object_detection_tflite: it is a
+// backend dylib loaded by object_detection, not a loadable plugin.
 const PLUGINS: [&str; 7] = [
     "auth_basic",
     "auth_none",

@@ -248,7 +248,6 @@ mod tests {
     #[test]
     fn test_config() {
         let temp_dir = TempDir::new().unwrap();
-        std::env::set_current_dir(temp_dir.path()).unwrap();
         std::fs::create_dir(temp_dir.path().join("plugins")).unwrap();
         let config_file = temp_dir.path().join("configs").join("env.toml");
 

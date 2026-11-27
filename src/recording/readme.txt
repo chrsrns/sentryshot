@@ -16,7 +16,7 @@
 //
 // <recordingID>.meta: File that contains all metadata required to generate moof.
 //   version: u8,
-//   startTimeNS: i64,
+//   startTime: i64,  // UnixH264 — 90 kHz clock ticks since the unix epoch.
 //   width: u16,
 //   height: u16,
 //   extradata_size: u16,
@@ -26,7 +26,7 @@
 //
 // sampleV0 { // 25 bytes.
 //   flags: u8 { random_access_present },
-//   pts: i64,        // Absolute Unix nanosecond timestamp.
+//   pts: i64,        // UnixH264 — 90 kHz clock ticks since the unix epoch.
 //   dts_offset: i32, // pts - dts
 //   duration: u32,
 //

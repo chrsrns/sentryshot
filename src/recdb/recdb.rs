@@ -360,6 +360,9 @@ impl RecDb {
         .expect("join")
     }
 
+    // Test helper used by monitor tests — `#[cfg(test)]` can't reach
+    // cross-crate callers, so it stays pub but hidden from docs.
+    #[doc(hidden)]
     pub async fn test_recording(&self) -> RecordingHandle {
         #[allow(clippy::unwrap_used)]
         self.new_recording("test".to_owned().try_into().unwrap(), UnixH264::new(1))

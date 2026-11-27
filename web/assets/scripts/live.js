@@ -126,7 +126,9 @@ function newViewer($parent, monitors, streamer, ptz) {
 		enableDebugging() {
 			console.log("enabling debugging");
 			for (const feed of feeds) {
-				feed.enableDebugging();
+				if (feed.enableDebugging !== undefined) {
+					feed.enableDebugging();
+				}
 			}
 		},
 	};

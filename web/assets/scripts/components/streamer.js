@@ -122,51 +122,10 @@ function newSlowPollStream(monitor, preferLowRes, buttons = []) {
 }
 
 const newStreamerBtn = {
-	//mute: newMuteBtn,
 	fullscreen: newFullscreenBtn,
 	recordings: newRecordingsBtn,
 };
 
-//const iconMutedPath = "assets/icons/feather/volume-x.svg";
-//const iconUnmutedPath = "assets/icons/feather/volume.svg";
-
-/**
- * @param {Monitor} monitor
- * @return {Button}
- */
-/*
-function newMuteBtn(monitor) {
-	const audioEnabled = monitor["audioEnabled"] === "true";
-
-	let html = "";
-	if (audioEnabled) {
-		html = `
-			<button class="js-mute-btn feed-btn">
-				<img class="feed-btn-img icon" src="${iconUnmutedPath}"/>
-			</button>`;
-	}
-
-	return {
-		html,
-		init($parent, $video) {
-			if (audioEnabled) {
-				const $muteBtn = $parent.querySelector(".js-mute-btn");
-				const $img = $muteBtn.querySelector("img");
-
-				$muteBtn.addEventListener("click", () => {
-					if ($video.muted) {
-						$video.muted = false;
-						$img.src = iconMutedPath;
-					} else {
-						$video.muted = true;
-						$img.src = iconUnmutedPath;
-					}
-				});
-				$video.muted = true;
-			}
-		},
-	};
-}*/
 
 const iconMaximizePath = "assets/icons/feather/maximize.svg";
 const iconMinimizePath = "assets/icons/feather/minimize.svg";

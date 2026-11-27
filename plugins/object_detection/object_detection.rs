@@ -867,7 +867,7 @@ async fn enable_handler(
         Some(Ok(_)) => {
             s.logger.log(LogEntry::new(
                 LogLevel::Info,
-                "tflite",
+                "object",
                 &monitor_id,
                 "detector enabled",
             ));
@@ -897,7 +897,7 @@ async fn disable_handler(
         Some(Ok(_)) => {
             s.logger.log(LogEntry::new(
                 LogLevel::Info,
-                "tflite",
+                "object",
                 &monitor_id,
                 "detector disabled",
             ));

@@ -985,10 +985,12 @@ function newAccount(token, fields) {
 
 /** @param {number} length */
 function randomString(length) {
-	const charSet = "234565789abcdefghjkmnpqrstuvwxyz";
+	const charSet = "23456789abcdefghjkmnpqrstuvwxyz";
+	const values = new Uint32Array(length);
+	crypto.getRandomValues(values);
 	let output = "";
-	for (let i = 0; i < length; i++) {
-		output += charSet.charAt(Math.floor(Math.random() * charSet.length));
+	for (const v of values) {
+		output += charSet.charAt(v % charSet.length);
 	}
 	return output;
 }

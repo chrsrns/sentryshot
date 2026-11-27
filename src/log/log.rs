@@ -161,10 +161,10 @@ impl fmt::Display for LogEntryWithTime {
             write!(f, "{monitor_id}: ")?;
         };
 
-        let mut src_titel = self.source.to_string();
-        make_ascii_titlecase(&mut src_titel);
+        let mut src_title = self.source.to_string();
+        make_ascii_titlecase(&mut src_title);
 
-        write!(f, "{}: {}", src_titel, self.message)?;
+        write!(f, "{}: {}", src_title, self.message)?;
 
         Ok(())
     }

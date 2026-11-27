@@ -15,19 +15,16 @@ doctest = false
 
 [dependencies]
 common.path = "../common"
-hls.path = "../hls"
 mp4.path = "../mp4"
 
 async-trait.workspace = true
-axum.workspace = true
-sentryshot_padded_bytes.workspace = true
-serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 pin-project.workspace = true
 
 
 [dev-dependencies]
+sentryshot_padded_bytes.workspace = true
 pretty_assertions.workspace = true
 pretty-hex.workspace = true
 tempfile.workspace = true

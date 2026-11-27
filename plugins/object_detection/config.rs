@@ -14,7 +14,6 @@ use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ObjectDetectionConfig {
-    //timestampOffset: time.Duration,
     pub thresholds: Thresholds,
     pub crop: Crop,
     pub mask: Mask,
@@ -78,10 +77,8 @@ impl ObjectDetectionConfig {
             logger.log(LogLevel::Warning, "no thresholds are set");
         }
 
-        //timestampOffset, err := ffmpeg.ParseTimestampOffset(c.Get("timestampOffset"))
 
         Ok(Some(ObjectDetectionConfig {
-            //timestampOffset: timestampOffset,
             thresholds: c.thresholds,
             crop: c.crop,
             mask: c.mask,

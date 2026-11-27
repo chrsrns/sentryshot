@@ -44,11 +44,6 @@ export function motion2(hasSubStream, getMonitorId) {
 	const fields = {
 		enable: fieldTemplate.toggle("Enable motion detection", false),
 		feedRate: fieldTemplate.integer("Feed rate (fps)", "", 2),
-		/*frameScale: fieldTemplate.select(
-			"Frame scale",
-			["full", "half", "third", "quarter", "sixth", "eighth"],
-			"full"
-		),*/
 		duration: fieldTemplate.integer(
 			"Trigger duration (sec)",
 			"",

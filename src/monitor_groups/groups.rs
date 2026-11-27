@@ -30,18 +30,12 @@ pub enum CreateMonitorGroupsError {
 
     #[error("deserialize: {0}")]
     Deserialize(#[from] serde_json::Error),
-
-    #[error("create file: {0}")]
-    CreateFile(std::io::Error),
 }
 
 #[derive(Debug, Error)]
 pub enum SetMonitorGroupsError {
     #[error("write file: {0}")]
     WriteFile(std::io::Error),
-
-    #[error("rename file: {0}")]
-    RenameFile(std::io::Error),
 }
 
 impl MonitorGroups {

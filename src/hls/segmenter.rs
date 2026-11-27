@@ -185,15 +185,11 @@ impl Segmenter {
 
         // switch segment
         if data.random_access_present {
-            //videoParams := extractVideoParams(m.videoTrack)
-            //paramsChanged := !videoParamsEqual(m.lastVideoParams, videoParams)
-
             if DurationH264::from(
                 next_dts
                     .checked_sub(segment_start_dts)
                     .ok_or(SwitchSegment)?,
             ) >= self.segment_duration
-            /*|| paramsChanged*/
             {
                 let next_segment = Segment::new(
                     self.segment_id_counter.next_id(),
@@ -214,13 +210,6 @@ impl Segmenter {
 
                 self.first_segment_finalized = true;
 
-                /*if paramsChanged {
-                    m.lastVideoParams = videoParams
-                    m.firstSegmentFinalized = false
-
-                    // reset adjusted part duration
-                    m.sampleDurations = make(map[time.Duration]struct{})
-                }*/
             }
         }
 
@@ -228,27 +217,7 @@ impl Segmenter {
     }
 }
 
-/*
-fn extractVideoParams(track: *gortsplib.TrackH264) ->  Vec<Vec<u8>> {
-    params := make([][]byte, 2);
-    params[0] = track.SafeSPS();
-    params[1] = track.SafePPS();
-    return params
-}
 
-fn videoParamsEqual(p1: Vec<Vec<u8>>, p2: Vec<Vec<u8>>)-> bool {
-    if len(p1) != len(p2) {
-        return true
-    }
-
-    for i, p := range p1 {
-        if !bytes.Equal(p2[i], p) {
-            return false
-        }
-    }
-    return true
-}
-*/
 
 fn part_duration_is_compatible(
     part_duration: DurationH264,

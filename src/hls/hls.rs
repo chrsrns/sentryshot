@@ -23,7 +23,7 @@ use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use types::MuxerIdCounter;
-pub use types::{VIDEO_TRACK_ID, track_params_from_video_params};
+pub use types::track_params_from_video_params;
 
 #[derive(Clone)]
 pub struct HlsServer {

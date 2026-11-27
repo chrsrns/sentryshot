@@ -744,7 +744,7 @@ function newSelectCustomField(inputRules, options, label, initial, doc) {
 	const set = (input) => {
 		if (input === undefined) {
 			field.$input.value = initial;
-			field.$error.innerHTML = "";
+			field.$error.textContent = "";
 			return;
 		}
 
@@ -756,7 +756,10 @@ function newSelectCustomField(inputRules, options, label, initial, doc) {
 		}
 
 		if (customValue) {
-			field.$input.innerHTML += `<option>${input}</option>`;
+			const option = document.createElement("option");
+			option.value = input;
+			option.textContent = input;
+			field.$input.append(option);
 		}
 		field.$input.value = input;
 	};
@@ -815,7 +818,7 @@ function newPasswordField() {
 	const passwordStrength = (string) => {
 		const strongRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!#$%&*@^])(?=.{8,})/;
 		const mediumRegex =
-			/^(?=.*[a-z])(?=.*[A-Z])|(?=.*[a-z])(?=.*\d)|(?=.*[A-Z](?=.*\d))(?=.{6,})/;
+			/^(?=.{6,})(?:(?=.*[a-z])(?=.*[A-Z])|(?=.*[a-z])(?=.*\d)|(?=.*[A-Z])(?=.*\d))/;
 
 		if (strongRegex.test(string) || string === "") {
 			return "";

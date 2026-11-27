@@ -14,7 +14,6 @@ fn test_map_fs() {
             MapEntry {
                 data: b"hello, world\n".to_vec(),
                 is_file: true,
-                is_symlink: false,
             },
         ),
         (
@@ -22,7 +21,6 @@ fn test_map_fs() {
             MapEntry {
                 data: b"If a program is too slow, it must have a loop.\n".to_vec(),
                 is_file: true,
-                is_symlink: false,
             },
         ),
     ]));

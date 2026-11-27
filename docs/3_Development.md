@@ -67,6 +67,23 @@ Each plugin is a `cdylib` shared library. Enabled plugins are loaded at runtime 
 
 https://github.com/luojia65/plugin-system-example
 
+### Plugin ABI
+
+The loader looks up plugins by file name in `plugin_dir`: `libsentryshot_<name>.so`, falling back to `lib<name>.so` (the short name is used during development).
+
+Exported symbols:
+
+| symbol | required | signature |
+|--------|----------|-----------|
+| `version` | yes | `extern "C" fn() -> *const c_char` — must return the core version string exactly or loading fails |
+| `load` | yes | `extern "Rust" fn(&dyn Application) -> Arc<dyn Plugin>` — called once at startup |
+| `pre_load` | no | `extern "Rust" fn() -> Box<dyn PreLoadPlugin>` — runs before `load` with no `Application` handle; registers the auth constructor (`set_new_auth`, only one auth plugin may be enabled) and extra log sources (`add_log_source`) |
+
+Notes:
+
+- The plugins use `extern "Rust"` trait objects, so there is no stable ABI — a plugin must be compiled with the same Rust toolchain and workspace dependencies as the core binary.
+- Shared libraries are deliberately leaked (`Box::leak`) and stay mapped until the process exits.
+
 ### Tokio limitations
 
 Tokio stores internal state in a global variable that isn't shared across shared libraries. Calling Tokio functions from a plugin must be done using a injected runtime handle, `self.rt_handle.spawn()` or by adding `let _enter = self.rt_handle.enter()` just before the function.

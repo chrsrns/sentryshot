@@ -506,9 +506,9 @@ pub enum ParseAccountIdError {
 }
 
 const ACCOUNT_ID_LENGTH: usize = 16;
-const ACCOUNT_ID_CHARSET: [char; 32] = [
-    '2', '3', '4', '5', '6', '5', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'j', 'k',
-    'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+const ACCOUNT_ID_CHARSET: [char; 31] = [
+    '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'j', 'k', 'm',
+    'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
 impl TryFrom<String> for AccountId {
@@ -684,6 +684,9 @@ impl StreamType {
     }
 }
 
+/// A video sample with a duration. `H264Data` is the same struct without
+/// `duration` — keep the two in sync; they are separate because the
+/// recording/vod/HLS paths need durations while monitor ingestion does not.
 #[derive(Clone, Debug, Default)]
 pub struct VideoSample {
     pub pts: UnixH264, // Absolute presentation timestamp, reported by the camera.
@@ -748,6 +751,10 @@ pub struct TrackParameters {
     pub extra_data: Vec<u8>,
 }
 
+/// A video sample without a duration. `VideoSample` is the same struct
+/// with `duration` — keep the two in sync; they are separate because
+/// ingestion produces duration-less frames while recording/vod/HLS
+/// consumers need durations.
 #[derive(Clone, Debug, Default)]
 pub struct H264Data {
     pub pts: UnixH264, // Absolute presentation timestamp, reported by the camera.
@@ -793,16 +800,6 @@ pub fn write_file(path: &Path, buf: &[u8]) -> std::io::Result<()> {
         .open(path)?;
     file.write_all(buf)?;
     file.sync_all()
-}
-
-pub async fn write_file2<T>(rt_handle: Handle, path: PathBuf, buf: T) -> std::io::Result<()>
-where
-    T: AsRef<[u8]> + Send + Sync + 'static,
-{
-    rt_handle
-        .spawn_blocking(move || write_file(&path, buf.as_ref()))
-        .await
-        .expect("join")
 }
 
 // It may be important that the temp path is on the same drive partition.
@@ -959,6 +956,14 @@ mod tests {
     fn test_parse_account_id() {
         AccountId::try_from("a222222222222222".to_owned()).unwrap();
         AccountId::try_from("a222222222222221".to_owned()).unwrap_err();
+    }
+
+    #[test]
+    fn test_account_id_charset_unique() {
+        let mut sorted = ACCOUNT_ID_CHARSET.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ACCOUNT_ID_CHARSET.len());
     }
 
     #[test]

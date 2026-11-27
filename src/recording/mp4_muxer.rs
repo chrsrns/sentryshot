@@ -3,7 +3,7 @@
 use crate::video::{Sample, TrackParameters};
 use async_trait::async_trait;
 use common::time::{DurationH264, H264_TIMESCALE, UnixH264};
-use hls::VIDEO_TRACK_ID;
+use mp4::VIDEO_TRACK_ID;
 use mp4::{FullBox, ImmutableBox, ImmutableBoxAsync, Mp4Error};
 use std::{num::TryFromIntError, sync::Arc};
 use thiserror::Error;
@@ -351,7 +351,7 @@ impl Mp4Muxer {
                     mp4::BoxesAsync::new(mp4::Url {
                         full_box: mp4::FullBox {
                             version: 0,
-                            flags: [0, 0, 1],
+                            flags: mp4::u32_to_flags(mp4::URL_NOPT),
                         },
                         location: String::new(),
                     }),

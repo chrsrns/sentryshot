@@ -559,7 +559,7 @@ function newMultiSelect(label, values, initial) {
 			field.set(false);
 		}
 		for (const val of initial) {
-			fields[val].set(false);
+			fields[val].set(true);
 		}
 	};
 	reset();
@@ -592,7 +592,9 @@ function newMultiSelect(label, values, initial) {
 				reset();
 				return;
 			}
-			console.error("set not implemented");
+			for (const key of Object.keys(fields)) {
+				fields[key].set(input.includes(key));
+			}
 		},
 	};
 }
@@ -617,9 +619,11 @@ function newMultiSelect(label, values, initial) {
 function newMonitorPicker(monitors, newModalSelect2 = newModalSelect) {
 	const monitorNames = [];
 	const monitorNameToID = {};
+	const monitorIDToName = {};
 	for (const { id, name } of sortByName(monitors)) {
 		monitorNames.push(name);
 		monitorNameToID[name] = id;
+		monitorIDToName[id] = name;
 	}
 
 	let options = "<option></option>";
@@ -698,7 +702,7 @@ function newMonitorPicker(monitors, newModalSelect2 = newModalSelect) {
 				reset();
 				return;
 			}
-			console.log("set not implemented");
+			$input.value = monitorIDToName[input] || "";
 		},
 	};
 }
@@ -808,7 +812,8 @@ function init(uiData) {
 	newLogSelector(logger, formFields, document.querySelector(".js-content"));
 
 	window.addEventListener("resize", logger.lazyLoadSavedLogs);
-	window.addEventListener("orientation", logger.lazyLoadSavedLogs);
+	// Lazy-load on rotation too — no resize event fires.
+	window.addEventListener("orientationchange", logger.lazyLoadSavedLogs);
 	$logLists.addEventListener("scroll", logger.lazyLoadSavedLogs);
 }
 

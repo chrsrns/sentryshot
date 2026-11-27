@@ -80,52 +80,21 @@ pub trait Fs {
 pub enum Entry {
     Dir(Box<dyn Dir>),
     File(Box<dyn File>),
-    Symlink(Box<dyn Symlink>),
 }
 
-#[allow(unused)]
 impl Entry {
     #[must_use]
     pub fn name(&self) -> &Path {
         match self {
             Entry::Dir(v) => v.name(),
             Entry::File(v) => v.name(),
-            Entry::Symlink(v) => v.name(),
         }
-    }
-
-    fn is_dir(&self) -> bool {
-        matches!(self, Entry::Dir(_))
-    }
-
-    fn is_symlink(&self) -> bool {
-        matches!(self, Entry::Symlink(_))
     }
 }
 
 pub enum Open {
     File(Box<dyn File>),
     Dir(Box<dyn Dir>),
-    Symlink(Box<dyn Symlink>),
-}
-
-#[allow(unused)]
-impl Open {
-    fn name(&self) -> &Path {
-        match self {
-            Open::File(v) => v.name(),
-            Open::Dir(v) => v.name(),
-            Open::Symlink(v) => v.name(),
-        }
-    }
-
-    fn is_dir(&self) -> bool {
-        matches!(self, Open::Dir(_))
-    }
-
-    fn is_symlink(&self) -> bool {
-        matches!(self, Open::Symlink(_))
-    }
 }
 
 pub trait File {
@@ -136,10 +105,6 @@ pub trait File {
 pub trait Dir {
     fn name(&self) -> &Path;
     fn read_dir_file(&mut self) -> Result<Vec<Entry>, FsError>;
-}
-
-pub trait Symlink {
-    fn name(&self) -> &Path;
 }
 
 #[allow(clippy::unwrap_used)]

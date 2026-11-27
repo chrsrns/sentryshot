@@ -69,7 +69,7 @@ use crate::buf_seek_reader::BufSeekReader;
 struct Chunk;
 
 impl Chunk {
-    // 16666 minutes or 27.7 hours.
+    // ~1667 minutes or 27.8 hours.
     const DURATION: i64 = 100_000 * SECOND;
 
     // The chunk identifier is the first N digits of a Unix timestamp.
@@ -141,10 +141,10 @@ impl Database {
         logger: ArcMsgLogger,
         db_dir: PathBuf,
         cache_capacity: usize,
-        write_buf_capacify: usize,
+        write_buf_capacity: usize,
         disable_reordering: bool,
     ) -> Result<Self, CreateEventDbError> {
-        assert!(cache_capacity >= write_buf_capacify);
+        assert!(cache_capacity >= write_buf_capacity);
         common::create_dir_all2(Handle::current(), db_dir.clone())
             .await
             .map_err(|e| CreateEventDbError::CreateDir(db_dir.clone(), e))?;
@@ -156,7 +156,7 @@ impl Database {
             logger.clone(),
             db_dir.clone(),
             cache_capacity,
-            write_buf_capacify,
+            write_buf_capacity,
         );
 
         // Entries are queued here for 10 seconds.
@@ -365,7 +365,7 @@ pub(crate) struct DbWriter {
 
     cache: VecDeque<Event>,
     cache_capacity: usize,
-    write_buf_capacify: usize,
+    write_buf_capacity: usize,
 }
 
 impl DbWriter {
@@ -373,7 +373,7 @@ impl DbWriter {
         logger: ArcMsgLogger,
         db_dir: PathBuf,
         cache_capacity: usize,
-        write_buf_capacify: usize,
+        write_buf_capacity: usize,
     ) -> Self {
         Self {
             logger,
@@ -382,7 +382,7 @@ impl DbWriter {
             prev_entry_time: UnixNano::new(0),
             cache: VecDeque::with_capacity(cache_capacity),
             cache_capacity,
-            write_buf_capacify,
+            write_buf_capacity,
         }
     }
 
@@ -439,7 +439,7 @@ impl DbWriter {
             self.logger.clone(),
             self.db_dir.clone(),
             chunk_id,
-            self.write_buf_capacify,
+            self.write_buf_capacity,
         )
         .await
     }
@@ -796,7 +796,7 @@ impl<T: AsyncRead + AsyncSeek + Unpin> LazyDbEntry<'_, T> {
             .map_err(Read)?;
 
         let detections: Event = serde_json::from_slice(&payload_buf)
-            .map_err(|e| Desrialize(e, self.payload_offset, self.payload_size))?;
+            .map_err(|e| Deserialize(e, self.payload_offset, self.payload_size))?;
         Ok(detections)
     }
 }
@@ -1134,7 +1134,7 @@ async fn encode_entry<W: AsyncWrite + Unpin, W2: AsyncWrite + Unpin>(
 #[derive(Debug, Error)]
 pub enum RecoverableDecodeError {
     #[error("deserialize payload: {0} pos={1} size={2}")]
-    Desrialize(serde_json::Error, u32, u16),
+    Deserialize(serde_json::Error, u32, u16),
 
     #[error("seek: {0}")]
     Seek(std::io::Error),

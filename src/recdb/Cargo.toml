@@ -17,7 +17,6 @@ doctest = false
 common.path = "../common"
 csv.path = "../csv"
 fs.path = "../fs"
-recording.path = "../recording"
 
 async-trait.workspace = true
 bytesize.workspace = true

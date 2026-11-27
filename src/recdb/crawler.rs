@@ -33,8 +33,6 @@ pub enum CrawlerError {
     #[error("{0:?}: unexpected directory")]
     UnexpectedDir(PathBuf),
 
-    #[error("{0:?}: unexpected symlink")]
-    UnexpectedSymlink(PathBuf),
 }
 
 // Crawls through storage looking for recordings.
@@ -416,9 +414,6 @@ impl DirIterRec {
                         return Err(CrawlerError::UnexpectedDir(d.name().to_path_buf()));
                     }
                     Entry::File(v) => v,
-                    Entry::Symlink(s) => {
-                        return Err(CrawlerError::UnexpectedDir(s.name().to_path_buf()));
-                    }
                 };
                 let Some(name) = file.name().to_str() else {
                     continue;

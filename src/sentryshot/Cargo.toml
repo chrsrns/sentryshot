@@ -14,10 +14,8 @@ path = "./main.rs"
 
 [dependencies]
 common.path = "../common"
-csv.path = "../csv"
 env.path = "../env"
 eventdb.path = "../eventdb"
-fs.path = "../fs"
 handler.path = "../handler"
 hls.path = "../hls"
 scan.path = "../scan"
@@ -37,13 +35,10 @@ serde_json.workspace = true
 
 axum.workspace = true
 bytesize.workspace = true
-console-subscriber.workspace = true
-hyper.workspace = true
 jiff.workspace = true
 pico-args.workspace = true
 rand.workspace = true
 thiserror.workspace = true
-tower.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 

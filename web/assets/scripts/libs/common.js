@@ -144,6 +144,8 @@ function newMonitorNameByID(monitors) {
 				return monitor.name;
 			}
 		}
+		// Unknown id — render it rather than "undefined".
+		return id;
 	};
 }
 
@@ -155,7 +157,7 @@ function setHashParam(key, value) {
 	const url = new URL("http://dummy.com");
 	url.search = window.location.hash.slice(1);
 	url.searchParams.set(key, value);
-	window.location.hash = url.search.slice(1).replace("%2C", ",");
+	window.location.hash = url.search.slice(1).replaceAll("%2C", ",");
 }
 
 /**
@@ -203,15 +205,19 @@ function denormalize(input, max) {
 	return Math.round((input * max) / 1000000);
 }
 
+// Injected by templater.rs get_data() into window.uiData on every page.
+// currentPage carries the page name. monitors is only present for
+// admins; timeOfOldestRecording only when recordings exist.
 /**
  * @typedef UiData
+ * @property {string} currentPage
  * @property {string} csrfToken
  * @property {Flags} flags
  * @property {boolean} isAdmin
  * @property {string} tz
  * @property {string[]} logSources
  * @property {MonitorGroups} monitorGroups
- * @property {{[x: string]: any}} monitors
+ * @property {{[x: string]: any}=} monitors
  * @property {MonitorsInfo} monitorsInfo
  * @property {number=} timeOfOldestRecording
  */
@@ -251,6 +257,8 @@ function globals() {
 
 /** @param {String} pathname */
 function relativePathname(pathname) {
+	// Test-only fallback: uiData is injected by the page template and
+	// is always set in production; jest tests run without it.
 	// @ts-ignore
 	if (window.uiData === undefined) {
 		return `http://test.com/${pathname}`;
@@ -296,6 +304,9 @@ function sleep(abortSignal, ms) {
 }
 
 // Memoization is 25% faster.
+// Bounded — html strings can interpolate dynamic values, so the key
+// space isn't fixed; evict the oldest entry past the cap.
+const ELEM_CACHE_MAX = 200;
 const elemCache = {};
 
 /**
@@ -311,6 +322,10 @@ function htmlToElem(html, children = []) {
 		return elem;
 	}
 
+	const cacheKeys = Object.keys(elemCache);
+	if (cacheKeys.length >= ELEM_CACHE_MAX) {
+		delete elemCache[cacheKeys[0]];
+	}
 	const template = document.createElement("template");
 	template.innerHTML = html;
 	//if (template.content.childElementCount !== 1) {

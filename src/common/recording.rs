@@ -371,19 +371,6 @@ fn div_ceil(a: u64, b: u64) -> u64 {
     if r > 0 && b > 0 { d + 1 } else { d }
 }
 
-// CreateMask creates an image mask from a polygon.
-// Pixels outside the polygon are masked.
-#[must_use]
-pub fn create_mask(poly: &Polygon, w: u16, h: u16) -> Vec<Vec<bool>> {
-    let mut img = vec![vec![false; usize::from(w)]; usize::from(h)];
-    for y in 0..w {
-        for x in 0..h {
-            img[usize::from(y)][usize::from(x)] = !vertex_inside_poly(x, y, poly);
-        }
-    }
-    img
-}
-
 // CreateInvertedMask creates an image mask from a polygon.
 // Pixels inside the polygon are masked.
 #[must_use]
@@ -445,6 +432,12 @@ pub fn vertex_inside_poly2(x: u32, y: u32, poly: &PolygonNormalized) -> bool {
     inside
 }
 
+// Feed rate in frames per second stored as a frame interval.
+// A configured rate of 0 yields a zero duration, which the
+// FrameRateLimiter treats as no limit. Negative rates are not
+// validated here; they produce a negative duration that fails the
+// u64 conversion when the limiter is constructed, so a bad config
+// surfaces as an init error rather than a panic.
 #[repr(transparent)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FeedRateSec(Duration);
@@ -516,6 +509,8 @@ fn feed_rate_to_duration(feed_rate: f32) -> Duration {
     Duration::new(((1.0 * SECOND as f32) / feed_rate) as i64)
 }
 
+// Drops frames above a configured rate.
+// A max_rate of 0 disables limiting entirely.
 pub struct FrameRateLimiter {
     max_rate: u64,
 
@@ -641,65 +636,6 @@ mod tests {
         assert_eq!(value, got);
     }
 
-    #[test]
-    fn test_create_mask() {
-        fn p(x: u16, y: u16) -> Point {
-            Point { x, y }
-        }
-        let cases = &[
-            (
-                vec![p(3, 1), p(6, 6), p(0, 6)],
-                "
-                _______
-                _______
-                ___X___
-                __XXX__
-                __XXX__
-                _XXXXX_
-                _______",
-            ),
-            (
-                vec![
-                    p(2, 0),
-                    p(5, 0),
-                    p(7, 3),
-                    p(7, 4),
-                    p(4, 7),
-                    p(0, 4),
-                    p(0, 2),
-                ],
-                "
-                __XXX__
-                _XXXXX_
-                XXXXXXX
-                XXXXXXX
-                XXXXXXX
-                _XXXXX_
-                __XXX__",
-            ),
-            (
-                vec![p(7, 0), p(7, 7), p(1, 5), p(6, 5), p(0, 7), p(0, 0)],
-                "
-                XXXXXXX
-                XXXXXXX
-                XXXXXXX
-                XXXXXXX
-                XXXXXXX
-                X_____X
-                XXX_XXX", // Lines cross over themselves at the bottom.
-            ),
-        ];
-
-        for (input, want) in cases {
-            let mask = create_mask(input, 7, 7);
-
-            let got = image_to_text(&mask);
-            let want = want.replace(' ', "");
-            assert_eq!(want, got);
-        }
-    }
-
-    #[test]
     fn test_create_inverted_mask() {
         fn p(x: u16, y: u16) -> Point {
             Point { x, y }

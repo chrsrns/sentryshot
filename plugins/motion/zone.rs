@@ -35,7 +35,6 @@ pub struct Zone {
     mask: Vec<bool>,
 
     zone_size: u64,
-    frame_size: i64,
 
     sensitivity: u8,
     threshold_min: f32,
@@ -56,7 +55,6 @@ impl Zone {
         Zone {
             mask,
             zone_size,
-            frame_size: i64::from(width) * i64::from(height),
             sensitivity: (config.sensitivity * 2.56) as u8,
             threshold_min: config.threshold_min,
             threshold_max: config.threshold_max,
@@ -236,48 +234,4 @@ mod tests {
         }
     }
 
-    /*func BenchmarkDetector(b *testing.B) {
-        width := 500
-        height := 500
-        frameSize := width * height
-        frame1 := bytes.Repeat([]byte{0}, frameSize)
-        frame2 := bytes.Repeat([]byte{255}, frameSize)
-        diff := make([]byte, frameSize)
-
-        newTestZone := func(area area) *zone {
-            return newZone(
-                width,
-                height,
-                zoneConfig{
-                    Enable:       true,
-                    Sensitivity:  8,
-                    ThresholdMin: 10,
-                    ThresholdMax: 100,
-                    Area:         area,
-                },
-            )
-        }
-
-        zones := zones{
-            // Full frame.
-            newTestZone(area{{0, 0}, {100, 0}, {100, 100}, {0, 100}}),
-            // Large diamond 50%.
-            newTestZone(area{{50, 0}, {100, 50}, {50, 100}, {0, 50}}),
-            // Medium diamond.
-            newTestZone(area{{50, 25}, {75, 50}, {50, 75}, {25, 50}}),
-        }
-
-        var zone int
-        var score float64
-        var active bool
-        b.ResetTimer()
-        for i := 0; i < b.N; i++ {
-            onActive := func(zone int, s float64) {
-                score = s
-            }
-            zones.analyze(frame1, frame2, diff, onActive)
-        }
-        _, _, _ = zone, score, active
-
-    }*/
 }
