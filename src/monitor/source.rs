@@ -549,10 +549,10 @@ enum SourceRtspRunError {
 
 #[derive(Debug, Error)]
 enum RemoveCreds {
-    #[error("set password")]
+    #[error("set username")]
     SetUsername,
 
-    #[error("set username")]
+    #[error("set password")]
     SetPassword,
 }
 
