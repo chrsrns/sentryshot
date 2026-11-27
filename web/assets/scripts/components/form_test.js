@@ -63,6 +63,30 @@ describe("newForm", () => {
 		expect(fieldValue()).toBeUndefined();
 	});
 
+	test("patch only sets provided keys", () => {
+		const values = {};
+		const form = newForm({
+			id: {
+				elems: [htmlToElem("<span>html</span>")],
+				set(input) {
+					values["id"] = input;
+				},
+			},
+			name: {
+				elems: [htmlToElem("<span>html</span>")],
+				set(input) {
+					values["name"] = input;
+				},
+			},
+		});
+
+		form.set({ id: "abc", name: "cam" });
+		form.patch({ name: "renamed" });
+
+		expect(values["id"]).toBe("abc");
+		expect(values["name"]).toBe("renamed");
+	});
+
 	const newTestForm = () => {
 		return newForm({
 			field: {
@@ -144,6 +168,44 @@ describe("newForm", () => {
 			document.body.replaceChildren(form.elem());
 
 			form.buttons["delete"].click();
+
+			expect(clicked).toBe(true);
+		});
+	});
+	describe("scanBtn", () => {
+		test("rendering", () => {
+			uidReset();
+			const form = newTestForm();
+			form.addButton("scan", () => {});
+
+			expect(form.elem().outerHTML).toMatchInlineSnapshot(`
+<ul class="form"
+    style="overflow-y: auto;"
+>
+  <span>
+    html
+  </span>
+  <div class="flex">
+    <button class="m-2 px-2 rounded-lg bg-color2 hover:bg-color3">
+      <span class="text-2 text-color">
+        Scan
+      </span>
+    </button>
+  </div>
+</ul>
+`);
+		});
+		test("onClick", () => {
+			const form = newTestForm();
+
+			let clicked = false;
+			const onScan = () => {
+				clicked = true;
+			};
+			form.addButton("scan", onScan);
+			document.body.replaceChildren(form.elem());
+
+			form.buttons["scan"].click();
 
 			expect(clicked).toBe(true);
 		});

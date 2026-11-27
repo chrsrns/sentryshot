@@ -379,6 +379,11 @@ impl App {
                 "/api/monitor-groups",
                 put(monitor_groups_put_handler).with_state(self.monitor_groups.clone()),
             )
+            // Camera scan.
+            .route_admin(
+                "/api/scan",
+                post(scan_handler).with_state(Arc::new(scan::scanner::Scanner::default())),
+            )
             // Recording delete.
             .route_user_no_csrf(
                 "/api/recording/delete/{*id}",

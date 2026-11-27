@@ -33,6 +33,7 @@ import { uniqueID, htmlToElem } from "../libs/common.js";
  * @property {() => string|undefined} validate
  * @property {() => Element} elem
  * @property {(values: {[x: string]: any}) => void} set
+ * @property {(values: {[x: string]: any}) => void} patch
  * @property {(values: {[x: string]: any}) => void} get
  */
 
@@ -58,6 +59,10 @@ function newForm(fields) {
 				}
 				case "delete": {
 					buttons["delete"] = newDeleteBtn(onClick);
+					break;
+				}
+				case "scan": {
+					buttons["scan"] = newScanBtn(onClick);
 					break;
 				}
 				default: {
@@ -113,6 +118,16 @@ function newForm(fields) {
 				if (values === undefined) {
 					field.set(undefined);
 				} else {
+					field.set(values[key]);
+				}
+			}
+		},
+		// Only sets the keys present in `values`; others keep
+		// their current value. Used for partial prefills that
+		// must not clear untouched fields (e.g. `id`).
+		patch(values) {
+			for (const [key, field] of Object.entries(fields)) {
+				if (key in values) {
 					field.set(values[key]);
 				}
 			}
@@ -220,6 +235,19 @@ function newSaveBtn(onClick) {
 	const elem = htmlToElem(/* HTML */ `
 		<button class="m-2 px-2 rounded-lg bg-green hover:bg-green2">
 			<span class="text-2 text-color">Save</span>
+		</button>
+	`);
+	elem.onclick = onClick;
+	return elem;
+}
+
+/** @param {() => void} onClick */
+function newScanBtn(onClick) {
+	/** @type {HTMLButtonElement} */
+	// @ts-ignore
+	const elem = htmlToElem(/* HTML */ `
+		<button class="m-2 px-2 rounded-lg bg-color2 hover:bg-color3">
+			<span class="text-2 text-color">Scan</span>
 		</button>
 	`);
 	elem.onclick = onClick;

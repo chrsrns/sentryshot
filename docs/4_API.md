@@ -82,3 +82,54 @@ Returns the temporary CSRF-token for your account.
 Toggle detector and restart monitor.
 
 
+### POST /api/scan
+
+##### Auth: admin + CSRF
+
+Discover cameras on the LAN.
+
+Request body:
+
+```json
+{
+	"host": "192.168.1.64",
+	"username": "admin",
+	"password": "optional-camera-credentials"
+}
+```
+
+- `host` absent or empty: WS-Discovery multicast scan (IPv4 only).
+- `host` present: single IPv4 literal — directed probe, vendor fast-paths and an RTSP path shortlist against that one address. No hostname, CIDR or range.
+
+Response `200`:
+
+```json
+{
+	"cameras": [
+		{
+			"ip": "192.168.1.64",
+			"name": "camera-name",
+			"streams": [
+				{
+					"rtspUrl": "rtsp://user:pass@192.168.1.64:554/main",
+					"role": "main",
+					"profileName": "MainStream",
+					"auth": "digest",
+					"videoCodec": "h264"
+				}
+			],
+			"ptz": false,
+			"backchannel": false,
+			"needsAuth": true
+		}
+	],
+	"truncated": false
+}
+```
+
+- Every returned stream is DESCRIBE-probed once within the shared deadline; `videoCodec` is the SDP video `encoding_name` (`"h264"`, `"h265"`, …), `"none"` when the SDP has no video stream, or `"unknown"` when the probe could not complete (auth challenge, timeout). SentryShot only plays `h264`.
+- One scan at a time: a semantically different concurrent request gets `409`; an identical one joins the running scan.
+- `truncated: true` means the 15-second budget cut the scan — results are partial.
+- `400` on invalid `host`, `500` on internal failure. Error bodies are static strings; camera credentials are request-scoped and never persisted by the scan itself.
+
+

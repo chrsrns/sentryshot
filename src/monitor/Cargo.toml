@@ -23,6 +23,7 @@ async-trait.workspace = true
 bytesize.workspace = true
 futures-lite.workspace = true
 jpeg-encoder.workspace = true
+percent-encoding = "2.3"
 retina.workspace = true
 sentryshot_convert.workspace = true
 sentryshot_ffmpeg_h264.workspace = true

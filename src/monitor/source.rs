@@ -565,17 +565,20 @@ fn remove_creds_from_url(mut url: Url) -> Result<Url, RemoveCreds> {
 }
 
 fn creds_from_url(url: &Url) -> Option<retina::client::Credentials> {
-    let username = url.username();
-    let password = url.password();
+    fn decode(s: &str) -> String {
+        percent_encoding::percent_decode_str(s)
+            .decode_utf8()
+            .map_or_else(|_| s.to_owned(), |d| d.into_owned())
+    }
+
+    let username = decode(url.username());
+    let password = url.password().map(decode);
 
     if let Some(password) = password {
-        Some(retina::client::Credentials {
-            username: username.to_owned(),
-            password: password.to_owned(),
-        })
+        Some(retina::client::Credentials { username, password })
     } else if !username.is_empty() {
         Some(retina::client::Credentials {
-            username: username.to_owned(),
+            username,
             password: String::new(),
         })
     } else {
@@ -681,4 +684,39 @@ fn new_decoder(
     });
 
     frame_rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn creds_from_url_decodes_percent_encoded() {
+        let url = Url::parse("rtsp://user:p%40ss%2Fword@192.168.1.1/stream").unwrap();
+        let creds = creds_from_url(&url).unwrap();
+        assert_eq!("user", creds.username);
+        assert_eq!("p@ss/word", creds.password);
+    }
+
+    #[test]
+    fn creds_from_url_plain_unchanged() {
+        let url = Url::parse("rtsp://admin:letmein@192.168.1.1/stream").unwrap();
+        let creds = creds_from_url(&url).unwrap();
+        assert_eq!("admin", creds.username);
+        assert_eq!("letmein", creds.password);
+    }
+
+    #[test]
+    fn creds_from_url_username_only() {
+        let url = Url::parse("rtsp://admin@192.168.1.1/stream").unwrap();
+        let creds = creds_from_url(&url).unwrap();
+        assert_eq!("admin", creds.username);
+        assert_eq!("", creds.password);
+    }
+
+    #[test]
+    fn creds_from_url_none() {
+        let url = Url::parse("rtsp://192.168.1.1/stream").unwrap();
+        assert!(creds_from_url(&url).is_none());
+    }
 }

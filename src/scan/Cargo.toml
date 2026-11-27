@@ -1,0 +1,45 @@
+[package]
+name = "scan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "scan"
+path = "scan.rs"
+doctest = false
+
+
+[dependencies]
+common.path = "../common"
+
+bytes.workspace = true
+futures-lite.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
+if-addrs = "0.13"
+rand.workspace = true
+retina.workspace = true
+roxmltree = "0.20"
+sha1 = "0.10"
+md5 = "0.8"
+base64 = "0.22"
+socket2 = "0.6"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+jiff.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+url.workspace = true
+
+
+[dev-dependencies]
+axum.workspace = true
+pretty_assertions.workspace = true
+test-case.workspace = true

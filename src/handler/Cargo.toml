@@ -17,6 +17,7 @@ doctest = false
 common.path = "../common"
 eventdb.path = "../eventdb"
 hls.path = "../hls"
+scan.path = "../scan"
 log.path = "../log"
 monitor_groups.path = "../monitor_groups"
 recdb.path = "../recdb"

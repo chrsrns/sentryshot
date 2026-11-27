@@ -2,7 +2,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use crate::asset_handler;
+use crate::{asset_handler, scan_error_response};
 use axum::{
     body::to_bytes,
     extract::{Path, State},
@@ -43,5 +43,21 @@ async fn handle_assets_404() {
     assert_eq!(
         "404",
         to_bytes(response.into_body(), usize::MAX).await.unwrap()
+    );
+}
+
+#[test]
+fn scan_error_status_mapping() {
+    assert_eq!(
+        StatusCode::BAD_REQUEST,
+        scan_error_response(&scan::ScanError::InvalidHost("x".into())).status()
+    );
+    assert_eq!(
+        StatusCode::CONFLICT,
+        scan_error_response(&scan::ScanError::Busy).status()
+    );
+    assert_eq!(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        scan_error_response(&scan::ScanError::Timeout).status()
     );
 }

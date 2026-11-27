@@ -575,5 +575,39 @@
 			</div>
 			<pre></pre>
 		</article>
+		<article class="js-post-scan">
+			<span>POST /api/scan</span>
+			<textarea style="width: 12rem; height: 4rem">
+{
+  "host": "192.168.1.64",
+  "username": "admin",
+  "password": ""
+}</textarea
+			>
+			<button
+				style="margin-left: 0"
+				onclick='
+				(async () => {
+					const element = document.querySelector(".js-post-scan");
+					const token = await fetch("api/account/my-token");
+					const jsonRequest = element.querySelector("textarea").value;
+					const res = await fetch("api/scan", {
+						body: jsonRequest,
+						headers: {
+							"Content-Type": "application/json",
+							"X-CSRF-TOKEN": token,
+						},
+						method: "post",
+					});
+					element.querySelector("pre").textContent =
+						`${res.status}\n${await res.text()}`;
+				})();
+				'
+				>
+					Submit
+				</button>
+			<pre></pre>
+		</article>
+
 	</body>
 </html>
