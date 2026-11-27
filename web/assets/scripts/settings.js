@@ -25,6 +25,7 @@ import {
 	newPasswordField,
 } from "./components/form.js";
 import { newModal } from "./components/modal.js";
+import { applyPtzCapabilities, newPtzController } from "./components/ptz.js";
 
 /** @typedef {import("./components/form.js").InputRule} InputRule */
 
@@ -498,7 +499,7 @@ function newScanModal(token) {
 					if (warnings.length > 0 && !confirm(`${warnings.join("; ")}. Apply anyway?`)) {
 						return;
 					}
-					onPick({
+					const prefill = {
 						source: "rtsp",
 						sourcertsp: {
 							protocol: "tcp",
@@ -508,7 +509,20 @@ function newScanModal(token) {
 								sel.sub === undefined ? "" : injectCreds(sel.sub.rtspUrl),
 						},
 						name: sanitizeMonitorName(cam.name, cam.ip),
-					});
+					};
+					if (cam.ptz === true) {
+						// First http XAddr; none → empty, derived at
+						// command time from the main stream host.
+						const httpXaddr = (cam.xaddrs || []).find((x) =>
+							x.startsWith("http://"),
+						);
+						// @ts-ignore
+						prefill.ptz = {
+							enable: true,
+							onvifAddr: httpXaddr === undefined ? "" : httpXaddr,
+						};
+					}
+					onPick(prefill);
 					modal.close();
 				};
 				item.append(pickBtn);
@@ -1216,6 +1230,187 @@ function newSourceRTSP() {
 	};
 }
 
+/**
+ * @typedef PtzConfig
+ * @property {boolean} enable
+ * @property {string} onvifAddr
+ * @property {string[]=} unsupported
+ */
+
+/** @type {InputRule[]} */
+const ptzOnvifAddrRules = [
+	[/^(?!\s*$)(?!http:\/\/)/, "must be empty or an http:// URL"],
+	[/^http:\/\/($|[#/?])/, "missing host"],
+	[/^http:\/\/[^#/?]*@/, "credentials not allowed"],
+	[/[#?]/, "query and fragment not allowed"],
+];
+
+/**
+ * @param {string} csrfToken
+ * @param {() => string} getMonitorId
+ * @returns {Field<PtzConfig>}
+ */
+function newPtzField(csrfToken, getMonitorId) {
+	const fields = {
+		enable: fieldTemplate.toggle("Enable PTZ", false),
+		onvifAddr: newErrorField(ptzOnvifAddrRules, {
+			input: "text",
+			label: "ONVIF address",
+			placeholder: "http://x.x.x.x/onvif/device_service (optional)",
+			doc: "ONVIF device service address. Leave empty to derive it from the main stream host",
+		}),
+	};
+	const panel = newPtzPanel(csrfToken, getMonitorId);
+
+	const form = newForm(fields);
+	/** @type {string[]|undefined} */
+	let unsupported;
+	return {
+		elems: [...fields.enable.elems, ...fields.onvifAddr.elems, panel.elem],
+		value() {
+			/** @type {PtzConfig} */
+			const value = { enable: false, onvifAddr: "" };
+			form.get(value);
+			// Server-managed capability marks — round-tripped untouched.
+			if (unsupported !== undefined) {
+				value.unsupported = unsupported;
+			}
+			return value;
+		},
+		set(input) {
+			const value = input === undefined ? {} : input;
+			unsupported = value.unsupported;
+			form.set(value);
+			// Panel only for a persisted monitor saved with ptz enabled —
+			// commands read stored config + creds, so an unsaved toggle
+			// could never authenticate anyway.
+			if (value.enable === true) {
+				panel.show();
+			} else {
+				panel.hide();
+			}
+		},
+		validate() {
+			return form.validate();
+		},
+	};
+}
+
+/**
+ * PTZ test panel: direction pad + zoom hold-to-move, home, preset list.
+ * Visibility is driven by the ptz field's set() — shown only when a
+ * persisted monitor's saved config has enable=true.
+ *
+ * @param {string} csrfToken
+ * @param {() => string} getMonitorId
+ */
+function newPtzPanel(csrfToken, getMonitorId) {
+	const glyphBtn = "ptz-glyph px-2 rounded-lg bg-color2 hover:bg-color3";
+	const elem = /** @type {HTMLElement} */ (htmlToElem(/* HTML */ `
+		<li class="ptz-panel form-item" hidden>
+			<div class="flex flex-col gap-1 p-2 border border-color3 rounded-lg w-max">
+				<div class="flex gap-2 items-center">
+					<div class="ptz-grid">
+						<span class="js-ptz-wrap"><button type="button" class="ptz-hold ${glyphBtn}" data-pan="-0.5" data-tilt="0.5">↖</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="ptz-hold ${glyphBtn}" data-pan="0" data-tilt="0.5">↑</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="ptz-hold ${glyphBtn}" data-pan="0.5" data-tilt="0.5">↗</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="ptz-hold ${glyphBtn}" data-pan="-0.5" data-tilt="0">←</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="js-ptz-stop ${glyphBtn}">■</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="ptz-hold ${glyphBtn}" data-pan="0.5" data-tilt="0">→</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="ptz-hold ${glyphBtn}" data-pan="-0.5" data-tilt="-0.5">↙</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="ptz-hold ${glyphBtn}" data-pan="0" data-tilt="-0.5">↓</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="ptz-hold ${glyphBtn}" data-pan="0.5" data-tilt="-0.5">↘</button></span>
+					</div>
+					<div class="flex flex-col gap-1">
+						<span class="js-ptz-wrap"><button type="button" class="ptz-hold ${glyphBtn}" data-zoom="0.5">+</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="ptz-hold ${glyphBtn}" data-zoom="-0.5">−</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="js-ptz-home ${glyphBtn}">⌂</button></span>
+						<span class="js-ptz-wrap"><button type="button" class="js-ptz-presets-btn ${glyphBtn}">★</button></span>
+					</div>
+				</div>
+				<div class="js-ptz-presets-pop ptz-popover-panel" hidden>
+					<div class="js-ptz-presets flex flex-col gap-1"></div>
+					<div class="flex gap-1 items-center mt-1">
+						<span class="js-ptz-wrap"><input type="text" class="js-ptz-name px-1 bg-color1" placeholder="preset name" maxlength="64" /></span>
+						<span class="js-ptz-wrap"><button type="button" class="js-ptz-save px-2 rounded-lg bg-color2 hover:bg-color3">save</button></span>
+					</div>
+				</div>
+				<div class="js-ptz-error text-red"></div>
+			</div>
+		</li>
+	`));
+
+	const errorElem = /** @type {HTMLElement} */ (elem.querySelector(".js-ptz-error"));
+	const presetsElem = /** @type {HTMLElement} */ (elem.querySelector(".js-ptz-presets"));
+	const nameInput = /** @type {HTMLInputElement} */ (elem.querySelector(".js-ptz-name"));
+
+	const popover = /** @type {HTMLElement} */ (elem.querySelector(".js-ptz-presets-pop"));
+
+	const controller = newPtzController(csrfToken, getMonitorId, errorElem);
+	controller.bindHold(elem);
+	// @ts-ignore
+	elem.querySelector(".js-ptz-stop").onclick = () => {
+		controller.stop();
+	};
+	// @ts-ignore
+	elem.querySelector(".js-ptz-home").onclick = () => {
+		controller.send({ command: "home" });
+	};
+	// @ts-ignore
+	elem.querySelector(".js-ptz-presets-btn").onclick = () => {
+		popover.hidden = !popover.hidden;
+	};
+	controller.bindPresetSave(nameInput, /** @type {Element} */ (elem.querySelector(".js-ptz-save")), () =>
+		controller.loadPresets(presetsElem),
+	);
+
+	/** @type {MutationObserver|undefined} */
+	let observer;
+
+	return {
+		elem,
+		show() {
+			elem.hidden = false;
+			controller.attach();
+			controller
+				.capabilities()
+				.then((res) => {
+					if (!res.ok) {
+						return res; // Failed query — keep prior marks.
+					}
+					const skip = applyPtzCapabilities(elem, res.unsupported, () =>
+						controller.release(),
+					);
+					return skip ? res : controller.loadPresets(presetsElem);
+				})
+				.catch(() => {});
+			if (observer === undefined) {
+				// Unmount/navigation-away: cancel the heartbeat + stop. The
+				// camera-side Timeout still bounds a stop lost on unload.
+				observer = new MutationObserver(() => {
+					if (!elem.isConnected) {
+						controller.detach();
+						if (observer !== undefined) {
+							observer.disconnect();
+							observer = undefined;
+						}
+					}
+				});
+				observer.observe(document.body, { childList: true, subtree: true });
+			}
+		},
+		hide() {
+			elem.hidden = true;
+			popover.hidden = true;
+			controller.detach();
+			if (observer !== undefined) {
+				observer.disconnect();
+				observer = undefined;
+			}
+		},
+	};
+}
+
 /** @returns {Field<string>} */
 function newIdField() {
 	let value;
@@ -1269,6 +1464,7 @@ function init(uiData) {
 	monitorFields.sourcertsp = newSourceRTSP();
 	monitorFields.alwaysRecord = fieldTemplate.toggle("Always record", false);
 	monitorFields.videoLength = fieldTemplate.number("Video length (min)", "15", 15);
+	monitorFields.ptz = newPtzField(uiData.csrfToken, getMonitorId);
 	//timestampOffset: fieldTemplate.integer("Timestamp offset (ms)", "500", "500"),
 	/* SETTINGS_LAST_MONITOR_FIELD */
 
@@ -1312,4 +1508,4 @@ function init(uiData) {
 		.replaceChildren(...rendererCategories([monitor, group, account]));
 }
 
-export { init, newScanModal };
+export { init, newScanModal, newPtzField, newPtzPanel };

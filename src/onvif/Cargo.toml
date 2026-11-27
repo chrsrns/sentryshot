@@ -1,0 +1,38 @@
+[package]
+name = "onvif"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "onvif"
+path = "onvif.rs"
+doctest = false
+
+
+[dependencies]
+common.path = "../common"
+
+base64 = "0.22"
+bytes.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
+jiff.workspace = true
+md5 = "0.8"
+percent-encoding = "2.3"
+rand.workspace = true
+roxmltree = "0.20"
+sha1 = "0.10"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+url.workspace = true
+
+
+[dev-dependencies]
+axum.workspace = true
+pretty_assertions.workspace = true

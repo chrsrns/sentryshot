@@ -575,6 +575,43 @@
 			</div>
 			<pre></pre>
 		</article>
+		<article class="js-post-ptz">
+			<span>POST /api/monitor/ptz?id=</span>
+			<input type="text" value="123" placeholder="MONITOR_ID" class="js-id" />
+			<textarea style="width: 12rem; height: 4rem">
+{
+  "command": "move",
+  "pan": 0.5,
+  "tilt": 0,
+  "zoom": 0,
+  "timeout": "PT2S"
+}</textarea
+			>
+			<button
+				style="margin-left: 0"
+				onclick='
+				(async () => {
+					const element = document.querySelector(".js-post-ptz");
+					const token = await fetch("api/account/my-token");
+					const id = element.querySelector(".js-id").value;
+					const jsonRequest = element.querySelector("textarea").value;
+					const res = await fetch(`api/monitor/ptz?id=${id}`, {
+						body: jsonRequest,
+						headers: {
+							"Content-Type": "application/json",
+							"X-CSRF-TOKEN": token,
+						},
+						method: "post",
+					});
+					element.querySelector("pre").textContent =
+						`${res.status}\n${await res.text()}`;
+				})();
+				'
+				>
+					Submit
+				</button>
+			<pre></pre>
+		</article>
 		<article class="js-post-scan">
 			<span>POST /api/scan</span>
 			<textarea style="width: 12rem; height: 4rem">

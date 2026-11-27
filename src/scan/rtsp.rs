@@ -5,9 +5,9 @@
 
 use crate::{
     ScanError,
-    onvif::{digest_authorization, parse_digest_challenge},
     types::{Creds, ScanRole},
 };
+use onvif::{digest_authorization, parse_digest_challenge};
 use std::{net::Ipv4Addr, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

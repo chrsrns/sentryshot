@@ -1,0 +1,33 @@
+[package]
+name = "ptz"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "ptz"
+path = "ptz.rs"
+doctest = false
+
+
+[dependencies]
+common.path = "../common"
+onvif.path = "../onvif"
+
+async-trait.workspace = true
+jiff.workspace = true
+roxmltree = "0.20"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+url.workspace = true
+
+
+[dev-dependencies]
+axum.workspace = true
+pretty_assertions.workspace = true

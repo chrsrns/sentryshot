@@ -82,6 +82,60 @@ Returns the temporary CSRF-token for your account.
 Toggle detector and restart monitor.
 
 
+### POST /api/monitor/ptz?id=<MONITOR_ID>
+
+##### Auth: admin + CSRF
+
+Send one ONVIF PTZ command to the monitor's camera. The camera
+credentials are taken from the stored monitor `mainStream` URL
+userinfo — never the request body. The monitor must have `ptz.enable`
+saved `true` (set it in the monitor settings form).
+
+Request body:
+
+```json
+{
+	"command": "move",
+	"pan": 0.5,
+	"tilt": 0,
+	"zoom": 0,
+	"timeout": "PT2S",
+	"presetToken": "1",
+	"presetName": "Gate"
+}
+```
+
+- `command`: `move` | `stop` | `home` | `getPresets` | `gotoPreset` | `setPreset` | `removePreset` | `capabilities`
+- `move`: at least one of `pan`/`tilt`/`zoom` required, each −1.0..=1.0. Optional `timeout` — `PT0.5S` | `PT1S` | `PT2S`, default `PT2S` — is interpolated into the `ContinuousMove` camera-side `Timeout`, bounding how long the camera holds movement without a `stop`. Short taps should send `PT0.5S`; note some firmware ignores `Timeout` and jogs a fixed duration instead (velocity is the only knob there). `timeout` is rejected on any non-`move` command.
+- `gotoPreset`/`removePreset`: `presetToken` required.
+- `setPreset`: `presetName` required, 1..=64 characters.
+- `stop`: stops all axes; `home`: moves to the camera home position.
+- `capabilities`: probes the camera and returns the unsupported-command list. Any op the camera faulted `not implemented`/`not recognized` is remembered in the monitor's `ptz.unsupported` and answered `502` on future calls without a camera round trip; the set clears when `ptz.onvifAddr` or `mainStream` changes.
+
+Response `200`:
+
+```json
+{
+	"presets": [{ "token": "1", "name": "Gate" }]
+}
+```
+
+```json
+{
+	"unsupported": ["home", "getPresets"]
+}
+```
+
+`presets` is present for `getPresets` only, `unsupported` for `capabilities` only; other commands return `{}`.
+
+| Status | Meaning |
+| --- | --- |
+| `400` | unknown command, missing required field, out-of-range velocity, `presetName` empty or over 64 chars, `timeout` outside the allowlist or attached to a non-`move` command |
+| `404` | monitor does not exist |
+| `409` | monitor `ptz.enable` is not `true` |
+| `502` | camera fault or timeout, or a command the camera marked unsupported |
+
+
 ### POST /api/scan
 
 ##### Auth: admin + CSRF
