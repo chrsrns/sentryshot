@@ -206,6 +206,8 @@ fn parse_path(path: String) -> Result<(String, String), ParsePathError> {
     if path.ends_with(".m3u8")
         || path.ends_with(".ts")
         || path.ends_with(".mp4")
+        // Safari can truncate ".mp4" requests to ".mp"; the HLS muxer
+        // maps them back (see the "Apple bug" arm in hls::Muxer::file).
         || path.ends_with(".mp")
     {
         let p = PathBuf::from(path);
