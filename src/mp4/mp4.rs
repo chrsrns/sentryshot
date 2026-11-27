@@ -1891,7 +1891,7 @@ pub struct Tfhd {
 
     // optional
     pub base_data_offset: u64,
-    pub sample_descroption_index: u32,
+    pub sample_description_index: u32,
     pub default_sample_duration: u32,
     pub default_sample_size: u32,
     pub default_sample_flags: u32,
@@ -1950,7 +1950,7 @@ impl ImmutableBoxSync for Tfhd {
             .full_box
             .check_flag(TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT)
         {
-            w.write_all(&self.sample_descroption_index.to_be_bytes())?;
+            w.write_all(&self.sample_description_index.to_be_bytes())?;
         }
         if self
             .full_box
@@ -1983,7 +1983,7 @@ impl ImmutableBoxAsync for Tfhd {
             .full_box
             .check_flag(TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT)
         {
-            w.write_all(&self.sample_descroption_index.to_be_bytes())
+            w.write_all(&self.sample_description_index.to_be_bytes())
                 .await?;
         }
         if self
