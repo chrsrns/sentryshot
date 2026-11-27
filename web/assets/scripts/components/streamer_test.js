@@ -52,6 +52,9 @@ describe("feed", () => {
 		// Only the start-session fetch; play was never reached.
 		expect(fetches.filter((u) => u.includes("start-session")).length).toBe(1);
 		expect(fetches.filter((u) => u.includes("/play")).length).toBe(0);
+		// The fatal gate surfaces an on-tile hint naming the codec family.
+		const hint = feed.elem.querySelector(".js-media-unsupported");
+		expect(hint?.textContent).toContain("hvc1");
 	});
 
 	test("supported codec passes the gate", async () => {
