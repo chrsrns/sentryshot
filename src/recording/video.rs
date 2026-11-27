@@ -194,9 +194,15 @@ where
 // Recording meta file header.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MetaHeader {
+    // Wire format version. New recordings are always written as v2;
+    // v1 recordings are read with codec "avc1".
+    pub version: u8,
     pub start_time: UnixH264,
     pub width: u16,
     pub height: u16,
+    // RFC 6381 codec string, e.g. "avc1.64001E". v1 headers didn't carry
+    // this field and are read as "avc1".
+    pub codec: String,
     pub extra_data: Vec<u8>,
 }
 
@@ -207,6 +213,9 @@ pub enum HeaderFromReaderError {
 
     #[error("unsupported version")]
     UnsupportedVersion,
+
+    #[error("invalid codec")]
+    InvalidCodec,
 
     #[error("read: {0}")]
     Read(#[from] std::io::Error),
@@ -221,9 +230,10 @@ impl MetaHeader {
     ) -> Result<Self, HeaderFromReaderError> {
         let mut api_version = [0];
         r.read_exact(&mut api_version).await?;
-        if api_version[0] == 0 {
+        let version = api_version[0];
+        if version == 0 {
             return Err(HeaderFromReaderError::OldVersion);
-        } else if api_version[0] != 1 {
+        } else if version > 2 {
             return Err(HeaderFromReaderError::UnsupportedVersion);
         }
 
@@ -242,6 +252,20 @@ impl MetaHeader {
         r.read_exact(&mut height).await?;
         let height = u16::from_be_bytes(height);
 
+        // Codec. v1 headers predate the field and are always h264.
+        let codec = if version == 1 {
+            "avc1".to_owned()
+        } else {
+            let mut codec_len = [0];
+            r.read_exact(&mut codec_len).await?;
+            let mut codec = vec![0; codec_len[0].into()];
+            r.read_exact(&mut codec).await?;
+            String::from_utf8(codec)
+                .ok()
+                .filter(|c| !c.is_empty())
+                .ok_or(HeaderFromReaderError::InvalidCodec)?
+        };
+
         // Extra data.
         let mut size_buf = [0; 2];
         r.read_exact(&mut size_buf).await?;
@@ -252,9 +276,11 @@ impl MetaHeader {
         r.read_exact(&mut extra_data).await?;
 
         Ok(MetaHeader {
+            version,
             start_time,
             width,
             height,
+            codec,
             extra_data,
         })
     }
@@ -262,15 +288,19 @@ impl MetaHeader {
     // Marshaled size.
     #[must_use]
     pub fn size(&self) -> usize {
-        15 + self.extra_data.len()
+        // v1: 1 version + 8 start + 2 width + 2 height + 2 extra_len.
+        // v2: v1 + 1 codec_len + codec_len.
+        if self.version == 1 {
+            15 + self.extra_data.len()
+        } else {
+            16 + self.codec.len() + self.extra_data.len()
+        }
     }
 
     pub fn marshal(&self) -> Result<Vec<u8>, std::num::TryFromIntError> {
-        const API_VERSION: u8 = 1;
-
         let mut out = Vec::with_capacity(self.size());
 
-        out.push(API_VERSION);
+        out.push(self.version);
 
         // Start time.
         out.extend_from_slice(&self.start_time.to_be_bytes());
@@ -280,6 +310,13 @@ impl MetaHeader {
 
         // Height.
         out.extend_from_slice(&self.height.to_be_bytes());
+
+        // Codec.
+        if self.version >= 2 {
+            let codec_len = u8::try_from(self.codec.len())?;
+            out.push(codec_len);
+            out.extend_from_slice(self.codec.as_bytes());
+        }
 
         // Extra data.
         let extra_data_size = u16::try_from(self.extra_data.len())?;
@@ -294,6 +331,7 @@ impl MetaHeader {
         TrackParameters {
             width: self.width,
             height: self.height,
+            codec: self.codec.clone(),
             extra_data: self.extra_data.clone(),
         }
     }
@@ -303,6 +341,7 @@ impl MetaHeader {
 pub struct TrackParameters {
     pub width: u16,
     pub height: u16,
+    pub codec: String,
     pub extra_data: Vec<u8>,
 }
 
@@ -322,9 +361,11 @@ mod tests {
         let mut mdat = Vec::new();
 
         let test_header = MetaHeader {
+            version: 2,
             start_time: UnixH264::new(1_000_000_000),
             width: 1920,
             height: 1080,
+            codec: "avc1".to_owned(),
             extra_data: vec![0, 1],
         };
 
@@ -352,10 +393,11 @@ mod tests {
 
         #[rustfmt::skip]
         let want_meta = &[
-            1, // Version.
+            2, // Version.
             0, 0, 0, 0, 0x3b, 0x9a, 0xca, 0, // Start time.
             7, 0x80, // Width.
             4, 0x38, // Height.
+            4, b'a', b'v', b'c', b'1', // Codec.
             0, 2, // Extra data size.
             0, 1, // Extra data.
             //
@@ -407,5 +449,94 @@ mod tests {
         ];
 
         assert_eq!(want_samples, samples.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_meta_header_v2_round_trip() {
+        let header = MetaHeader {
+            version: 2,
+            start_time: UnixH264::new(42),
+            width: 1,
+            height: 2,
+            codec: "hvc1.1.6.L93.B0".to_owned(),
+            extra_data: vec![3, 4, 5],
+        };
+
+        let marshaled = header.marshal().unwrap();
+        let got = MetaHeader::from_reader(&mut Cursor::new(marshaled))
+            .await
+            .unwrap();
+        assert_eq!(header, got);
+    }
+
+    #[tokio::test]
+    async fn test_meta_header_v1_read() {
+        #[rustfmt::skip]
+        let v1 = &[
+            1, // Version.
+            0, 0, 0, 0, 0x3b, 0x9a, 0xca, 0, // Start time.
+            7, 0x80, // Width.
+            4, 0x38, // Height.
+            0, 2, // Extra data size.
+            0, 1, // Extra data.
+        ];
+
+        let got = MetaHeader::from_reader(&mut Cursor::new(v1)).await.unwrap();
+        let want = MetaHeader {
+            version: 1,
+            start_time: UnixH264::new(1_000_000_000),
+            width: 1920,
+            height: 1080,
+            codec: "avc1".to_owned(),
+            extra_data: vec![0, 1],
+        };
+        assert_eq!(want, got);
+    }
+
+    #[tokio::test]
+    async fn test_meta_header_version_errors() {
+        let v0 = &[0_u8; 20];
+        let got = MetaHeader::from_reader(&mut Cursor::new(v0)).await;
+        assert!(matches!(got, Err(HeaderFromReaderError::OldVersion)));
+
+        let v3 = &[3_u8; 20];
+        let got = MetaHeader::from_reader(&mut Cursor::new(v3)).await;
+        assert!(matches!(
+            got,
+            Err(HeaderFromReaderError::UnsupportedVersion)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_meta_header_invalid_codec() {
+        // Non-utf8 codec.
+        let bad_utf8 = &[2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xff, 0, 0];
+        let got = MetaHeader::from_reader(&mut Cursor::new(bad_utf8)).await;
+        assert!(matches!(got, Err(HeaderFromReaderError::InvalidCodec)));
+
+        // Empty codec.
+        let empty = &[2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let got = MetaHeader::from_reader(&mut Cursor::new(empty)).await;
+        assert!(matches!(got, Err(HeaderFromReaderError::InvalidCodec)));
+    }
+
+    #[test]
+    fn test_meta_header_size() {
+        let v1 = MetaHeader {
+            version: 1,
+            start_time: UnixH264::new(0),
+            width: 0,
+            height: 0,
+            codec: "avc1".to_owned(),
+            extra_data: vec![0; 10],
+        };
+        assert_eq!(25, v1.size());
+
+        let v2 = MetaHeader {
+            version: 2,
+            ..v1.clone()
+        };
+        // 15 base + 1 codec_len + 4 codec + 10 extra.
+        assert_eq!(30, v2.size());
     }
 }

@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use common::{
-    TrackParameters, VideoSample,
-    time::UnixH264,
-};
+use common::{TrackParameters, VideoSample, time::UnixH264};
 use mp4::{ImmutableBox, ImmutableBoxSync};
 
 pub fn generate_init(params: &TrackParameters) -> Result<Vec<u8>, mp4::Mp4Error> {
-    mp4::generate_init(params.width, params.height, params.extra_data.clone())
+    mp4::generate_init(
+        params.width,
+        params.height,
+        params.extra_data.clone(),
+        &params.codec,
+    )
 }
 
 pub(crate) fn generate_moof_and_empty_mdat(

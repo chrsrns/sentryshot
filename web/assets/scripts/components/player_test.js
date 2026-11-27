@@ -416,6 +416,26 @@ describe("newPlayer", () => {
 
 		expect(nclicks).toBe(1);
 	});
+
+	test("source selection error shows media-unsupported message", () => {
+		window.HTMLMediaElement.prototype.play = () => {};
+		document.body.innerHTML = "<div></div>";
+		const element = document.querySelector("div");
+		const player = newPlayer(data);
+		element.replaceChildren(player.elem);
+
+		player.testingThumbnail.click();
+		const $source = player.testing().$video.querySelector("source");
+		$source.dispatchEvent(new Event("error"));
+
+		const msg = element.querySelector(".js-media-unsupported");
+		expect(msg).not.toBeNull();
+		expect(msg.textContent).toContain("codec");
+
+		// A repeat error doesn't stack messages.
+		$source.dispatchEvent(new Event("error"));
+		expect(element.querySelectorAll(".js-media-unsupported").length).toBe(1);
+	});
 });
 
 describe("detectionRenderer", () => {

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use crate::ArcMonitorHooks;
+use crate::decoder;
 use common::{
     ArcLogger, ArcMsgLogger, ArcStreamerMuxer, Event, LogEntry, LogLevel, MonitorId, MsgLogger,
     Segment, TrackParameters,
@@ -15,8 +16,7 @@ use sentryshot_convert::{
     ConvertError, Frame, NewConverterError, PixelFormat, PixelFormatConverter,
 };
 use sentryshot_ffmpeg_h264::{
-    DrainError, H264BuilderError, H264DecoderBuilder, Packet, PaddedBytes, ReceiveFrameError,
-    SendPacketError,
+    DrainError, H264BuilderError, Packet, PaddedBytes, ReceiveFrameError, SendPacketError,
 };
 use sentryshot_util::ImageCopyToBufferError;
 use std::{pin::Pin, sync::Arc, task::Poll};
@@ -313,6 +313,7 @@ async fn run_recording(
         c.config.clone(),
         &recording,
         &first_segment,
+        params.codec.clone(),
         muxer.params().extra_data.clone(),
     )
     .await;
@@ -393,9 +394,11 @@ async fn generate_video(
         .ok_or(GenerateVideoError::Add)?;
 
     let header = MetaHeader {
+        version: 2,
         start_time,
         width: params.width,
         height: params.height,
+        codec: params.codec.clone(),
         extra_data: params.extra_data.clone(),
     };
 
@@ -460,7 +463,7 @@ enum GenerateThumbnailError {
     FlushFile(std::io::Error),
 }
 
-// The first h264 frame in firstSegment is wrapped in a mp4
+// The first video frame in firstSegment is wrapped in a mp4
 // container and piped into FFmpeg and then converted to jpeg.
 async fn generate_thumbnail(
     hooks: ArcMonitorHooks,
@@ -468,6 +471,7 @@ async fn generate_thumbnail(
     config: MonitorConfig,
     recording: &RecordingHandle,
     first_segment: &Segment,
+    codec: String,
     extradata: Vec<u8>,
 ) -> Result<(), GenerateThumbnailError> {
     use GenerateThumbnailError::*;
@@ -483,7 +487,7 @@ async fn generate_thumbnail(
 
     let avcc = first_sample.avcc.clone();
     let jpeg_buf = tokio::task::spawn_blocking(move || {
-        avcc_to_jpeg(&hooks, &config, &avcc, PaddedBytes::new(extradata))
+        avcc_to_jpeg(&hooks, &config, &avcc, &codec, PaddedBytes::new(extradata))
     })
     .await
     .expect("join")?;
@@ -502,13 +506,16 @@ async fn generate_thumbnail(
 
 #[derive(Debug, Error)]
 enum AvccToJpegError {
-    #[error("new h264 decoder: {0}")]
-    NewH264Decoder(#[from] H264BuilderError),
+    #[error("new video decoder: {0}")]
+    NewVideoDecoder(#[from] H264BuilderError),
+
+    #[error("unsupported codec: {0}")]
+    UnsupportedCodec(String),
 
     #[error("send avcc packet: {0}")]
     SendPacket(#[from] SendPacketError),
 
-    #[error("drain h264 decoder: {0}")]
+    #[error("drain video decoder: {0}")]
     Drain(#[from] DrainError),
 
     #[error("receive frame: {0}")]
@@ -531,16 +538,22 @@ fn avcc_to_jpeg(
     hooks: &ArcMonitorHooks,
     config: &MonitorConfig,
     avcc: &PaddedBytes,
+    codec: &str,
     extradata: PaddedBytes,
 ) -> Result<Vec<u8>, AvccToJpegError> {
-    let mut decoder = H264DecoderBuilder::new().avcc(extradata)?;
+    let mut decoder = decoder::build_video_decoder(codec, extradata).map_err(|e| match e {
+        decoder::BuildVideoDecoderError::Builder(e) => AvccToJpegError::NewVideoDecoder(e),
+        decoder::BuildVideoDecoderError::UnsupportedCodec(c) => {
+            AvccToJpegError::UnsupportedCodec(c)
+        }
+    })?;
 
     decoder.send_packet(&Packet::new(avcc))?;
 
-    let mut h264_decoder = decoder.drain()?;
+    let mut video_decoder = decoder.drain()?;
 
     let mut frame = Frame::new();
-    h264_decoder.receive_frame(&mut frame)?;
+    video_decoder.receive_frame(&mut frame)?;
 
     let frame = hooks.on_thumb_save(config, frame);
 

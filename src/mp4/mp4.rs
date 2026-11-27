@@ -79,6 +79,9 @@ pub enum Mp4Error {
 
     #[error("from int: {0} {1}")]
     FromInt(String, std::num::TryFromIntError),
+
+    #[error("unsupported codec: {0}")]
+    UnsupportedCodec(String),
 }
 
 // Tree of boxes that can be marshaled together.
@@ -1327,12 +1330,25 @@ impl SampleEntry {
     }
 }
 
-/*********************** avc1 *************************/
+/*********************** sample entry *************************/
 
 pub const TYPE_AVC1: BoxType = *b"avc1";
+pub const TYPE_HVC1: BoxType = *b"hvc1";
+
+// Maps an RFC 6381 codec string to its (sample entry, decoder config) box types.
+pub fn sample_entry_tags(codec: &str) -> Result<(BoxType, BoxType), Mp4Error> {
+    if codec.starts_with("avc") {
+        Ok((TYPE_AVC1, TYPE_AVCC))
+    } else if codec.starts_with("hvc") || codec.starts_with("hev") {
+        Ok((TYPE_HVC1, TYPE_HVCC))
+    } else {
+        Err(Mp4Error::UnsupportedCodec(codec.to_owned()))
+    }
+}
 
 #[derive(Default)]
-pub struct Avc1 {
+pub struct VisualSampleEntry {
+    pub box_type: BoxType,
     pub sample_entry: SampleEntry,
     pub pre_defined: u16,
     pub reserved: u16,
@@ -1347,11 +1363,11 @@ pub struct Avc1 {
     pub depth: u16,
     pub pre_defined3: i16,
 }
-impl_from!(Avc1);
+impl_from!(VisualSampleEntry);
 
-impl ImmutableBox for Avc1 {
+impl ImmutableBox for VisualSampleEntry {
     fn box_type(&self) -> BoxType {
-        TYPE_AVC1
+        self.box_type
     }
 
     fn size(&self) -> usize {
@@ -1359,7 +1375,7 @@ impl ImmutableBox for Avc1 {
     }
 }
 
-impl ImmutableBoxSync for Avc1 {
+impl ImmutableBoxSync for VisualSampleEntry {
     fn marshal(&self, w: &mut dyn Write) -> Result<(), Mp4Error> {
         self.sample_entry.marshal(w)?;
         w.write_all(&self.pre_defined.to_be_bytes())?;
@@ -1381,7 +1397,7 @@ impl ImmutableBoxSync for Avc1 {
 }
 
 #[async_trait]
-impl ImmutableBoxAsync for Avc1 {
+impl ImmutableBoxAsync for VisualSampleEntry {
     async fn marshal(
         &self,
         w: &mut (dyn AsyncWrite + Unpin + Send + Sync),
@@ -1406,6 +1422,7 @@ impl ImmutableBoxAsync for Avc1 {
 }
 
 pub const TYPE_AVCC: BoxType = *b"avcC";
+pub const TYPE_HVCC: BoxType = *b"hvcC";
 
 /*************************** stbl ****************************/
 
@@ -2496,7 +2513,7 @@ pub struct FragmentSample {
 }
 
 /// ftyp + moov(mvhd + trak + mvex) init segment for a single
-/// H264 video track.
+/// video track. The codec selects the sample entry (avc1/hvc1).
 ///
 /// ```text
 /// - ftyp
@@ -2510,7 +2527,9 @@ pub fn generate_init(
     width: u16,
     height: u16,
     extra_data: Vec<u8>,
+    codec: &str,
 ) -> Result<Vec<u8>, Mp4Error> {
+    let (sample_entry, config_box) = sample_entry_tags(codec)?;
     let ftyp = Boxes::new(
         // Ftyp.
         Ftyp {
@@ -2536,7 +2555,7 @@ pub fn generate_init(
             ..Mvhd::default()
         }),
         // Trak.
-        generate_trak(width, height, extra_data),
+        generate_trak(width, height, extra_data, sample_entry, config_box),
         // Mvex.
         Boxes::new(Mvex)
             // Trex.
@@ -2557,7 +2576,13 @@ pub fn generate_init(
 }
 
 #[allow(clippy::too_many_lines)]
-fn generate_trak(width: u16, height: u16, extra_data: Vec<u8>) -> Boxes {
+fn generate_trak(
+    width: u16,
+    height: u16,
+    extra_data: Vec<u8>,
+    sample_entry: BoxType,
+    config_box: BoxType,
+) -> Boxes {
     /*
        trak
        - tkhd
@@ -2587,8 +2612,9 @@ fn generate_trak(width: u16, height: u16, extra_data: Vec<u8>) -> Boxes {
             entry_count: 1,
         })
         .with_child(
-            // Avc1.
-            Boxes::new(Avc1 {
+            // VisualSampleEntry. avc1|hvc1.
+            Boxes::new(VisualSampleEntry {
+                box_type: sample_entry,
                 sample_entry: SampleEntry {
                     reserved: [0, 0, 0, 0, 0, 0],
                     data_reference_index: 1,
@@ -2600,11 +2626,14 @@ fn generate_trak(width: u16, height: u16, extra_data: Vec<u8>) -> Boxes {
                 frame_count: 1,
                 depth: 24,
                 pre_defined3: -1,
-                ..Avc1::default()
+                ..VisualSampleEntry::default()
             })
             .with_children2(
-                // AvcC.
-                Boxes::new(RawAvcC(extra_data)),
+                // Decoder config. avcC|hvcC.
+                Boxes::new(RawParamBox {
+                    box_type: config_box,
+                    payload: extra_data,
+                }),
                 // Btrt.
                 Boxes::new(Btrt {
                     buffer_size_db: 0,
@@ -2686,29 +2715,38 @@ fn generate_trak(width: u16, height: u16, extra_data: Vec<u8>) -> Boxes {
     )
 }
 
-// Raw avcC payload box used inside the trak above.
-struct RawAvcC(Vec<u8>);
+// Raw decoder config payload box (avcC|hvcC) used inside the trak above.
+pub struct RawParamBox {
+    pub box_type: BoxType,
+    pub payload: Vec<u8>,
+}
+impl_from!(RawParamBox);
 
-impl ImmutableBox for RawAvcC {
+impl ImmutableBox for RawParamBox {
     fn box_type(&self) -> BoxType {
-        TYPE_AVCC
+        self.box_type
     }
 
     fn size(&self) -> usize {
-        self.0.len()
+        self.payload.len()
     }
 }
 
-impl ImmutableBoxSync for RawAvcC {
+impl ImmutableBoxSync for RawParamBox {
     fn marshal(&self, w: &mut dyn Write) -> Result<(), Mp4Error> {
-        w.write_all(&self.0)?;
+        w.write_all(&self.payload)?;
         Ok(())
     }
 }
 
-impl From<RawAvcC> for Box<dyn ImmutableBoxSync> {
-    fn from(value: RawAvcC) -> Self {
-        Box::new(value)
+#[async_trait]
+impl ImmutableBoxAsync for RawParamBox {
+    async fn marshal(
+        &self,
+        w: &mut (dyn AsyncWrite + Unpin + Send + Sync),
+    ) -> Result<(), Mp4Error> {
+        w.write_all(&self.payload).await?;
+        Ok(())
     }
 }
 

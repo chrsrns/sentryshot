@@ -260,14 +260,21 @@ pub async fn describe_codec(
 pub struct ProbeOutcome {
     /// SDP video `encoding_name` (`"none"` when the SDP has no video).
     pub codec: String,
-    /// `true` when ≥1 RTP media packet arrived inside the PLAY window.
-    pub live: bool,
+    /// `Some(true)` when ≥1 RTP media packet arrived inside the PLAY
+    /// window, `Some(false)` when the handshake completed yet nothing
+    /// arrived — a proven-dead stream. `None` when SETUP/PLAY was
+    /// protocol-rejected: the verdict is undetermined (a busy,
+    /// session-limited stream is ⊥ dead) and the caller keeps the
+    /// enumeration value.
+    pub live: Option<bool>,
 }
 
 /// `DESCRIBE` then `PLAY`: codec from the SDP, then at most
 /// `play_window` (also bounded by `budget`) awaiting the first RTP
 /// media packet — early-exit on first packet, RTCP ⊥ counts. A stream
-/// answering the full handshake yet sending nothing is `live = false`.
+/// answering the full handshake yet sending nothing is `live =
+/// Some(false)`; a SETUP/PLAY rejection keeps the DESCRIBE codec but
+/// leaves `live` undetermined (`None`).
 pub async fn describe_play_probe(
     url: url::Url,
     creds: &Creds,
@@ -326,8 +333,13 @@ pub async fn describe_play_probe(
     .await
     {
         Ok(Ok(p)) => p,
-        Ok(Err(e)) => return Err(ScanError::Malformed(e.to_string())),
-        Err(_) => return Ok(ProbeOutcome { codec, live: false }),
+        Ok(Err(_)) => return Ok(ProbeOutcome { codec, live: None }),
+        Err(_) => {
+            return Ok(ProbeOutcome {
+                codec,
+                live: Some(false),
+            });
+        }
     };
     let live = tokio::time::timeout(window, async {
         while let Some(item) = futures_lite::StreamExt::next(&mut playing).await {
@@ -341,7 +353,10 @@ pub async fn describe_play_probe(
     })
     .await
     .unwrap_or_default();
-    Ok(ProbeOutcome { codec, live })
+    Ok(ProbeOutcome {
+        codec,
+        live: Some(live),
+    })
 }
 
 #[cfg(test)]
@@ -474,6 +489,53 @@ mod tests {
         url::Url::parse(&format!("rtsp://{}:{}/x", addr.ip(), addr.port())).unwrap()
     }
 
+    /// Rejecting fake: DESCRIBE + SETUP succeed, PLAY answers an error
+    /// status (an in-use stream on a session-limited camera).
+    async fn fake_play_reject_server(sdp: &'static str) -> url::Url {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                loop {
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                    match s.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let req = String::from_utf8_lossy(&buf).into_owned();
+                let cseq = header(&req, "cseq").unwrap_or("0").to_owned();
+                buf.clear();
+                let resp = if req.starts_with("DESCRIBE") {
+                    format!(
+                        "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{sdp}",
+                        sdp.len()
+                    )
+                } else if req.starts_with("SETUP") {
+                    let transport = header(&req, "transport").unwrap_or("");
+                    format!(
+                        "RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nSession: abc123;timeout=60\r\nTransport: {transport}\r\n\r\n"
+                    )
+                } else if req.starts_with("PLAY") {
+                    format!(
+                        "RTSP/1.0 429 Too Many Requests\r\nCSeq: {cseq}\r\nSession: abc123\r\n\r\n"
+                    )
+                } else {
+                    format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nSession: abc123\r\n\r\n")
+                };
+                if s.write_all(resp.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        });
+        url::Url::parse(&format!("rtsp://{}:{}/x", addr.ip(), addr.port())).unwrap()
+    }
+
     #[tokio::test]
     async fn play_probe_alive_when_rtp_flows() {
         let url = fake_play_server(SDP_H264, true).await;
@@ -486,7 +548,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!("h264", out.codec);
-        assert!(out.live);
+        assert_eq!(Some(true), out.live);
     }
 
     #[tokio::test]
@@ -501,7 +563,22 @@ mod tests {
         .await
         .unwrap();
         assert_eq!("h264", out.codec);
-        assert!(!out.live);
+        assert_eq!(Some(false), out.live);
+    }
+
+    #[tokio::test]
+    async fn play_probe_keeps_codec_when_play_rejected() {
+        let url = fake_play_reject_server(SDP_H264).await;
+        let out = describe_play_probe(
+            url,
+            &Creds::default(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!("h264", out.codec);
+        assert_eq!(None, out.live);
     }
 
     #[tokio::test]

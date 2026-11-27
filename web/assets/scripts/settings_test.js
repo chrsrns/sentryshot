@@ -238,24 +238,27 @@ describe("newScanModal", () => {
 		expect(picked.sourcertsp.subStream).toBe("rtsp://10.0.0.9/extra");
 	});
 
-	test("marks non-h264 streams unsupported", async () => {
+	test("marks unsupported-codec streams unsupported", async () => {
 		document.body.replaceChildren();
 		const modal = newScanModal("token");
 
-		await runScan(modal, scanBody("h265"));
+		await runScan(modal, scanBody("mjpeg"));
 
-		expect(modal.elem.textContent).toContain("h265 — unsupported");
+		expect(modal.elem.textContent).toContain("mjpeg — unsupported");
 	});
 
-	test("h264 streams render without unsupported mark", async () => {
-		document.body.replaceChildren();
-		const modal = newScanModal("token");
+	test.each(["h264", "h265"])(
+		"%s streams render without unsupported mark",
+		async (codec) => {
+			document.body.replaceChildren();
+			const modal = newScanModal("token");
 
-		await runScan(modal, scanBody("h264"));
+			await runScan(modal, scanBody(codec));
 
-		expect(modal.elem.textContent).toContain("rtsp://10.0.0.9/main");
-		expect(modal.elem.textContent).not.toContain("unsupported");
-	});
+			expect(modal.elem.textContent).toContain("rtsp://10.0.0.9/main");
+			expect(modal.elem.textContent).not.toContain("unsupported");
+		},
+	);
 
 	test("pick warns when a chosen stream is unsupported", async () => {
 		document.body.replaceChildren();
@@ -270,7 +273,7 @@ describe("newScanModal", () => {
 			picked = p;
 		};
 
-		await runScan(modal, scanBody("h265"));
+		await runScan(modal, scanBody("mjpeg"));
 		const useBtn = [...modal.elem.querySelectorAll("button")].find(
 			(b) => b.textContent.trim() === "Use",
 		);
@@ -280,7 +283,7 @@ describe("newScanModal", () => {
 		expect(picked).toBeUndefined();
 	});
 
-	test("pick applies without warning on h264", async () => {
+	test("pick applies without warning on h265", async () => {
 		document.body.replaceChildren();
 		let confirmCalls = 0;
 		global.confirm = () => {
@@ -293,7 +296,7 @@ describe("newScanModal", () => {
 			picked = p;
 		};
 
-		await runScan(modal, scanBody("h264"));
+		await runScan(modal, scanBody("h265"));
 		const useBtn = [...modal.elem.querySelectorAll("button")].find(
 			(b) => b.textContent.trim() === "Use",
 		);

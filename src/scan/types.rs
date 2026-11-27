@@ -119,7 +119,8 @@ pub struct ScanStream {
 
     /// `false` when the post-dedupe PLAY probe saw zero media inside
     /// its window — a proven-dead stream. `true` when probed alive or
-    /// never probed (DESCRIBE-failed retained, deadline expired).
+    /// the verdict is undetermined (DESCRIBE-failed retained,
+    /// SETUP/PLAY rejected, deadline expired).
     pub live: bool,
 }
 

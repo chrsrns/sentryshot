@@ -243,6 +243,8 @@ function denormalize(input, max) {
  * @property {boolean} hasSubStream
  * @property {string} id
  * @property {string} name
+ * @property {string=} codec RFC 6381 codec of the running main stream, absent while down.
+ * @property {string=} subCodec RFC 6381 codec of the running sub stream, absent while down.
  */
 
 /** @typedef {{[id: string]: MonitorInfo}} MonitorsInfo */

@@ -8,5 +8,6 @@ pub fn generate_init(params: &TrackParameters) -> Result<Bytes, GenerateInitErro
         params.width,
         params.height,
         params.extra_data.clone(),
+        &params.codec,
     )?))
 }

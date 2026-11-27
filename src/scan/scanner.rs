@@ -6,7 +6,7 @@ use crate::{
     ScanError, assemble,
     onvif::{OnvifHttp, enumerate},
     rtsp,
-    types::{Creds, DiscoveredCamera, DiscoveredDevice, ScanRequest, ScanResult},
+    types::{Creds, DiscoveredCamera, DiscoveredDevice, ScanRequest, ScanResult, ScanStream},
     vendor, wsd,
 };
 use std::{
@@ -307,9 +307,11 @@ async fn scan_one(
 
 /// DESCRIBE+PLAY-probe every emitted stream once post-dedupe: fill
 /// codec when still unknown and mark `live = false` when the PLAY
-/// window sees zero media. Enumeration-evidenced URIs stay on probe
-/// failure (codec `"unknown"`, `live` untouched); evidence-less path
-/// candidates were already dropped pre-assembly.
+/// window sees zero media. A SETUP/PLAY rejection yields an
+/// undetermined liveness verdict — codec still fills, `live` keeps
+/// the enumeration value. Enumeration-evidenced URIs stay on
+/// DESCRIBE failure (codec `"unknown"`, `live` untouched);
+/// evidence-less path candidates were already dropped pre-assembly.
 async fn fill_codecs(cam: &mut DiscoveredCamera, creds: &Creds, deadline: Instant) {
     for s in &mut cam.streams {
         if remaining(deadline).is_zero() {
@@ -325,10 +327,19 @@ async fn fill_codecs(cam: &mut DiscoveredCamera, creds: &Creds, deadline: Instan
         else {
             continue;
         };
-        if s.video_codec == "unknown" {
-            s.video_codec = outcome.codec;
-        }
-        s.live = outcome.live;
+        apply_outcome(s, &outcome);
+    }
+}
+
+/// Merge one probe outcome into an emitted stream: codec fills when
+/// still `"unknown"`; `live` only moves on a definitive verdict —
+/// `None` (SETUP/PLAY rejected) leaves enumeration evidence standing.
+fn apply_outcome(s: &mut ScanStream, o: &rtsp::ProbeOutcome) {
+    if s.video_codec == "unknown" {
+        s.video_codec.clone_from(&o.codec);
+    }
+    if let Some(live) = o.live {
+        s.live = live;
     }
 }
 
@@ -501,5 +512,63 @@ mod tests {
         };
         assert!(matches!(r.target(), Err(ScanError::InvalidHost(_))));
         let _: Ipv4Addr = "192.0.2.1".parse().unwrap();
+    }
+
+    fn stream(codec: &str, live: bool) -> ScanStream {
+        ScanStream {
+            profile_name: None,
+            resolution: None,
+            rtsp_url: "rtsp://127.0.0.1:554/x".into(),
+            role: crate::types::ScanRole::Main,
+            auth: None,
+            video_codec: codec.into(),
+            live,
+        }
+    }
+
+    #[test]
+    fn apply_outcome_fills_codec_and_dead_verdict() {
+        let mut s = stream("unknown", true);
+        apply_outcome(
+            &mut s,
+            &rtsp::ProbeOutcome {
+                codec: "h264".into(),
+                live: Some(false),
+            },
+        );
+        assert_eq!("h264", s.video_codec);
+        assert!(!s.live);
+    }
+
+    #[test]
+    fn apply_outcome_keeps_live_when_verdict_undetermined() {
+        // PLAY-rejected (e.g. 429 on an in-use stream): codec still
+        // fills, enumeration's `live` stands.
+        for prior in [true, false] {
+            let mut s = stream("unknown", prior);
+            apply_outcome(
+                &mut s,
+                &rtsp::ProbeOutcome {
+                    codec: "h264".into(),
+                    live: None,
+                },
+            );
+            assert_eq!("h264", s.video_codec);
+            assert_eq!(prior, s.live);
+        }
+    }
+
+    #[test]
+    fn apply_outcome_does_not_overwrite_known_codec() {
+        let mut s = stream("h265", true);
+        apply_outcome(
+            &mut s,
+            &rtsp::ProbeOutcome {
+                codec: "h264".into(),
+                live: Some(true),
+            },
+        );
+        assert_eq!("h265", s.video_codec);
+        assert!(s.live);
     }
 }

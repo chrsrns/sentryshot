@@ -320,7 +320,8 @@ use test_case::test_case;
         ]; "mvhd: version 1"
     )]
 #[test_case(
-        Avc1{
+        VisualSampleEntry{
+            box_type: TYPE_AVC1,
             sample_entry: SampleEntry{
                 reserved: [0; 6],
                 data_reference_index: 0x1234,
@@ -359,7 +360,50 @@ use test_case::test_case;
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // compressor_name
             0x01, 0x05, // depth
             0x03, 0xe9, // pre_defined3
-        ]; "Avc1"
+        ]; "VisualSampleEntry: avc1"
+    )]
+#[test_case(
+        VisualSampleEntry{
+            box_type: TYPE_HVC1,
+            sample_entry: SampleEntry{
+                reserved: [0; 6],
+                data_reference_index: 0x1234,
+            },
+            pre_defined: 0x0101,
+            pre_defined2: [0x0100_0001, 0x0100_0002, 0x0100_0003],
+            reserved: 0,
+            width: 0x0102,
+            height: 0x0103,
+            horiz_resolution: 0x0100_0004,
+            vert_resolution: 0x0100_0005,
+            reserved2: 0x0100_0006,
+            frame_count: 0x0104,
+            compressor_name: [8, b'a', b'b', b'e', b'm', b'a', 0x00, b't', b'v',
+                0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
+            depth: 0x0105,
+            pre_defined3: 1001,
+        },
+        &[
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // reserved
+            0x12, 0x34, // data reference index
+            0x01, 0x01, // pre_defined
+            0x00, 0x00, // reserved
+            0x01, 0x00, 0x00, 0x01,
+            0x01, 0x00, 0x00, 0x02,
+            0x01, 0x00, 0x00, 0x03, // pre_defined2
+            0x01, 0x02, // width
+            0x01, 0x03, // height
+            0x01, 0x00, 0x00, 0x04, // horiz_resolution
+            0x01, 0x00, 0x00, 0x05, // vert_resolution
+            0x01, 0x00, 0x00, 0x06, // reserved2
+            0x01, 0x04, // frame_count
+            8, b'a', b'b', b'e', b'm', b'a', 0x00, b't',
+            b'v', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // compressor_name
+            0x01, 0x05, // depth
+            0x03, 0xe9, // pre_defined3
+        ]; "VisualSampleEntry: hvc1"
     )]
 #[test_case(Stbl{}, &[]; "stbl")]
 #[test_case(
@@ -731,7 +775,7 @@ fn test_generate_init() {
         0x58, 0xb6, 0x58, 0x1, 0x0, 0x0,
     ];
 
-    let got = generate_init(650, 450, extra_data).unwrap();
+    let got = generate_init(650, 450, extra_data, "avc1.64001E").unwrap();
 
     let want = vec![
         0, 0, 0, 0x20, b'f', b't', b'y', b'p', //
@@ -885,6 +929,35 @@ fn test_generate_init() {
         0, 0, 0, 0, // Default sample flags.
     ];
     assert_eq!(want, got);
+}
+
+// hvc1 init differs from avc1 only in the two fourccs.
+#[test_case("hvc1.1.6.L93.B0"; "hvc1 codec")]
+#[test_case("hev1.1.6.L93.B0"; "hev1 codec")]
+fn test_generate_init_hvc1(codec: &str) {
+    let extra_data = vec![
+        0x1, 0x64, 0x0, 0x16, 0x3, 0x1, 0x0, 0x1b, 0x67, 0x64, 0x0, 0x16, 0xac, 0xd9, 0x40, 0xa4,
+        0x3b, 0xe4, 0x88, 0xc0, 0x44, 0x0, 0x0, 0x3, 0x0, 0x4, 0x0, 0x0, 0x3, 0x0, 0x60, 0x3c,
+        0x58, 0xb6, 0x58, 0x1, 0x0, 0x0,
+    ];
+
+    let avc1 = generate_init(650, 450, extra_data.clone(), "avc1").unwrap();
+    let hvc1 = generate_init(650, 450, extra_data, codec).unwrap();
+
+    let mut want = avc1;
+    let find = |hay: &[u8], n: &[u8]| hay.windows(n.len()).position(|w| w == n).unwrap();
+    let entry_i = find(&want, b"avc1");
+    let config_i = find(&want, b"avcC");
+    want[entry_i..entry_i + 4].copy_from_slice(b"hvc1");
+    want[config_i..config_i + 4].copy_from_slice(b"hvcC");
+
+    assert_eq!(want, hvc1);
+}
+
+#[test]
+fn test_generate_init_unsupported_codec() {
+    let got = generate_init(650, 450, Vec::new(), "mjpeg");
+    assert!(matches!(got, Err(Mp4Error::UnsupportedCodec(_))));
 }
 
 #[test]

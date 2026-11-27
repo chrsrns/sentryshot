@@ -217,6 +217,9 @@ pub enum GenerateTrakError {
 
     #[error("stsz size: {0} {1}")]
     StszLen(usize, TryFromIntError),
+
+    #[error("mp4: {0}")]
+    Mp4(#[from] Mp4Error),
 }
 
 impl Mp4Muxer {
@@ -300,7 +303,7 @@ impl Mp4Muxer {
 
         let stbl = mp4::BoxesAsync::new(mp4::Stbl {}).with_children7(
             // Stsd.
-            generate_stsd(params),
+            generate_stsd(params)?,
             // Stts.
             mp4::BoxesAsync::new(mp4::Stts {
                 full_box: mp4::FullBox::default(),
@@ -366,20 +369,22 @@ impl Mp4Muxer {
 }
 
 #[allow(clippy::let_and_return)]
-fn generate_stsd(params: &TrackParameters) -> mp4::BoxesAsync {
+fn generate_stsd(params: &TrackParameters) -> Result<mp4::BoxesAsync, Mp4Error> {
     /*
        - stsd
-         - avc1
-           - avcC
+         - avc1|hvc1
+           - avcC|hvcC
     */
+    let (sample_entry, config_box) = mp4::sample_entry_tags(&params.codec)?;
 
     let stsd = mp4::BoxesAsync::new(mp4::Stsd {
         full_box: mp4::FullBox::default(),
         entry_count: 1,
     })
     .with_child(
-        // Avc1.
-        mp4::BoxesAsync::new(mp4::Avc1 {
+        // VisualSampleEntry.
+        mp4::BoxesAsync::new(mp4::VisualSampleEntry {
+            box_type: sample_entry,
             sample_entry: mp4::SampleEntry {
                 data_reference_index: 1,
                 ..Default::default()
@@ -394,40 +399,15 @@ fn generate_stsd(params: &TrackParameters) -> mp4::BoxesAsync {
             ..Default::default()
         })
         .with_child(
-            // AvcC.
-            mp4::BoxesAsync::new(MyAvcC(params.extra_data.clone())),
+            // Decoder config.
+            mp4::BoxesAsync::new(mp4::RawParamBox {
+                box_type: config_box,
+                payload: params.extra_data.clone(),
+            }),
         ),
     );
 
-    stsd
-}
-
-struct MyAvcC(Vec<u8>);
-
-impl ImmutableBox for MyAvcC {
-    fn box_type(&self) -> mp4::BoxType {
-        mp4::TYPE_AVCC
-    }
-
-    fn size(&self) -> usize {
-        self.0.len()
-    }
-}
-#[async_trait]
-impl ImmutableBoxAsync for MyAvcC {
-    async fn marshal(
-        &self,
-        w: &mut (dyn AsyncWrite + Unpin + Send + Sync),
-    ) -> Result<(), Mp4Error> {
-        w.write_all(&self.0).await?;
-        Ok(())
-    }
-}
-
-impl From<MyAvcC> for Box<dyn ImmutableBoxAsync> {
-    fn from(value: MyAvcC) -> Self {
-        Box::new(value)
-    }
+    Ok(stsd)
 }
 
 pub struct MyStco {
@@ -481,10 +461,33 @@ mod tests {
     use pretty_hex::pretty_hex;
     use std::io::Cursor;
 
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn test_generate_mp4() {
-        let samples = [
+    fn test_params(codec: &str) -> TrackParameters {
+        TrackParameters {
+            width: 650,
+            height: 450,
+            codec: codec.to_owned(),
+            extra_data: vec![
+                1,    // Configuration version.
+                0x64, // Profile.
+                0,    // Profile compatibility.
+                0x16, // Level.
+                3,    // Reserved, Length size minus one.
+                1,    // Reserved, N sequence parameters.
+                0, 0x1b, // Length 27.
+                0x67, 0x64, 0, 0x16, 0xac, // Parameter set.
+                0xd9, 0x40, 0xa4, 0x3b, 0xe4, //
+                0x88, 0xc0, 0x44, 0, 0, //
+                3, 0, 4, 0, 0, //
+                3, 0, 0x60, 0x3c, 0x58, //
+                0xb6, 0x58, //
+                1,    // Reserved N sequence parameters.
+                0, 0, // Length.
+            ],
+        }
+    }
+
+    fn test_samples() -> [Sample; 3] {
+        [
             Sample {
                 // VideoSample3. B-Frame.
                 random_access_present: false,
@@ -512,31 +515,15 @@ mod tests {
                 data_size: 2,
                 data_offset: 0,
             },
-        ];
+        ]
+    }
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn test_generate_mp4() {
+        let samples = test_samples();
+        let params = test_params("avc1");
         let mut buf = Cursor::new(Vec::new());
-
-        let params = TrackParameters {
-            width: 650,
-            height: 450,
-            extra_data: vec![
-                1,    // Configuration version.
-                0x64, // Profile.
-                0,    // Profile compatibility.
-                0x16, // Level.
-                3,    // Reserved, Length size minus one.
-                1,    // Reserved, N sequence parameters.
-                0, 0x1b, // Length 27.
-                0x67, 0x64, 0, 0x16, 0xac, // Parameter set.
-                0xd9, 0x40, 0xa4, 0x3b, 0xe4, //
-                0x88, 0xc0, 0x44, 0, 0, //
-                3, 0, 4, 0, 0, //
-                3, 0, 0x60, 0x3c, 0x58, //
-                0xb6, 0x58, //
-                1,    // Reserved N sequence parameters.
-                0, 0, // Length.
-            ],
-        };
 
         let start_time = UnixH264::new(1);
         let mdat_size = generate_mp4(&mut buf, start_time, samples.iter(), &params)
@@ -699,5 +686,55 @@ mod tests {
         ];
 
         assert_eq!(pretty_hex(&want), pretty_hex(&buf.into_inner()));
+    }
+
+    // hvc1 output differs from avc1 only in the two fourccs.
+    #[tokio::test]
+    async fn test_generate_mp4_hvc1() {
+        let samples = test_samples();
+        let start_time = UnixH264::new(1);
+
+        let mut avc1 = Cursor::new(Vec::new());
+        generate_mp4(&mut avc1, start_time, samples.iter(), &test_params("avc1"))
+            .await
+            .unwrap();
+
+        let mut hvc1 = Cursor::new(Vec::new());
+        generate_mp4(
+            &mut hvc1,
+            start_time,
+            samples.iter(),
+            &test_params("hvc1.1.6.L93.B0"),
+        )
+        .await
+        .unwrap();
+
+        let mut want = avc1.into_inner();
+        let find = |hay: &[u8], n: &[u8]| hay.windows(n.len()).position(|w| w == n).unwrap();
+        let entry_i = find(&want, b"avc1");
+        let config_i = find(&want, b"avcC");
+        want[entry_i..entry_i + 4].copy_from_slice(b"hvc1");
+        want[config_i..config_i + 4].copy_from_slice(b"hvcC");
+
+        assert_eq!(pretty_hex(&want), pretty_hex(&hvc1.into_inner()));
+    }
+
+    #[tokio::test]
+    async fn test_generate_mp4_unsupported_codec() {
+        let samples = test_samples();
+        let mut buf = Cursor::new(Vec::new());
+        let got = generate_mp4(
+            &mut buf,
+            UnixH264::new(1),
+            samples.iter(),
+            &test_params("mjpeg"),
+        )
+        .await;
+        assert!(matches!(
+            got,
+            Err(GenerateMp4Error::GenerateTrak(GenerateTrakError::Mp4(
+                Mp4Error::UnsupportedCodec(_)
+            )))
+        ));
     }
 }
