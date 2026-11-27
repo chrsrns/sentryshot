@@ -405,7 +405,7 @@ impl FullBox {
 }
 
 fn parse_fullbox_flags(flags: [u8; 3]) -> u32 {
-    (u32::from(flags[0]) << 16) ^ (u32::from(flags[1]) << 8) ^ (u32::from(flags[2]))
+    (u32::from(flags[0]) << 16) | (u32::from(flags[1]) << 8) | u32::from(flags[2])
 }
 
 fn check_fullbox_flag(flags: [u8; 3], flag: u32) -> bool {
