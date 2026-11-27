@@ -1,4 +1,8 @@
 [workspace]
+# Plugin list — keep in sync with make::PLUGINS, the [profile.release.package.*]
+# strip blocks below, and [[plugin]] entries in src/env/default_config.tpl.
+# default_config.tpl intentionally omits object_detection_tflite: it is a
+# backend dylib loaded by object_detection, not a loadable plugin.
 members = [
 	"plugins/auth_basic",
 	"plugins/auth_none",
@@ -104,6 +108,8 @@ similar_names = "allow"
 
 
 # Strip plugins to reduce size.
+# Plugin list — keep in sync with workspace members above, make::PLUGINS,
+# and [[plugin]] entries in src/env/default_config.tpl.
 [profile.release.package.auth_basic]
 strip = true
 [profile.release.package.auth_none]

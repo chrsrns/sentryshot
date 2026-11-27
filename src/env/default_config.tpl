@@ -23,6 +23,11 @@ debug_log_stdout = false
 
 # Authentication. One must be enabled.
 
+# Plugin list — keep in sync with workspace members, the
+# [profile.release.package.*] strip blocks in the root Cargo.toml, and
+# make::PLUGINS. object_detection_tflite is intentionally absent: it is a
+# backend dylib loaded by object_detection, not a loadable plugin.
+
 # Basic Auth.
 [[plugin]]
 name = "auth_basic"
