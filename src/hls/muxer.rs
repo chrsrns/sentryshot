@@ -121,11 +121,6 @@ impl HlsMuxer {
         self.playlist.file(name, query).await
     }
 
-    // Blocks until a new segment has been finalized.
-    /*async fn wait_for_seg_finalized(&self) {
-        self.playlist.wait_for_seg_finalized().await
-    }*/
-
     #[cfg(test)]
     pub async fn playlist_state(&self) -> crate::playlist::PlaylistDebugState {
         self.playlist.debug_state().await

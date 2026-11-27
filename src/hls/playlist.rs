@@ -106,7 +106,6 @@ impl Playlist {
 
             playlists_on_hold: Vec::new(),
             parts_on_hold: Vec::new(),
-            seg_final_on_hold: Vec::new(),
             next_segments_on_hold: Vec::new(),
         }));
 
@@ -457,7 +456,6 @@ struct PlaylistState {
 
     playlists_on_hold: Vec<BlockingPlaylistRequest>,
     parts_on_hold: Vec<BlockingPartRequest>,
-    seg_final_on_hold: Vec<oneshot::Sender<()>>,
     next_segments_on_hold: Vec<NextSegmentRequest>,
 }
 
@@ -611,10 +609,6 @@ impl PlaylistState {
             self.segment_delete_count += 1;
         }
 
-        for done in self.seg_final_on_hold.drain(..) {
-            done.send(()).expect("sender should still be alive");
-        }
-
         /*
         self.nextSegmentsOnHold
         .drain_filter(|req| segment.id > req.prevID)
@@ -705,12 +699,6 @@ impl PlaylistState {
 
             match sog {
                 SegmentOrGap::Segment(seg) => {
-                    /*if (self.segments.len() - i) <= 2 {
-                        cnt += "#EXT-X-PROGRAM-DATE-TIME:"
-                            + seg.StartTime.Format("2006-01-02T15:04:05.999Z07:00")
-                            + "\n"
-                    }*/
-
                     if (self.segments.len() - i) <= 2 {
                         for part in seg.parts() {
                             cnt += &format!(
@@ -822,7 +810,6 @@ stream.m3u8
             next_part_id: 0,
             playlists_on_hold: Vec::new(),
             parts_on_hold: Vec::new(),
-            seg_final_on_hold: Vec::new(),
             next_segments_on_hold: Vec::new(),
         }
     }

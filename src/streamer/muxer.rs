@@ -403,8 +403,6 @@ pub struct PlayRequest {
 #[derive(Debug)]
 pub enum PlayReponse {
     Ready(Result<Vec<u8>, GenerateMoofError>),
-    NotReady,
-    NotImplemented(String),
     FramesExpired,
     SessionNotExist,
     SessionAlreadyLocked,
