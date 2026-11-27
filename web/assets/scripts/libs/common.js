@@ -205,15 +205,19 @@ function denormalize(input, max) {
 	return Math.round((input * max) / 1000000);
 }
 
+// Injected by templater.rs get_data() into window.uiData on every page.
+// currentPage carries the page name. monitors is only present for
+// admins; timeOfOldestRecording only when recordings exist.
 /**
  * @typedef UiData
+ * @property {string} currentPage
  * @property {string} csrfToken
  * @property {Flags} flags
  * @property {boolean} isAdmin
  * @property {string} tz
  * @property {string[]} logSources
  * @property {MonitorGroups} monitorGroups
- * @property {{[x: string]: any}} monitors
+ * @property {{[x: string]: any}=} monitors
  * @property {MonitorsInfo} monitorsInfo
  * @property {number=} timeOfOldestRecording
  */
