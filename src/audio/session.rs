@@ -771,11 +771,13 @@ impl LazyV380 {
         }
     }
 
-    /// Fresh-conn claim — `1167` login then `377` talk-open with
-    /// the new ticket (V282). `Ok(conn)` = `477`+`1001`.
+    /// Two-conn claim — `1167` on a login conn, `377` on a SECOND
+    /// conn authenticated by the login's `authTicket`; the login
+    /// conn drops post-`477`. A same-conn `1167`+`377` gets the
+    /// conn closed live (V282). `Ok(conn)` = `477`+`1001`.
     async fn claim(claim: &V380Claim) -> Result<crate::v380::V380Conn, Error> {
-        let mut conn = crate::v380::V380Conn::connect(&claim.host).await?;
-        let resp = conn
+        let mut login_conn = crate::v380::V380Conn::connect(&claim.host).await?;
+        let resp = login_conn
             .login(claim.device_id, &claim.user, &claim.pass)
             .await?;
         if resp.result != crate::v380::login_result::OK {
@@ -784,6 +786,7 @@ impl LazyV380 {
                 resp.result
             )));
         }
+        let mut conn = crate::v380::V380Conn::connect(&claim.host).await?;
         let result = conn
             .talk_open(claim.device_id, resp.ticket, claim.channel)
             .await?;
@@ -3192,56 +3195,66 @@ mod tests {
                 let kill = kill2.clone();
                 tokio::spawn(async move {
                     let (mut rd, mut wr) = stream.into_split();
-                    // Dialect sniff — non-`1167` heads (a VIGI probe
-                    // on the same port) close instantly, ⊥ stall.
+                    // Dialect sniff — the head picks the conn role:
+                    // `1167` ⇒ login conn (a second packet on it =
+                    // a same-conn media cmd ⇒ close, the live
+                    // posture); `377` ⇒ the cross-conn talk conn;
+                    // anything else (VIGI probe) closes instantly.
                     let mut head = [0_u8; 4];
                     if rd.read_exact(&mut head).await.is_err() {
                         return;
                     }
-                    if u32::from_le_bytes(head) != 1167 {
-                        return;
-                    }
-                    let mut pkt = [0_u8; 256];
-                    pkt[0..4].copy_from_slice(&head);
-                    if rd.read_exact(&mut pkt[4..]).await.is_err() {
-                        return;
-                    }
-                    if wr.write_all(&v380_reply(1001, 3, 1, 1)).await.is_err() {
-                        return;
-                    }
-                    // `377` handshake — 85 B, channel u32@12.
-                    let mut h = [0_u8; 85];
-                    if rd.read_exact(&mut h).await.is_err() {
-                        _ = closed_tx.send(idx).await;
-                        return;
-                    }
-                    assert_eq!(u32::from_le_bytes(h[0..4].try_into().unwrap()), 377);
-                    let mut r = [0_u8; 8];
-                    r[0..4].copy_from_slice(&477_u32.to_le_bytes());
-                    r[4..8].copy_from_slice(&talk_result.to_le_bytes());
-                    if wr.write_all(&r).await.is_err() {
-                        return;
-                    }
-                    if talk_result != 1001 {
-                        return; // refused claim — the conn dies
-                    }
-                    let mut f = [0_u8; 272];
-                    loop {
-                        tokio::select! {
-                            n = rd.read_exact(&mut f) => {
-                                if n.is_err() {
-                                    _ = closed_tx.send(idx).await;
-                                    return;
-                                }
-                                if frames_tx.send(f.to_vec()).await.is_err() {
-                                    return;
-                                }
+                    match u32::from_le_bytes(head) {
+                        1167 => {
+                            let mut pkt = [0_u8; 256];
+                            pkt[0..4].copy_from_slice(&head);
+                            if rd.read_exact(&mut pkt[4..]).await.is_err() {
+                                return;
                             }
-                            () = kill.notified() => {
+                            if wr.write_all(&v380_reply(1001, 3, 1, 1)).await.is_err() {
+                                return;
+                            }
+                            // Any further packet on the login conn ⇒
+                            // same-conn media cmd ⇒ close (live rule).
+                            let mut one = [0_u8; 1];
+                            _ = rd.read_exact(&mut one).await;
+                        }
+                        377 => {
+                            // `377` handshake — 85 B, channel u32@12.
+                            let mut rest = [0_u8; 81];
+                            if rd.read_exact(&mut rest).await.is_err() {
                                 _ = closed_tx.send(idx).await;
                                 return;
                             }
+                            let mut r = [0_u8; 8];
+                            r[0..4].copy_from_slice(&477_u32.to_le_bytes());
+                            r[4..8].copy_from_slice(&talk_result.to_le_bytes());
+                            if wr.write_all(&r).await.is_err() {
+                                return;
+                            }
+                            if talk_result != 1001 {
+                                return; // refused claim — the conn dies
+                            }
+                            let mut f = [0_u8; 272];
+                            loop {
+                                tokio::select! {
+                                    n = rd.read_exact(&mut f) => {
+                                        if n.is_err() {
+                                            _ = closed_tx.send(idx).await;
+                                            return;
+                                        }
+                                        if frames_tx.send(f.to_vec()).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    () = kill.notified() => {
+                                        _ = closed_tx.send(idx).await;
+                                        return;
+                                    }
+                                }
+                            }
                         }
+                        _ => {}
                     }
                 });
             }
@@ -3270,8 +3283,9 @@ mod tests {
         // Unclaimed ⇒ ⊥ sends (V282 lazy posture).
         assert!(sess.talk(&[0_i16; 160]).await.is_err());
         assert!(matches!(sess.claim_talk().await, TalkClaim::Ready));
-        // Fresh conn for the claim — the probe was conn 0.
-        assert_eq!(v.conns.load(std::sync::atomic::Ordering::Relaxed), 2);
+        // Two fresh conns for the claim (login + talk) — the probe
+        // was conn 0.
+        assert_eq!(v.conns.load(std::sync::atomic::Ordering::Relaxed), 3);
         // >505 samples ⇒ one `180` per drain; 3 blocks expected.
         for _ in 0..10 {
             sess.talk(&[1000_i16; 160]).await.unwrap();
@@ -3357,10 +3371,11 @@ mod tests {
         let sess = client.open(true).await.unwrap();
         assert!(matches!(sess.claim_talk().await, TalkClaim::Ready));
         sess.release_talk().await;
-        // The talk conn (idx 1 — the probe was 0) EOFs server-side.
+        // The talk conn (idx 2 — probe 0, claim login 1) EOFs
+        // server-side.
         let saw_close = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                if v.closed.recv().await == Some(1) {
+                if v.closed.recv().await == Some(2) {
                     return true;
                 }
             }
@@ -3370,7 +3385,7 @@ mod tests {
         assert!(saw_close, "release must close the claim conn");
         assert!(sess.talk(&[0_i16; 160]).await.is_err());
         assert!(matches!(sess.claim_talk().await, TalkClaim::Ready));
-        assert_eq!(v.conns.load(std::sync::atomic::Ordering::Relaxed), 3);
+        assert_eq!(v.conns.load(std::sync::atomic::Ordering::Relaxed), 5);
         drop(v);
         sess.close().await;
     }
@@ -3908,13 +3923,12 @@ mod tests {
             pkt[4..8].copy_from_slice(&dev.to_le_bytes());
             pkt[8..12].copy_from_slice(&resp.ticket.to_le_bytes());
             pkt[12..16].copy_from_slice(&ch.to_le_bytes());
-            conn.write_all(&pkt).await.map_err(|e| format!("write {e}"))?;
+            conn.write_all(&pkt)
+                .await
+                .map_err(|e| format!("write {e}"))?;
             let mut raw = [0_u8; 128];
-            let n = match tokio::time::timeout(
-                Duration::from_secs(3),
-                conn.read_some(&mut raw),
-            )
-            .await
+            let n = match tokio::time::timeout(Duration::from_secs(3), conn.read_some(&mut raw))
+                .await
             {
                 Ok(Ok(n)) => n,
                 other => return Err(format!("read {other:?}")),
@@ -3929,29 +3943,38 @@ mod tests {
             Ok(conn)
         }
 
-        // (a) claim → drop → immediate re-claims.
-        let a = talk_claim(&host, device_id, &user, &pass, channel).await;
-        eprintln!("claim A: {}", a.as_ref().map(|_| "1001".to_owned()).unwrap_or_else(|e| e.clone()));
-        drop(a);
-        for i in 0..8 {
-            let b = talk_claim(&host, device_id, &user, &pass, channel).await;
+        // (a) REAL `LazyV380::claim` (two-conn) — repeated cycles.
+        let claim_cfg = V380Claim {
+            host: host.clone(),
+            device_id,
+            user: user.clone(),
+            pass: pass.clone(),
+            channel,
+            version: 3,
+        };
+        for i in 0..4 {
+            let c = LazyV380::claim(&claim_cfg).await;
             eprintln!(
-                "re-claim #{i} (t+{i}s): {}",
-                b.as_ref().map(|_| "1001".to_owned()).unwrap_or_else(|e| e.clone())
+                "LazyV380::claim #{i}: {}",
+                c.as_ref()
+                    .map(|_| "1001".to_owned())
+                    .unwrap_or_else(|e| format!("{e}"))
             );
-            if b.is_ok() {
-                break;
-            }
-            drop(b);
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            drop(c);
         }
 
         // (b) listen stream conn open ⇒ talk claim outcome.
         let mut login_conn = crate::v380::V380Conn::connect(&host).await.unwrap();
-        let resp = login_conn
-            .login(device_id, &user, &pass)
-            .await
-            .unwrap();
+        let resp = login_conn.login(device_id, &user, &pass).await.unwrap();
+        eprintln!(
+            "1168: version={} n_channels={} n_audio_pri={} n_speaker={} rec_dev_id={} domain={:?}",
+            resp.version,
+            resp.n_channels,
+            resp.n_audio_pri,
+            resp.n_speaker,
+            resp.rec_dev_id,
+            resp.domain,
+        );
         let mut stream = crate::v380::V380Conn::connect(&host).await.unwrap();
         let (r, ver) = stream
             .stream_open(device_id, resp.ticket, channel, resp.version)
@@ -3959,13 +3982,84 @@ mod tests {
             .unwrap();
         eprintln!("stream_open: result={r} comms_ver={ver}");
         stream.stream_start().await.unwrap();
+        let (mut rd, mut wr) = stream.into_split();
+
+        // Audio ON + 3 s of fragments — is the camera streaming?
+        wr.keepalive_stream(channel, true).await.unwrap();
+        let mut type_counts = std::collections::HashMap::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            tokio::select! {
+                f = rd.next_fragment() => {
+                    match f {
+                        Ok(frag) => *type_counts.entry(frag.type_).or_insert(0) += 1,
+                        Err(e) => { eprintln!("frag err: {e}"); break; }
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+        eprintln!("fragment types seen: {type_counts:?}");
+
         let c = talk_claim(&host, device_id, &user, &pass, channel).await;
         eprintln!(
             "claim while 301-conn open: {}",
-            c.as_ref().map(|_| "1001".to_owned()).unwrap_or_else(|e| e.clone())
+            c.as_ref()
+                .map(|_| "1001".to_owned())
+                .unwrap_or_else(|e| e.clone())
         );
         drop(c);
-        drop(stream);
+
+        // Cross-conn `377` — a THIRD conn riding the stream-login
+        // conn's ticket (the `301` split-conn pattern).
+        let mut conn3 = crate::v380::V380Conn::connect(&host).await.unwrap();
+        let mut pkt = [0_u8; 85];
+        pkt[0..4].copy_from_slice(&377_u32.to_le_bytes());
+        pkt[4..8].copy_from_slice(&device_id.to_le_bytes());
+        pkt[8..12].copy_from_slice(&resp.ticket.to_le_bytes());
+        pkt[12..16].copy_from_slice(&channel.to_le_bytes());
+        _ = conn3.write_all(&pkt).await;
+        let mut raw = [0_u8; 128];
+        match tokio::time::timeout(Duration::from_secs(3), conn3.read_some(&mut raw)).await {
+            Ok(Ok(n)) => eprintln!("cross-conn 377: n={n} {:02x?}", &raw[..n.min(48)]),
+            other => eprintln!("cross-conn 377: {other:?}"),
+        }
+        if u32::from_le_bytes(raw[0..4].try_into().unwrap()) != 477
+            || i32::from_le_bytes(raw[4..8].try_into().unwrap()) != 1001
+        {
+            panic!("cross-conn 377 not accepted");
+        }
+
+        // Send `180` blocks ~3 s — first WITH the login conn held,
+        // then after dropping it (claim shape the fix will use).
+        let mut enc = crate::v380::ImaEncoder::new();
+        let pcm = [0_i16; 505];
+        for i in 0..12 {
+            if conn3
+                .send_talk_block(&enc.encode_block(&pcm), i)
+                .await
+                .is_err()
+            {
+                eprintln!("180 send #{i} failed (login conn held)");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(63)).await;
+        }
         drop(login_conn);
+        for i in 12..24 {
+            if conn3
+                .send_talk_block(&enc.encode_block(&pcm), i)
+                .await
+                .is_err()
+            {
+                eprintln!("180 send #{i} failed (login conn dropped)");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(63)).await;
+        }
+        eprintln!("180 sends done (login conn dropped at block 12)");
+        drop(conn3);
+        drop(wr);
+        drop(rd);
     }
 }
