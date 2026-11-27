@@ -506,9 +506,9 @@ pub enum ParseAccountIdError {
 }
 
 const ACCOUNT_ID_LENGTH: usize = 16;
-const ACCOUNT_ID_CHARSET: [char; 32] = [
-    '2', '3', '4', '5', '6', '5', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'j', 'k',
-    'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+const ACCOUNT_ID_CHARSET: [char; 31] = [
+    '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'j', 'k', 'm',
+    'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
 impl TryFrom<String> for AccountId {
@@ -949,6 +949,14 @@ mod tests {
     fn test_parse_account_id() {
         AccountId::try_from("a222222222222222".to_owned()).unwrap();
         AccountId::try_from("a222222222222221".to_owned()).unwrap_err();
+    }
+
+    #[test]
+    fn test_account_id_charset_unique() {
+        let mut sorted = ACCOUNT_ID_CHARSET.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ACCOUNT_ID_CHARSET.len());
     }
 
     #[test]

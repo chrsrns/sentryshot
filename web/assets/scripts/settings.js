@@ -985,7 +985,7 @@ function newAccount(token, fields) {
 
 /** @param {number} length */
 function randomString(length) {
-	const charSet = "234565789abcdefghjkmnpqrstuvwxyz";
+	const charSet = "23456789abcdefghjkmnpqrstuvwxyz";
 	let output = "";
 	for (let i = 0; i < length; i++) {
 		output += charSet.charAt(Math.floor(Math.random() * charSet.length));
