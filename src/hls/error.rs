@@ -1,6 +1,5 @@
 #![allow(clippy::module_name_repetitions)]
 
-use common::time::{DtsOffset, UnixH264};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -12,34 +11,16 @@ pub enum PartHlsQueryError {
 #[derive(Debug, Error)]
 pub enum GenerateInitError {
     #[error("{0}")]
-    TryFromInt(#[from] std::num::TryFromIntError),
-
-    #[error("{0}")]
     Mp4(#[from] mp4::Mp4Error),
 }
 
 #[derive(Debug, Error)]
 pub enum GeneratePartError {
-    #[error("from int: {0}")]
-    TryFromInt(#[from] std::num::TryFromIntError),
-
-    #[error("generate traf: {0}")]
-    GenerateTraf(#[from] GenerateTrafError),
+    #[error("generate moof: {0}")]
+    GenerateMoof(#[from] mp4::GenerateMoofError),
 
     #[error("mp4: {0}")]
     Mp4(#[from] mp4::Mp4Error),
-}
-
-#[derive(Debug, Error)]
-pub enum GenerateTrafError {
-    #[error("from int: {0} {1}")]
-    TryFromInt(String, std::num::TryFromIntError),
-
-    #[error("dts {0:?} {1:?}")]
-    Dts(UnixH264, DtsOffset),
-
-    #[error("sub")]
-    Sub,
 }
 
 #[derive(Debug, Error)]

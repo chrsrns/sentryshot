@@ -507,7 +507,7 @@ use test_case::test_case;
             },
             track_id: 0x0840_4649,
             base_data_offset: 0,
-            sample_descroption_index: 0,
+            sample_description_index: 0,
             default_sample_duration: 0,
             default_sample_size: 0,
             default_sample_flags: 0,
@@ -530,7 +530,7 @@ use test_case::test_case;
             },
             track_id: 0x0840_4649,
             base_data_offset: 0x0123_4567_89ab_cdef,
-            sample_descroption_index: 0,
+            sample_description_index: 0,
             default_sample_duration: 0x2345_6789,
             default_sample_size: 0,
             default_sample_flags: 0,
@@ -720,4 +720,352 @@ async fn test_box_types<T: Into<Box<dyn ImmutableBoxBoth>>>(src: T, bin: &[u8]) 
     src.marshal_async(&mut buf).await.unwrap();
     assert_eq!({ size }, buf.len());
     assert_eq!(bin, buf);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn test_generate_init() {
+    let extra_data = vec![
+        0x1, 0x64, 0x0, 0x16, 0x3, 0x1, 0x0, 0x1b, 0x67, 0x64, 0x0, 0x16, 0xac, 0xd9, 0x40, 0xa4,
+        0x3b, 0xe4, 0x88, 0xc0, 0x44, 0x0, 0x0, 0x3, 0x0, 0x4, 0x0, 0x0, 0x3, 0x0, 0x60, 0x3c,
+        0x58, 0xb6, 0x58, 0x1, 0x0, 0x0,
+    ];
+
+    let got = generate_init(650, 450, extra_data).unwrap();
+
+    let want = vec![
+        0, 0, 0, 0x20, b'f', b't', b'y', b'p', //
+        b'm', b'p', b'4', b'2', // Major brand.
+        0, 0, 0, 1, // Minor version.
+        b'm', b'p', b'4', b'1', // Compatible brand.
+        b'm', b'p', b'4', b'2', // Compatible brand.
+        b'i', b's', b'o', b'm', // Compatible brand.
+        b'h', b'l', b's', b'f', // Compatible brand.
+        0, 0, 2, 0x89, b'm', b'o', b'o', b'v', //
+        0, 0, 0, 0x6c, b'm', b'v', b'h', b'd', //
+        0, 0, 0, 0, // FullBox.
+        0, 0, 0, 0, // Creation time.
+        0, 0, 0, 0, // Modification time.
+        0, 0, 3, 0xe8, // Time scale.
+        0, 0, 0, 0, // Duration.
+        0, 1, 0, 0, // Rate.
+        1, 0, // Volume.
+        0, 0, // Reserved.
+        0, 0, 0, 0, 0, 0, 0, 0, // Reserved2.
+        0, 1, 0, 0, // 1 Matrix.
+        0, 0, 0, 0, // 2.
+        0, 0, 0, 0, // 3.
+        0, 0, 0, 0, // 4.
+        0, 1, 0, 0, // 5.
+        0, 0, 0, 0, // 6.
+        0, 0, 0, 0, // 7.
+        0, 0, 0, 0, // 8.
+        0x40, 0, 0, 0, // 9.
+        0, 0, 0, 0, // 1 Predefined.
+        0, 0, 0, 0, // 2.
+        0, 0, 0, 0, // 3.
+        0, 0, 0, 0, // 4.
+        0, 0, 0, 0, // 5.
+        0, 0, 0, 0, // 6.
+        0, 0, 0, 2, // Next track ID.
+        0, 0, 1, 0xed, b't', b'r', b'a', b'k', // Video.
+        0, 0, 0, 0x5c, b't', b'k', b'h', b'd', //
+        0, 0, 0, 3, // FullBox.
+        0, 0, 0, 0, // Creation time.
+        0, 0, 0, 0, // Modification time.
+        0, 0, 0, 1, // Track ID.
+        0, 0, 0, 0, // Reserved0.
+        0, 0, 0, 0, // Duration.
+        0, 0, 0, 0, 0, 0, 0, 0, // Reserved1.
+        0, 0, // Layer.
+        0, 0, // Alternate group.
+        0, 0, // Volume.
+        0, 0, // Reserved2.
+        0, 1, 0, 0, // 1 Matrix.
+        0, 0, 0, 0, // 2.
+        0, 0, 0, 0, // 3.
+        0, 0, 0, 0, // 4.
+        0, 1, 0, 0, // 5.
+        0, 0, 0, 0, // 6.
+        0, 0, 0, 0, // 7.
+        0, 0, 0, 0, // 8.
+        0x40, 0, 0, 0, // 9.
+        2, 0x8a, 0, 0, // Width
+        1, 0xc2, 0, 0, // Height
+        0, 0, 1, 0x89, b'm', b'd', b'i', b'a', //
+        0, 0, 0, 0x20, b'm', b'd', b'h', b'd', //
+        0, 0, 0, 0, // FullBox.
+        0, 0, 0, 0, // Creation time.
+        0, 0, 0, 0, // Modification time.
+        0, 1, 0x5f, 0x90, // Time scale.
+        0, 0, 0, 0, // Duration.
+        0x55, 0xc4, // Language.
+        0, 0, // Predefined.
+        0, 0, 0, 0x2d, b'h', b'd', b'l', b'r', //
+        0, 0, 0, 0, // FullBox.
+        0, 0, 0, 0, // Predefined.
+        b'v', b'i', b'd', b'e', // Handler type.
+        0, 0, 0, 0, // Reserved.
+        0, 0, 0, 0, //
+        0, 0, 0, 0, //
+        b'V', b'i', b'd', b'e', b'o', b'H', b'a', b'n', b'd', b'l', b'e', b'r', 0, //
+        0, 0, 1, 0x34, b'm', b'i', b'n', b'f', //
+        0, 0, 0, 0x14, b'v', b'm', b'h', b'd', //
+        0, 0, 0, 1, // FullBox.
+        0, 0, // Graphics mode.
+        0, 0, 0, 0, 0, 0, // OpColor.
+        0, 0, 0, 0x24, b'd', b'i', b'n', b'f', //
+        0, 0, 0, 0x1c, b'd', b'r', b'e', b'f', //
+        0, 0, 0, 0, // FullBox.
+        0, 0, 0, 1, // Entry count.
+        0, 0, 0, 0xc, b'u', b'r', b'l', b' ', //
+        0, 0, 0, 1, // FullBox.
+        0, 0, 0, 0xf4, b's', b't', b'b', b'l', //
+        0, 0, 0, 0xa8, b's', b't', b's', b'd', //
+        0, 0, 0, 0, // FullBox.
+        0, 0, 0, 1, // Entry count.
+        0, 0, 0, 0x98, b'a', b'v', b'c', b'1', //
+        0, 0, 0, 0, 0, 0, // Reserved.
+        0, 1, // Data reference index.
+        0, 0, // Predefined.
+        0, 0, // Reserved.
+        0, 0, 0, 0, // Predefined2.
+        0, 0, 0, 0, 0, 0, 0, 0, 2, 0x8a, // Width.
+        1, 0xc2, // Height.
+        0, 0x48, 0, 0, // Horizresolution
+        0, 0x48, 0, 0, // Vertresolution
+        0, 0, 0, 0, // Reserved2.
+        0, 1, // Frame count.
+        0, 0, 0, 0, 0, 0, 0, 0, // Compressor name.
+        0, 0, 0, 0, 0, 0, 0, 0, //
+        0, 0, 0, 0, 0, 0, 0, 0, //
+        0, 0, 0, 0, 0, 0, 0, 0, //
+        0, 0x18, // Depth.
+        0xff, 0xff, // Predefined3.
+        0, 0, 0, 0x2e, b'a', b'v', b'c', b'C', //
+        1,    // Configuration version.
+        0x64, // Profile.
+        0,    // Profile compatibility.
+        0x16, // Level.
+        3,    // Reserved, Length size minus one.
+        1,    // Reserved, N sequence parameters.
+        0, 0x1b, // Length 27.
+        0x67, 0x64, 0, 0x16, 0xac, // Parameter set.
+        0xd9, 0x40, 0xa4, 0x3b, 0xe4, //
+        0x88, 0xc0, 0x44, 0, 0, //
+        3, 0, 4, 0, 0, //
+        3, 0, 0x60, 0x3c, 0x58, //
+        0xb6, 0x58, //
+        1,    // Reserved N sequence parameters.
+        0, 0, // Length.
+        0, 0, 0, 0x14, b'b', b't', b'r', b't', //
+        0, 0, 0, 0, // Buffer size.
+        0, 0xf, 0x42, 0x40, // Max bitrate.
+        0, 0xf, 0x42, 0x40, // Average bitrate.
+        0, 0, 0, 0x10, b's', b't', b't', b's', //
+        0, 0, 0, 0, // FullBox.
+        0, 0, 0, 0, // Entry count.
+        0, 0, 0, 0x10, b's', b't', b's', b'c', //
+        0, 0, 0, 0, // FullBox.
+        0, 0, 0, 0, // Entry count.
+        0, 0, 0, 0x14, b's', b't', b's', b'z', //
+        0, 0, 0, 0, // FullBox.
+        0, 0, 0, 0, // Sample size.
+        0, 0, 0, 0, // Sample count.
+        0, 0, 0, 0x10, b's', b't', b'c', b'o', //
+        0, 0, 0, 0, // FullBox.
+        0, 0, 0, 0, // Entry count.
+        0, 0, 0, 0x28, b'm', b'v', b'e', b'x', //
+        0, 0, 0, 0x20, b't', b'r', b'e', b'x', //
+        0, 0, 0, 0, // FullBox.
+        0, 0, 0, 1, // Track ID.
+        0, 0, 0, 1, // Default sample description index.
+        0, 0, 0, 0, // Default sample duration.
+        0, 0, 0, 0, // Default sample size.
+        0, 0, 0, 0, // Default sample flags.
+    ];
+    assert_eq!(want, got);
+}
+
+#[test]
+fn test_generate_moof_minimal() {
+    let samples = [FragmentSample {
+        pts: 0,
+        cto: 0,
+        duration: 0,
+        size: 0,
+        non_sync: true,
+    }];
+
+    let got = generate_moof(0, &samples).unwrap();
+
+    let want = vec![
+        0, 0, 0, 0x68, b'm', b'o', b'o', b'f', //
+        0, 0, 0, 0x10, b'm', b'f', b'h', b'd', //
+        0, 0, 0, 0, // FullBox.
+        0, 0, 0, 0, // Sequence number.
+        0, 0, 0, 0x50, b't', b'r', b'a', b'f', //
+        0, 0, 0, 0x10, b't', b'f', b'h', b'd', //
+        0, 2, 0, 0, // Track id.
+        0, 0, 0, 1, // Sample size.
+        0, 0, 0, 0x14, b't', b'f', b'd', b't', //
+        1, 0, 0, 0, // Track id.
+        0, 0, 0, 0, 0, 0, 0, 0, // BaseMediaDecodeTime.
+        0, 0, 0, 0x24, b't', b'r', b'u', b'n', // Video trun.
+        1, 0, 0xf, 1, // FullBox.
+        0, 0, 0, 1, // Sample count.
+        0, 0, 0, 0x70, // Data offset.
+        0, 0, 0, 0, // Entry sample duration.
+        0, 0, 0, 0, // Entry sample size.
+        0, 1, 0, 0, // Entry sample flags.
+        0, 0, 0, 0, // Entry SampleCompositionTimeOffset
+    ];
+    assert_eq!(want, got);
+}
+
+#[test]
+fn test_generate_moof_video_sample() {
+    let samples = [FragmentSample {
+        pts: 0,
+        cto: 0,
+        duration: 0,
+        size: 4,
+        non_sync: true,
+    }];
+
+    let got = generate_moof(0, &samples).unwrap();
+
+    let want = vec![
+        0, 0, 0, 0x68, b'm', b'o', b'o', b'f', //
+        0, 0, 0, 0x10, b'm', b'f', b'h', b'd', //
+        0, 0, 0, 0, // FullBox.
+        0, 0, 0, 0, // Sequence number.
+        0, 0, 0, 0x50, b't', b'r', b'a', b'f', // Video traf.
+        0, 0, 0, 0x10, b't', b'f', b'h', b'd', // Video tfhd.
+        0, 2, 0, 0, // Track id.
+        0, 0, 0, 1, // Sample size.
+        0, 0, 0, 0x14, b't', b'f', b'd', b't', // Video tfdt.
+        1, 0, 0, 0, // Track id.
+        0, 0, 0, 0, 0, 0, 0, 0, // BaseMediaDecodeTime.
+        0, 0, 0, 0x24, b't', b'r', b'u', b'n', // Video trun.
+        1, 0, 0xf, 1, // FullBox.
+        0, 0, 0, 1, // Sample count.
+        0, 0, 0, 0x70, // Data offset.
+        0, 0, 0, 0, // Entry sample duration.
+        0, 0, 0, 4, // Entry sample size.
+        0, 1, 0, 0, // Entry sample flags.
+        0, 0, 0, 0, // Entry SampleCompositionTimeOffset
+    ];
+    assert_eq!(want, got);
+}
+
+#[test]
+fn test_generate_moof_multiple_video_samples() {
+    let samples = [
+        FragmentSample {
+            pts: 0,
+            cto: 0,
+            duration: 0,
+            size: 4,
+            non_sync: false,
+        },
+        FragmentSample {
+            pts: 0,
+            cto: 0,
+            duration: 0,
+            size: 4,
+            non_sync: true,
+        },
+        FragmentSample {
+            pts: 0,
+            cto: 0,
+            duration: 0,
+            size: 4,
+            non_sync: true,
+        },
+    ];
+
+    let got = generate_moof(0, &samples).unwrap();
+
+    let want = vec![
+        0, 0, 0, 0x88, b'm', b'o', b'o', b'f', //
+        0, 0, 0, 0x10, b'm', b'f', b'h', b'd', //
+        0, 0, 0, 0, // FullBox.
+        0, 0, 0, 0, // Sequence number.
+        0, 0, 0, 0x70, b't', b'r', b'a', b'f', // Video traf.
+        0, 0, 0, 0x10, b't', b'f', b'h', b'd', // Video tfhd.
+        0, 2, 0, 0, // Track id.
+        0, 0, 0, 1, // Sample size.
+        0, 0, 0, 0x14, b't', b'f', b'd', b't', // Video tfdt.
+        1, 0, 0, 0, // Track id.
+        0, 0, 0, 0, 0, 0, 0, 0, // BaseMediaDecodeTime.
+        0, 0, 0, 0x44, b't', b'r', b'u', b'n', // Video trun.
+        1, 0, 0xf, 1, // FullBox.
+        0, 0, 0, 3, // Sample count.
+        0, 0, 0, 0x90, // Data offset.
+        0, 0, 0, 0, // Entry1 sample duration.
+        0, 0, 0, 4, // Entry1 sample size.
+        0, 0, 0, 0, // Entry1 sample flags.
+        0, 0, 0, 0, // Entry1 SampleCompositionTimeOffset
+        0, 0, 0, 0, // Entry2 sample duration.
+        0, 0, 0, 4, // Entry2 sample size.
+        0, 1, 0, 0, // Entry2 sample flags.
+        0, 0, 0, 0, // Entry2 SampleCompositionTimeOffset
+        0, 0, 0, 0, // Entry3 sample duration.
+        0, 0, 0, 4, // Entry3 sample size.
+        0, 1, 0, 0, // Entry3 sample flags.
+        0, 0, 0, 0, // Entry3 SampleCompositionTimeOffset
+    ];
+    assert_eq!(want, got);
+}
+
+#[test]
+fn test_generate_moof_minimal_real() {
+    // start_time = 1_000_000_000 seconds at 90 kHz.
+    let start_time = 1_000_000_000 * 90000;
+    let samples = [
+        FragmentSample {
+            pts: start_time + 54000,
+            cto: 54000 - 60000,
+            duration: 11999,
+            size: 4,
+            non_sync: false,
+        },
+        FragmentSample {
+            pts: start_time + 63000,
+            cto: 63000 - 72000,
+            duration: 9000,
+            size: 4,
+            non_sync: true,
+        },
+    ];
+
+    let got = generate_moof(start_time, &samples).unwrap();
+
+    let want = vec![
+        0, 0, 0, 0x78, b'm', b'o', b'o', b'f', //
+        0, 0, 0, 0x10, b'm', b'f', b'h', b'd', //
+        0, 0, 0, 0, // FullBox.
+        0, 0, 0, 0, // Sequence number.
+        0, 0, 0, 0x60, b't', b'r', b'a', b'f', // Video traf.
+        0, 0, 0, 0x10, b't', b'f', b'h', b'd', // Video tfhd.
+        0, 2, 0, 0, // Track id.
+        0, 0, 0, 1, // Sample size.
+        0, 0, 0, 0x14, b't', b'f', b'd', b't', // Video tfdt.
+        1, 0, 0, 0, // Track id.
+        0, 0, 0, 0, 0, 0, 0xea, 0x60, // BaseMediaDecodeTime.
+        0, 0, 0, 0x34, b't', b'r', b'u', b'n', // Video trun.
+        1, 0, 0xf, 1, // FullBox.
+        0, 0, 0, 2, // Sample count.
+        0, 0, 0, 0x80, // Data offset.
+        0, 0, 0x2e, 0xdf, // Entry1 sample duration.
+        0, 0, 0, 4, // Entry1 sample size.
+        0, 0, 0, 0, // Entry1 sample flags.
+        0xff, 0xff, 0xe8, 0x90, // 1 Entry SampleCompositionTimeOffset
+        0, 0, 0x23, 0x28, // 2 Entry sample duration.
+        0, 0, 0, 4, // 2 Entry sample size.
+        0, 1, 0, 0, // 2 Entry sample flags.
+        0xff, 0xff, 0xdc, 0xd8, // Entry2 SampleCompositionTimeOffset
+    ];
+    assert_eq!(want, got);
 }

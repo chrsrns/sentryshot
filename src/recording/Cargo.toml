@@ -15,7 +15,6 @@ doctest = false
 
 [dependencies]
 common.path = "../common"
-hls.path = "../hls"
 mp4.path = "../mp4"
 
 async-trait.workspace = true

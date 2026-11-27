@@ -2110,7 +2110,6 @@ dependencies = [
  "async-trait",
  "axum 0.8.1",
  "common",
- "hls",
  "mp4",
  "pin-project",
  "pretty-hex",

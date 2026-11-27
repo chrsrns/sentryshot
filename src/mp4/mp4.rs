@@ -2467,3 +2467,386 @@ impl ImmutableBoxAsync for Vmhd {
         Ok(())
     }
 }
+
+// H264 elementary stream clock rate: 90 kHz.
+const H264_TIMESCALE: u32 = 90000;
+
+// 14496-12_2015 8.3.2.3
+// track_ID is an integer that uniquely identifies this track
+// over the entire life‐time of this presentation.
+// Track IDs are never re‐used and cannot be zero.
+pub const VIDEO_TRACK_ID: u32 = 1;
+
+/// Primitive per-sample record for [`generate_moof`].
+///
+/// `mp4` has no workspace-crate dependencies, so `common::VideoSample`
+/// cannot be used here; call sites map their samples into this record.
+#[derive(Clone, Debug)]
+pub struct FragmentSample {
+    /// Absolute presentation timestamp in H264 timescale.
+    pub pts: i64,
+    /// Composition time offset (signed; negative is legitimate).
+    pub cto: i32,
+    /// Sample duration in H264 timescale.
+    pub duration: i64,
+    /// Sample payload size in bytes.
+    pub size: usize,
+    /// `!random_access_present`.
+    pub non_sync: bool,
+}
+
+/// ftyp + moov(mvhd + trak + mvex) init segment for a single
+/// H264 video track.
+///
+/// ```text
+/// - ftyp
+/// - moov
+///   - mvhd
+///   - trak (video)
+///   - mvex
+///     - trex (video)
+/// ```
+pub fn generate_init(
+    width: u16,
+    height: u16,
+    extra_data: Vec<u8>,
+) -> Result<Vec<u8>, Mp4Error> {
+    let ftyp = Boxes::new(
+        // Ftyp.
+        Ftyp {
+            major_brand: *b"mp42",
+            minor_version: 1,
+            compatible_brands: vec![
+                CompatibleBrandElem(*b"mp41"),
+                CompatibleBrandElem(*b"mp42"),
+                CompatibleBrandElem(*b"isom"),
+                CompatibleBrandElem(*b"hlsf"),
+            ],
+        },
+    );
+
+    let moov = Boxes::new(Moov).with_children3(
+        // Mvhd.
+        Boxes::new(Mvhd {
+            timescale: 1000,
+            rate: 65536,
+            volume: 256,
+            matrix: [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000],
+            next_track_id: 2,
+            ..Mvhd::default()
+        }),
+        // Trak.
+        generate_trak(width, height, extra_data),
+        // Mvex.
+        Boxes::new(Mvex)
+            // Trex.
+            .with_child(Boxes::new(Trex {
+                track_id: VIDEO_TRACK_ID,
+                default_sample_description_index: 1,
+                ..Trex::default()
+            })),
+    );
+
+    let size = ftyp.size() + moov.size();
+    let mut buf = Vec::with_capacity(size);
+
+    ftyp.marshal(&mut buf)?;
+    moov.marshal(&mut buf)?;
+
+    Ok(buf)
+}
+
+#[allow(clippy::too_many_lines)]
+fn generate_trak(width: u16, height: u16, extra_data: Vec<u8>) -> Boxes {
+    /*
+       trak
+       - tkhd
+       - mdia
+         - mdhd
+         - hdlr
+         - minf
+           - vmhd
+           - dinf
+             - dref
+               - url
+           - stbl
+             - stsd
+               - avc1
+                 - avcC
+                 - btrt
+             - stts
+             - stsc
+             - stsz
+             - stco
+    */
+
+    let stbl = Boxes::new(Stbl).with_children5(
+        // Stds.
+        Boxes::new(Stsd {
+            full_box: FullBox::default(),
+            entry_count: 1,
+        })
+        .with_child(
+            // Avc1.
+            Boxes::new(Avc1 {
+                sample_entry: SampleEntry {
+                    reserved: [0, 0, 0, 0, 0, 0],
+                    data_reference_index: 1,
+                },
+                width,
+                height,
+                horiz_resolution: 4_718_592,
+                vert_resolution: 4_718_592,
+                frame_count: 1,
+                depth: 24,
+                pre_defined3: -1,
+                ..Avc1::default()
+            })
+            .with_children2(
+                // AvcC.
+                Boxes::new(RawAvcC(extra_data)),
+                // Btrt.
+                Boxes::new(Btrt {
+                    buffer_size_db: 0,
+                    max_bitrate: 1_000_000,
+                    avg_bitrate: 1_000_000,
+                }),
+            ),
+        ),
+        // Stts.
+        Boxes::new(Stts::default()),
+        // Stsc.
+        Boxes::new(Stsc::default()),
+        // Stsz.
+        Boxes::new(Stsz::default()),
+        // Stco.
+        Boxes::new(Stco::default()),
+    );
+
+    let minf = Boxes::new(Minf).with_children3(
+        // Vmhd.
+        Boxes::new(Vmhd {
+            full_box: FullBox {
+                version: 0,
+                flags: [0, 0, 1],
+            },
+            graphics_mode: 0,
+            opcolor: [0, 0, 0],
+        }),
+        // Dinf.
+        Boxes::new(Dinf).with_child(
+            // Dref.
+            Boxes::new(Dref {
+                full_box: FullBox::default(),
+                entry_count: 1,
+            })
+            .with_child(Boxes::new(
+                // Url.
+                Url {
+                    full_box: FullBox {
+                        version: 0,
+                        flags: u32_to_flags(URL_NOPT),
+                    },
+                    location: String::new(),
+                },
+            )),
+        ),
+        // Stbl.
+        stbl,
+    );
+
+    // Trak.
+    Boxes::new(Trak {}).with_children2(
+        // Tkhd.
+        Boxes::new(Tkhd {
+            flags: [0, 0, 3],
+            track_id: VIDEO_TRACK_ID,
+            width: u32::from(width) * 65536,
+            height: u32::from(height) * 65536,
+            matrix: [0x0001_0000, 0, 0, 0, 0x0001_0000, 0, 0, 0, 0x4000_0000],
+            ..Tkhd::default()
+        }),
+        // Mdia
+        Boxes::new(Mdia {}).with_children3(
+            // Mdhd.
+            Boxes::new(Mdhd {
+                timescale: H264_TIMESCALE,
+                language: *b"und",
+                ..Mdhd::default()
+            }),
+            // Hdlr
+            Boxes::new(Hdlr {
+                handler_type: *b"vide",
+                name: "VideoHandler".to_owned(),
+                ..Hdlr::default()
+            }),
+            // Minf.
+            minf,
+        ),
+    )
+}
+
+// Raw avcC payload box used inside the trak above.
+struct RawAvcC(Vec<u8>);
+
+impl ImmutableBox for RawAvcC {
+    fn box_type(&self) -> BoxType {
+        TYPE_AVCC
+    }
+
+    fn size(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl ImmutableBoxSync for RawAvcC {
+    fn marshal(&self, w: &mut dyn Write) -> Result<(), Mp4Error> {
+        w.write_all(&self.0)?;
+        Ok(())
+    }
+}
+
+impl From<RawAvcC> for Box<dyn ImmutableBoxSync> {
+    fn from(value: RawAvcC) -> Self {
+        Box::new(value)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum GenerateMoofError {
+    #[error("from int: {0}")]
+    TryFromInt(#[from] std::num::TryFromIntError),
+
+    #[error("generate traf: {0}")]
+    GenerateTraf(#[from] GenerateTrafError),
+
+    #[error("mp4: {0}")]
+    Mp4(#[from] Mp4Error),
+}
+
+/// moof(mfhd + traf(tfhd + tfdt + trun)) for one video fragment,
+/// marshaled to bytes.
+///
+/// The caller appends the mdat box directly after these bytes — its
+/// payload layout deliberately differs between consumers.
+///
+/// ```text
+/// moof
+/// - mfhd
+/// - traf (video)
+///   - tfhd
+///   - tfdt
+///   - trun
+/// (mdat appended by caller)
+/// ```
+pub fn generate_moof(
+    muxer_start_time: i64,
+    samples: &[FragmentSample],
+) -> Result<Vec<u8>, GenerateMoofError> {
+    let mut moof = Boxes::new(Moof {}).with_child(
+        // Mfhd.
+        Boxes::new(Mfhd {
+            full_box: FullBox::default(),
+            sequence_number: 0,
+        }),
+    );
+
+    let mfhd_offset = 24;
+    let video_trun_size = (samples.len() * 16) + 20;
+    let mdat_offset = mfhd_offset + video_trun_size + 44;
+
+    let video_data_offset = i32::try_from(mdat_offset + 8)?;
+    let traf = generate_traf(muxer_start_time, samples, video_data_offset)?;
+
+    moof.children.push(traf);
+
+    let mut buf = Vec::with_capacity(moof.size());
+    moof.marshal(&mut buf)?;
+
+    Ok(buf)
+}
+
+#[derive(Debug, Error)]
+pub enum GenerateTrafError {
+    #[error("from int: {0} {1}")]
+    TryFromInt(String, std::num::TryFromIntError),
+
+    #[error("dts {0} {1}")]
+    Dts(i64, i32),
+
+    #[error("sub")]
+    Sub,
+}
+
+fn generate_traf(
+    muxer_start_time: i64,
+    samples: &[FragmentSample],
+    data_offset: i32,
+) -> Result<Boxes, GenerateTrafError> {
+    use GenerateTrafError::*;
+    /*
+           traf
+           - tfhd
+           - tfdt
+           - trun
+    */
+
+    let mut trun_entries = Vec::with_capacity(samples.len());
+    for sample in samples {
+        let flags = if sample.non_sync {
+            1 << 16 // sample_is_non_sync_sample
+        } else {
+            0
+        };
+
+        trun_entries.push(TrunEntryV1 {
+            sample_duration: u32::try_from(sample.duration)
+                .map_err(|e| TryFromInt("duration".to_owned(), e))?,
+            sample_size: u32::try_from(sample.size)
+                .map_err(|e| TryFromInt("sample_size".to_owned(), e))?,
+            sample_flags: flags,
+            sample_composition_time_offset: sample.cto,
+        });
+    }
+
+    let first_sample = &samples[0];
+    let dts = first_sample
+        .pts
+        .checked_sub(i64::from(first_sample.cto))
+        .ok_or(Dts(first_sample.pts, first_sample.cto))?;
+    let relative_dts = dts.checked_sub(muxer_start_time).ok_or(Sub)?;
+    let base_media_decode_time_v1 = u64::try_from(relative_dts)
+        .map_err(|e| TryFromInt(format!("base_media_decode_time: {relative_dts}"), e))?;
+
+    // Traf
+    Ok(Boxes::new(Traf).with_children3(
+        // Tfhd.
+        Boxes::new(Tfhd {
+            full_box: FullBox {
+                version: 0,
+                flags: u32_to_flags(TFHD_DEFAULT_BASE_IS_MOOF),
+            },
+            track_id: VIDEO_TRACK_ID,
+            ..Tfhd::default()
+        }),
+        // Tfdt.
+        Boxes::new(Tfdt {
+            flags: [0, 0, 0],
+            // sum of decode durations of all earlier samples
+            base_media_decode_time: TfdtBaseMediaDecodeTime::V1(base_media_decode_time_v1),
+        }),
+        // Trun.
+        Boxes::new(Trun {
+            flags: u32_to_flags(
+                TRUN_DATA_OFFSET_PRESENT
+                    | TRUN_SAMPLE_DURATION_PRESENT
+                    | TRUN_SAMPLE_SIZE_PRESENT
+                    | TRUN_SAMPLE_FLAGS_PRESENT
+                    | TRUN_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT,
+            ),
+            data_offset,
+            first_sample_flags: 0,
+            entries: TrunEntries::V1(trun_entries),
+        }),
+    ))
+}

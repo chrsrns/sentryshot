@@ -4,12 +4,6 @@ use std::convert::TryFrom;
 
 use crate::error::ParseParamsError;
 
-// 14496-12_2015 8.3.2.3
-// track_ID is an integer that uniquely identifies this track
-// over the entire life‐time of this presentation.
-// Track IDs are never re‐used and cannot be zero.
-pub const VIDEO_TRACK_ID: u32 = 1;
-
 pub struct IdCounter(u64);
 
 impl IdCounter {

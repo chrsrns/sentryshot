@@ -6,7 +6,6 @@ mod video;
 mod video_reader;
 
 pub use cache::VideoCache;
-pub use hls::VIDEO_TRACK_ID;
 pub use mp4_muxer::{GenerateMp4Error, Mp4Muxer, generate_mp4};
 pub use video::{
     CreateVideoWriterError, MetaHeader, MetaReader, ReadMetaError, Sample, TrackParameters,

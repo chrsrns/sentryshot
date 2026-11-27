@@ -12,7 +12,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
-use crate::boxes::{GenerateMoofError, generate_init, generate_moof_and_empty_mdat};
+use crate::boxes::{generate_init, generate_moof_and_empty_mdat};
 
 #[allow(clippy::module_name_repetitions)]
 pub struct Muxer {
@@ -352,7 +352,7 @@ impl MuxerState {
 #[derive(Debug, Error)]
 pub enum WriteFrameError {
     #[error("generate mp4 boxes: {0}")]
-    GenerateMp4Boxes(#[from] GenerateMoofError),
+    GenerateMp4Boxes(#[from] mp4::GenerateMoofError),
 
     #[error("calculate sample duration")]
     ComputeFrameDuration,
@@ -402,7 +402,7 @@ pub struct PlayRequest {
 
 #[derive(Debug)]
 pub enum PlayReponse {
-    Ready(Result<Vec<u8>, GenerateMoofError>),
+    Ready(Result<Vec<u8>, mp4::GenerateMoofError>),
     FramesExpired,
     SessionNotExist,
     SessionAlreadyLocked,
@@ -442,7 +442,7 @@ impl Frame {
         data: H264Data,
         mut duration: DurationH264,
         muxer_start_time: UnixH264,
-    ) -> Result<Self, GenerateMoofError> {
+    ) -> Result<Self, mp4::GenerateMoofError> {
         if *duration < 0 {
             duration = DurationH264::new(0);
         }
@@ -468,7 +468,7 @@ impl Frame {
         })
     }
 
-    fn muxed(&self, start_time: UnixH264) -> Result<Vec<u8>, GenerateMoofError> {
+    fn muxed(&self, start_time: UnixH264) -> Result<Vec<u8>, mp4::GenerateMoofError> {
         let mut boxes = generate_moof_and_empty_mdat(start_time, &[&self.sample])?;
         assert_eq!(self.boxes_size, boxes.len());
         let avcc: &[u8] = &self.sample.avcc;
