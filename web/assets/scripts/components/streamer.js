@@ -115,7 +115,7 @@ function newSlowPollStream(monitor, preferLowRes, buttons = []) {
 	}
 	const abort = new AbortController();
 	const debugOverlay = newDebugOverlay(elem);
-	newStream(abort.signal, $video, debugOverlay, monitorId, subStream);
+	newStream(abort.signal, $video, debugOverlay, monitorId, subStream, elem);
 
 	return {
 		elem: $wrapper,
@@ -220,8 +220,9 @@ function newRecordingsBtn(monitorIds) {
  * @param {DebugOvelay} debugOverlay
  * @param {String} monitorId
  * @param {boolean} subStream
+ * @param {Element} elem
  */
-async function newStream(parentSignal, $video, debugOverlay, monitorId, subStream) {
+async function newStream(parentSignal, $video, debugOverlay, monitorId, subStream, elem) {
 	/** @type {number} */
 	let targetDelayMs = 0;
 	$video.onwaiting = () => {
@@ -277,6 +278,20 @@ async function newStream(parentSignal, $video, debugOverlay, monitorId, subStrea
 		// is pointless.
 		if (!SourceApi.isTypeSupported(mimeCodec)) {
 			fatalError = new Error(`codec unsupported by this browser: ${codecs}`);
+			// On-tile hint so the failure isn't a silent black tile.
+			elem.append(
+				htmlToElem(/* HTML */ `
+					<div
+						class="js-media-unsupported absolute flex justify-center items-center w-full h-full text-color"
+						style="z-index: 3; top: 0; left: 0; background: rgb(0 0 0 / 60%);"
+					>
+						<span class="p-1"
+							>live stream uses a codec this browser can't play:
+							${codecs.split(".")[0]}</span
+						>
+					</div>
+				`),
+			);
 			return;
 		}
 

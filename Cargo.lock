@@ -1890,7 +1890,6 @@ checksum = "c08c74e62047bb2de4ff487b251e4a92e24f48745648451635cec7d591162d9f"
 [[package]]
 name = "retina"
 version = "0.4.13"
-source = "git+https://github.com/Curid/retina?branch=dts#39ff2f3364360d16c2bd4685e87ef2b4f19a6829"
 dependencies = [
  "base64 0.22.1",
  "bitstream-io",
