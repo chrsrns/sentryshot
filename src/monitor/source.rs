@@ -388,6 +388,8 @@ impl SourceRtsp {
         let (feed_tx, _) = broadcast::channel(10);
 
         let mut stream_started: Option<StreamStarted> = None;
+        let params_wait_start = std::time::Instant::now();
+        let mut params_warned = false;
         loop {
             tokio::select! {
                 () = token.cancelled() => {
@@ -411,6 +413,19 @@ impl SourceRtsp {
                                 _ = feed_tx.send(data);
 
                             } else {
+                                // Frames flowing without a usable start means
+                                // the camera isn't delivering stream
+                                // parameters or a random-access point.
+                                if !params_warned
+                                    && params_wait_start.elapsed()
+                                        > std::time::Duration::from_secs(30)
+                                {
+                                    params_warned = true;
+                                    self.log(
+                                        LogLevel::Warning,
+                                        "30s without stream parameters or a random-access point",
+                                    );
+                                }
                                 if !frame.is_random_access_point() {
                                     // Wait for IDR.
                                     continue

@@ -2513,7 +2513,7 @@ pub struct FragmentSample {
 }
 
 /// ftyp + moov(mvhd + trak + mvex) init segment for a single
-/// H264 video track.
+/// video track. The codec selects the sample entry (avc1/hvc1).
 ///
 /// ```text
 /// - ftyp

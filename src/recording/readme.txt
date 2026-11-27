@@ -19,9 +19,13 @@
 //   startTime: i64,  // UnixH264 — 90 kHz clock ticks since the unix epoch.
 //   width: u16,
 //   height: u16,
+//   codec_size: u8,     // version >= 2 only.
+//   codec: [u8],        // version >= 2 only. RFC 6381 string, e.g. "avc1.42E01E"/"hvc1.*".
 //   extradata_size: u16,
 //   extradata: [u8],
 //   samples: [sampleV0],
+//
+// version 1 has no codec fields and implies codec "avc1".
 //
 //
 // sampleV0 { // 25 bytes.
