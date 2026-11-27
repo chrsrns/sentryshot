@@ -396,24 +396,6 @@ async fn logout(State(auth): State<ArcAuth>, headers: HeaderMap) -> impl IntoRes
     }
 }
 
-/*
-// MyToken return CSRF token for requesting user.
-func (a *Authenticator) MyToken() http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        w.WriteHeader(http.StatusOK)
-        auth := a.ValidateRequest(r)
-        token := auth.User.Token
-        if token == "" {
-            http.Error(w, "token does not exist", http.StatusInternalServerError)
-            return
-        }
-        if _, err := w.Write([]byte(token)); err != nil {
-            http.Error(w, "could not write", http.StatusInternalServerError)
-            return
-        }
-    })
-}
-*/
 
 // LogFailedLogin finds and logs the ip.
 pub fn log_failed_login(logger: &ArcLogger, username: &Username) {

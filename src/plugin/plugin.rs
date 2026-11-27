@@ -39,15 +39,6 @@ pub trait Plugin {
         router
     }
 
-    // Non-blocking.
-    /*async fn on_source_start(
-        &self,
-        _token: CancellationToken,
-        _monitor_id: MonitorId,
-        _stream_type: StreamType,
-    ) {
-    }*/
-
     // The token will be cancelled when the monitor stops/restarts.
     async fn on_monitor_start(&self, _token: CancellationToken, _monitor: ArcMonitor) {}
     fn on_thumb_save(&self, _config: &MonitorConfig, frame: Frame) -> Frame {

@@ -21,9 +21,6 @@ use tower::ServiceBuilder;
 
 #[derive(Debug, Error)]
 pub enum NewAuthError {
-    #[error("create file: '{0}' {1}")]
-    CreateFile(PathBuf, std::io::Error),
-
     #[error("write initial file: '{0}' {1}")]
     WriteInitialFile(PathBuf, std::io::Error),
 
