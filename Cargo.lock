@@ -3208,7 +3208,6 @@ version = "0.3.11"
 dependencies = [
  "bytesize",
  "common",
- "mp4",
  "pin-project",
  "pretty-hex",
  "pretty_assertions",
