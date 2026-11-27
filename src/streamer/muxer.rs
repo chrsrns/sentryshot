@@ -307,7 +307,21 @@ impl MuxerState {
             self.muxer_start_time,
         )?);
 
-        if self.frames.len() >= Muxer::FRAME_CACHE_SIZE {
+        // Never evict the frame new sessions anchor to: the last completed
+        // GOP's first frame (fall back to the in-progress GOP's first frame,
+        // which is the next anchor once its GOP completes). A GOP larger
+        // than the cache would otherwise expire the anchor before a session
+        // can start.
+        let anchor_id = self
+            .gops
+            .back()
+            .map(|gop| gop.frames[0].id)
+            .or_else(|| self.gop_in_progress.first().map(|f| f.id));
+        while self.frames.len() >= Muxer::FRAME_CACHE_SIZE
+            && self.frames.front().is_some_and(|f| {
+                anchor_id.is_none_or(|anchor| f.id < anchor)
+            })
+        {
             self.frames.pop_front();
         }
         self.frames.push_back(frame.clone());

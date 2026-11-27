@@ -470,3 +470,63 @@ async fn test_play() {
 
     assert_eq!(pretty_hex(&want_bytes.as_slice()), pretty_hex(&got));
 }
+
+#[tokio::test]
+async fn test_play_session_with_gop_larger_than_frame_cache() {
+    let token = CancellationToken::new();
+    let streamer = Streamer::new(token.clone(), DummyLogger::new());
+
+    let (muxer, mut writer) = streamer
+        .new_muxer2(
+            token.clone(),
+            m_id("test"),
+            false,
+            test_params(),
+            UnixH264::new(0),
+            H264Data {
+                pts: UnixH264::new(0),
+                dts_offset: DtsOffset::new(0),
+                random_access_present: true,
+                avcc: Arc::new(PaddedBytes::new(vec![1])),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    // GOP=300 > FRAME_CACHE_SIZE=256: frames 0..299 then the next IDR at 300
+    // completes the gop; the session anchor (gop's first frame) must be
+    // retained or every fresh session reports FramesExpired.
+    for i in 1..300u64 {
+        writer
+            .write_h264(H264Data {
+                pts: UnixH264::new(i.try_into().unwrap()),
+                dts_offset: DtsOffset::new(0),
+                random_access_present: false,
+                avcc: Arc::new(PaddedBytes::new(vec![1])),
+            })
+            .await
+            .unwrap();
+    }
+    writer
+        .write_h264(H264Data {
+            pts: UnixH264::new(300),
+            dts_offset: DtsOffset::new(0),
+            random_access_present: true,
+            avcc: Arc::new(PaddedBytes::new(vec![1])),
+        })
+        .await
+        .unwrap();
+    assert_eq!(1, muxer.debug_state().await.gop_count);
+
+    assert!(matches!(
+        streamer.start_session(m_id("test"), false, 42).await,
+        StartSessionReponse::Ready(_)
+    ));
+
+    let got = streamer.play(m_id("test"), false, 42).await;
+    assert!(
+        matches!(got, PlayReponse::Ready(_)),
+        "play must not expire the session anchor, got: {got:?}"
+    );
+}
