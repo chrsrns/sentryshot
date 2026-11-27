@@ -157,7 +157,7 @@ function setHashParam(key, value) {
 	const url = new URL("http://dummy.com");
 	url.search = window.location.hash.slice(1);
 	url.searchParams.set(key, value);
-	window.location.hash = url.search.slice(1).replace("%2C", ",");
+	window.location.hash = url.search.slice(1).replaceAll("%2C", ",");
 }
 
 /**
