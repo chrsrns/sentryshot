@@ -40,14 +40,6 @@ impl Sample {
             data_offset: u32::from_be_bytes([b[17], b[18], b[19], b[20]]),
             data_size: u32::from_be_bytes([b[21], b[22], b[23], b[24]]),
         }
-        /*Self {
-            random_access_present: flags & FLAG_RANDOM_ACCESS_PRESENT != 0,
-            pts: i64::from_be_bytes(b[1..9].try_into().unwrap()),
-            cts: i32::from_be_bytes(b[9..13].try_into().unwrap()),
-            duration: u32::from_be_bytes(b[13..17].try_into().unwrap()),
-            data_offset: u32::from_be_bytes(b[17..21].try_into().unwrap()),
-            data_size: u32::from_be_bytes(b[21..25].try_into().unwrap()),
-        }*/
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, std::num::TryFromIntError> {
@@ -168,7 +160,6 @@ pub struct MetaReader<T: AsyncRead + AsyncSeek + Unpin> {
     file: T,
 
     header_size: u64,
-    //file_size: usize,
     sample_count: usize,
 }
 
@@ -208,7 +199,6 @@ impl<T: AsyncRead + AsyncSeek + Unpin> MetaReader<T> {
             Self {
                 file,
                 header_size,
-                //file_size,
                 sample_count: usize::try_from(
                     (file_size - header_size) / u64::from(SAMPLE_SIZE_U8),
                 )?,

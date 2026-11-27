@@ -122,46 +122,11 @@ impl StorageImpl {
         let usage = StorageUsage {
             used,
             percent,
-            //max,
-            //formatted: format_disk_usage(used),
         };
         (usage, err)
     }
 }
 
-/*fn format_disk_usage(used: u64) -> String {
-    if used < 1000 * MB {
-        format!("{:.0}", used / MB)
-    } else if used < 10 * GB {
-        format!("{:.2}", used / GB)
-    } else if used < 100 * GB {
-        format!("{:.1}", used / GB)
-    } else if used < 1000 * GB {
-        format!("{:.0}", used / GB)
-    } else if used < 10 * TB {
-        format!("{:.2}", used / TB)
-    } else if used < 100 * TB {
-        format!("{:.1}", used / TB)
-    } else {
-        format!("{:.0}", used / TB)
-    }
-    /*switch {
-    case used < 1000*megabyte:
-        return fmt.Sprintf("%.0fMB", used/megabyte)
-    case used < 10*gigabyte:
-        return fmt.Sprintf("%.2fGB", used/gigabyte)
-    case used < 100*gigabyte:
-        return fmt.Sprintf("%.1fGB", used/gigabyte)
-    case used < 1000*gigabyte:
-        return fmt.Sprintf("%.0fGB", used/gigabyte)
-    case used < 10*terabyte:
-        return fmt.Sprintf("%.2fTB", used/terabyte)
-    case used < 100*terabyte:
-        return fmt.Sprintf("%.1fTB", used/terabyte)
-    default:
-        return fmt.Sprintf("%.0fTB", used/terabyte)
-    }*/
-}*/
 
 struct StorageUsageBytes;
 
@@ -212,14 +177,6 @@ impl StorageBytesUsed for StorageUsageBytes {
     }
 }
 
-/*
-// CensorLog replaces sensitive env config values.
-func (env ConfigEnv) CensorLog(msg string) string {
-    if env.StorageDir != "" {
-        msg = strings.ReplaceAll(msg, env.StorageDir, "$StorageDir")
-    }
-    return msg
-}*/
 
 #[cfg(test)]
 pub(crate) struct StubStorageUsageBytes(pub u64);
@@ -336,30 +293,4 @@ mod tests {
         assert_eq!(want, got.unwrap());
     }
 
-    /*t.Run("CensorLog", func(t *testing.T) {
-        cases := map[string]struct {
-            env      ConfigEnv
-            input    string
-            expected string
-        }{
-            "emptyConfig": {
-                ConfigEnv{},
-                "a b c",
-                "a b c",
-            },
-            "storageDir": {
-                ConfigEnv{
-                    StorageDir: "a",
-                },
-                "a b c",
-                "$StorageDir b c",
-            },
-        }
-        for name, tc := range cases {
-            t.Run(name, func(t *testing.T) {
-                actual := tc.env.CensorLog(tc.input)
-                require.Equal(t, tc.expected, actual)
-            })
-        }
-    }*/
 }
