@@ -123,7 +123,6 @@ function newTime(unixMs, timeZone) {
 	 */
 	const daysInMonth = (month, year) => {
 		switch (month) {
-			case 0:
 			case 1:
 			case 3:
 			case 5:
@@ -215,7 +214,7 @@ function newTime(unixMs, timeZone) {
 						curMonth += 1;
 					}
 				} else {
-					d.setTime(d.getTime() - daysInMonth(month - 1, year) * MS_DAY);
+					d.setTime(d.getTime() - daysInMonth(month === 1 ? 12 : month - 1, year) * MS_DAY);
 					if (curMonth === 1) {
 						curMonth = 12;
 					} else {
@@ -297,7 +296,7 @@ function newTime(unixMs, timeZone) {
 			const prevDay = day;
 			const prevHour = hour;
 
-			d.setTime(d.getTime() - daysInMonth(month - 1, year) * MS_DAY);
+			d.setTime(d.getTime() - daysInMonth(month === 1 ? 12 : month - 1, year) * MS_DAY);
 			update();
 
 			// Correct the day and hour.

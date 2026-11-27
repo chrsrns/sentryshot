@@ -744,7 +744,7 @@ function newSelectCustomField(inputRules, options, label, initial, doc) {
 	const set = (input) => {
 		if (input === undefined) {
 			field.$input.value = initial;
-			field.$error.innerHTML = "";
+			field.$error.textContent = "";
 			return;
 		}
 
@@ -756,7 +756,10 @@ function newSelectCustomField(inputRules, options, label, initial, doc) {
 		}
 
 		if (customValue) {
-			field.$input.innerHTML += `<option>${input}</option>`;
+			const option = document.createElement("option");
+			option.value = input;
+			option.textContent = input;
+			field.$input.append(option);
 		}
 		field.$input.value = input;
 	};
