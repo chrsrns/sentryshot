@@ -378,8 +378,9 @@ fn generate_stsd(params: &TrackParameters) -> mp4::BoxesAsync {
         entry_count: 1,
     })
     .with_child(
-        // Avc1.
-        mp4::BoxesAsync::new(mp4::Avc1 {
+        // VisualSampleEntry.
+        mp4::BoxesAsync::new(mp4::VisualSampleEntry {
+            box_type: mp4::TYPE_AVC1,
             sample_entry: mp4::SampleEntry {
                 data_reference_index: 1,
                 ..Default::default()
