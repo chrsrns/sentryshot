@@ -144,6 +144,8 @@ function newMonitorNameByID(monitors) {
 				return monitor.name;
 			}
 		}
+		// Unknown id — render it rather than "undefined".
+		return id;
 	};
 }
 

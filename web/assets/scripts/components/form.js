@@ -815,7 +815,7 @@ function newPasswordField() {
 	const passwordStrength = (string) => {
 		const strongRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!#$%&*@^])(?=.{8,})/;
 		const mediumRegex =
-			/^(?=.*[a-z])(?=.*[A-Z])|(?=.*[a-z])(?=.*\d)|(?=.*[A-Z](?=.*\d))(?=.{6,})/;
+			/^(?=.{6,})(?:(?=.*[a-z])(?=.*[A-Z])|(?=.*[a-z])(?=.*\d)|(?=.*[A-Z])(?=.*\d))/;
 
 		if (strongRegex.test(string) || string === "") {
 			return "";
