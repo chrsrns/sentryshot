@@ -702,7 +702,7 @@ function newMonitorPicker(monitors, newModalSelect2 = newModalSelect) {
 				reset();
 				return;
 			}
-			$input.value = monitorIDToName[input] ?? "";
+			$input.value = monitorIDToName[input] || "";
 		},
 	};
 }

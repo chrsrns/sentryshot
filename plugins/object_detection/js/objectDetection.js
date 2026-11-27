@@ -69,7 +69,7 @@ export function objectDetection2(detectors, hasSubStream, getMonitorId) {
 	fields.detectorName = fieldTemplate.select(
 		"Detector",
 		detectorNames,
-		detectorNames.at(-1) ?? "", // Last item, empty string if none configured.
+		detectorNames.at(-1) || "", // Last item, empty string if none configured.
 	);
 	fields.feedRate = newNumberField(
 		{
