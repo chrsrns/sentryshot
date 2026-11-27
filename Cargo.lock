@@ -746,10 +746,8 @@ dependencies = [
 name = "eventdb"
 version = "0.3.11"
 dependencies = [
- "bytesize",
  "common",
  "criterion",
- "csv",
  "pin-project",
  "pretty-hex",
  "pretty_assertions",

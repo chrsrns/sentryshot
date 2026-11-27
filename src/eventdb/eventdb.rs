@@ -2,7 +2,6 @@
 
 mod buf_seek_reader;
 mod database;
-pub mod slow_poller;
 
 pub use database::{Database, EventQuery};
 

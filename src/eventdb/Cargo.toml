@@ -15,9 +15,7 @@ doctest = false
 
 [dependencies]
 common.path = "../common"
-csv.path = "../csv"
 
-bytesize.workspace = true
 pin-project.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -35,6 +33,6 @@ test-case.workspace = true
 
 
 [[bench]]
-name = "logdb"
+name = "eventdb"
 path = "./bench.rs"
 harness = false
