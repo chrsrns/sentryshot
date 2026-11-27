@@ -659,7 +659,6 @@ impl MonitorManagerState {
             self.log(LogLevel::Info, id, "stopping");
             monitor.stop().await;
             self.log(LogLevel::Debug, id, "stopped");
-            self.started_monitors.remove(id);
         }
 
         if self.configs.remove(id).is_none() {
