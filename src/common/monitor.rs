@@ -432,8 +432,11 @@ pub enum DecoderError {
 
 #[derive(Debug, Error)]
 pub enum SubscribeDecodedError {
-    #[error("new h264 decoder: {0}")]
-    NewH264Decoder(#[from] H264BuilderError),
+    #[error("new video decoder: {0}")]
+    NewVideoDecoder(#[from] H264BuilderError),
+
+    #[error("unsupported codec: {0}")]
+    UnsupportedCodec(String),
 }
 
 // A 'broadcast' channel is used instead of a 'watch' channel to detect dropped frames.

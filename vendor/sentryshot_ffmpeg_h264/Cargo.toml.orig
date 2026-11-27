@@ -1,0 +1,29 @@
+[package]
+name = "sentryshot_ffmpeg_h264"
+version = "0.2.1"
+edition.workspace = true
+rust-version.workspace = true
+description = "A small rust wrapper around FFmpeg's h264 decoder"
+repository.workspace = true
+license = "MPL-2.0+"
+keywords = ["video", "ffmpeg", "ffi"]
+categories = ["multimedia", "multimedia::encoding", "multimedia::video"]
+
+[lints]
+workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+sentryshot_ffmpeg_h264_sys = "0.1.2"
+sentryshot_padded_bytes = "0.1.0"
+sentryshot_util = "0.1.2"
+
+libc.workspace = true
+thiserror.workspace = true
+
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+pretty-hex.workspace = true

@@ -15,6 +15,14 @@ members = [
 	"src/make",
 	"src/sentryshot",
 ]
+
+# Vendored forks of the sentryshot-media FFmpeg crates. Excluded from the
+# workspace so members keep the "no workspace-crate deps beyond common"
+# rule; they're still linked as path dependencies.
+exclude = [
+	"vendor/sentryshot_ffmpeg_h264",
+	"vendor/sentryshot_ffmpeg_h264_sys",
+]
 resolver = "2"
 
 [workspace.package]
@@ -25,7 +33,7 @@ license = "GPL-2.0+"
 
 [workspace.dependencies]
 sentryshot_convert = "0.1.2"
-sentryshot_ffmpeg_h264 = "0.2.1"
+sentryshot_ffmpeg_h264 = { path = "vendor/sentryshot_ffmpeg_h264" }
 sentryshot_filter = "0.1.2"
 sentryshot_padded_bytes = "0.1.0"
 sentryshot_scale = "0.1.2"

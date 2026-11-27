@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use crate::decoder::{self, VideoDecoder};
 use crate::log_monitor;
 use async_trait::async_trait;
 use common::{
@@ -18,9 +19,7 @@ use retina::{
     codec::{ParametersRef, VideoFrame, VideoParameters},
 };
 use sentryshot_convert::Frame;
-use sentryshot_ffmpeg_h264::{
-    H264Decoder, H264DecoderBuilder, Packet, PaddedBytes, Ready, ReceiveFrameError, SendPacketError,
-};
+use sentryshot_ffmpeg_h264::{Packet, PaddedBytes, ReceiveFrameError, SendPacketError};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::{
@@ -97,17 +96,25 @@ impl Source for MonitorSource {
 
         // We could grab the extradata strait from the source instead.
         let muxer = self.muxer().await?;
-        let extradata = muxer.params().extra_data.clone();
+        let params = muxer.params();
+        let codec = params.codec.clone();
+        let extradata = params.extra_data.clone();
 
-        let h264_decoder = match H264DecoderBuilder::new().avcc(PaddedBytes::new(extradata)) {
+        let video_decoder = match decoder::build_video_decoder(&codec, PaddedBytes::new(extradata))
+        {
             Ok(v) => v,
-            Err(e) => return Some(Err(SubscribeDecodedError::NewH264Decoder(e))),
+            Err(decoder::BuildVideoDecoderError::Builder(e)) => {
+                return Some(Err(SubscribeDecodedError::NewVideoDecoder(e)));
+            }
+            Err(decoder::BuildVideoDecoderError::UnsupportedCodec(c)) => {
+                return Some(Err(SubscribeDecodedError::UnsupportedCodec(c)));
+            }
         };
         Some(Ok(new_decoder(
             rt_handle,
             logger,
             feed,
-            h264_decoder,
+            video_decoder,
             limiter,
         )))
     }
@@ -606,7 +613,7 @@ fn new_decoder(
     rt_handle: Handle,
     logger: ArcMsgLogger,
     mut feed: Feed,
-    mut h264_decoder: H264Decoder<Ready>,
+    mut video_decoder: VideoDecoder,
     mut frame_rate_limiter: Option<FrameRateLimiter>,
 ) -> FeedDecoded {
     let (frame_tx, frame_rx) = mpsc::channel(1);
@@ -631,16 +638,20 @@ fn new_decoder(
             let avcc = frame.avcc.clone();
 
             let result: Result<(), SendPacketError>;
-            (h264_decoder, result) = rt_handle
+            (video_decoder, result) = rt_handle
                 .spawn_blocking(move || {
-                    let result = h264_decoder.send_packet(&Packet::new(&avcc).with_pts(*frame.pts));
-                    (h264_decoder, result)
+                    let result =
+                        video_decoder.send_packet(&Packet::new(&avcc).with_pts(*frame.pts));
+                    (video_decoder, result)
                 })
                 .await
                 .expect("join");
             if let Err(e) = result {
                 if let SendPacketError::Invaliddata = e {
-                    logger.log(LogLevel::Warning, "h264 decoder: send_packet: invalid data");
+                    logger.log(
+                        LogLevel::Warning,
+                        "video decoder: send_packet: invalid data",
+                    );
                     continue;
                 }
                 _ = frame_tx.send(Err(SendFrame(e))).await;
@@ -649,7 +660,7 @@ fn new_decoder(
 
             loop {
                 let mut frame_decoded = Frame::new();
-                match h264_decoder.receive_frame(&mut frame_decoded) {
+                match video_decoder.receive_frame(&mut frame_decoded) {
                     Ok(()) => {}
                     Err(ReceiveFrameError::Eagain) => break,
                     Err(e) => {
