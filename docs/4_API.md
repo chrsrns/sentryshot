@@ -70,6 +70,27 @@ Returns the temporary CSRF-token for your account.
 
 ## Monitor
 
+The page-render `ui_data` JSON carries a `monitorsInfo` object keyed by
+monitor id, available to normal users:
+
+```json
+{
+	"monitorsInfo": {
+		"<MONITOR_ID>": {
+			"id": "<MONITOR_ID>",
+			"name": "front door",
+			"enable": true,
+			"hasSubStream": true,
+			"codec": "hvc1.1.6.L93.B0",
+			"subCodec": "avc1.42E01E"
+		}
+	}
+}
+```
+
+- `codec`/`subCodec`: RFC 6381 codec string of the running main/sub stream.
+  Omitted while the stream is down or doesn't exist.
+
 
 ### PATCH /api/monitor/<MONITOR_ID>/motion/enable
 ### PATCH /api/monitor/<MONITOR_ID>/motion/disable

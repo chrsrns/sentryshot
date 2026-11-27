@@ -466,6 +466,12 @@ pub trait Source {
         logger: ArcMsgLogger,
         limiter: Option<FrameRateLimiter>,
     ) -> Option<Result<FeedDecoded, SubscribeDecodedError>>;
+
+    // Non-blocking snapshot of the running muxer's RFC 6381 codec
+    // string. None while the stream is down or absent.
+    fn codec(&self) -> Option<String> {
+        None
+    }
 }
 
 pub type ArcMonitor = Arc<dyn MonitorImpl + Send + Sync>;
@@ -576,16 +582,33 @@ pub struct MonitorInfo {
 
     #[serde(rename = "hasSubStream")]
     pub has_sub_stream: bool,
+
+    // RFC 6381 codec of the running main/sub stream, e.g. "hvc1.1.6.L93.B0".
+    // Absent while the stream is down or doesn't exist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+
+    #[serde(rename = "subCodec", skip_serializing_if = "Option::is_none")]
+    pub sub_codec: Option<String>,
 }
 
 impl MonitorInfo {
     #[must_use]
-    pub fn new(id: MonitorId, name: MonitorName, enable: bool, has_sub_stream: bool) -> Self {
+    pub fn new(
+        id: MonitorId,
+        name: MonitorName,
+        enable: bool,
+        has_sub_stream: bool,
+        codec: Option<String>,
+        sub_codec: Option<String>,
+    ) -> Self {
         Self {
             id,
             name,
             enable,
             has_sub_stream,
+            codec,
+            sub_codec,
         }
     }
 }

@@ -387,7 +387,9 @@ async fn run_monitor_manager(mut rx: mpsc::Receiver<MonitorManagerRequest>) {
             MonitorManagerRequest::MonitorDelete((res, monitor_id)) => {
                 _ = res.send(state.get().monitor_delete(&monitor_id).await);
             }
-            MonitorManagerRequest::MonitorsInfo(res) => _ = res.send(state.get().monitors_info()),
+            MonitorManagerRequest::MonitorsInfo(res) => {
+                _ = res.send(state.get().monitors_info().await);
+            }
             MonitorManagerRequest::MonitorConfig((res, monitor_id)) => {
                 _ = res.send(state.get().configs.get(&monitor_id).cloned());
             }
@@ -673,11 +675,22 @@ impl MonitorManagerState {
 
     // Returns common information about the monitors.
     // This will be accessesable by normal users.
-    #[must_use]
-    pub fn monitors_info(&self) -> HashMap<MonitorId, MonitorInfo> {
+    pub async fn monitors_info(&self) -> HashMap<MonitorId, MonitorInfo> {
         let mut configs = HashMap::new();
         for raw_conf in self.configs.values() {
             let c = raw_conf;
+
+            let (codec, sub_codec) = match self.started_monitors.get(c.id()) {
+                Some(monitor) => {
+                    let codec = monitor.source_main().await.and_then(|s| s.codec());
+                    let sub_codec = match monitor.source_sub().await {
+                        Some(Some(s)) => s.codec(),
+                        _ => None,
+                    };
+                    (codec, sub_codec)
+                }
+                None => (None, None),
+            };
 
             configs.insert(
                 c.id().to_owned(),
@@ -686,6 +699,8 @@ impl MonitorManagerState {
                     c.name().to_owned(),
                     c.enabled(),
                     c.has_sub_stream(),
+                    codec,
+                    sub_codec,
                 ),
             );
         }
@@ -1150,6 +1165,8 @@ mod tests {
                     name: name("one"),
                     enable: false,
                     has_sub_stream: false,
+                    codec: None,
+                    sub_codec: None,
                 },
             ),
             (
@@ -1159,6 +1176,8 @@ mod tests {
                     name: name("two"),
                     enable: false,
                     has_sub_stream: true,
+                    codec: None,
+                    sub_codec: None,
                 },
             ),
         ]);

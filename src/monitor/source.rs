@@ -24,7 +24,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::{
     runtime::Handle,
-    sync::{broadcast, mpsc, oneshot},
+    sync::{broadcast, mpsc, oneshot, watch},
 };
 use tokio_util::{sync::CancellationToken, task::task_tracker::TaskTrackerToken};
 use url::Url;
@@ -34,6 +34,7 @@ pub struct MonitorSource {
     stream_type: StreamType,
     get_muxer_tx: mpsc::Sender<oneshot::Sender<ArcStreamerMuxer>>,
     subscribe_tx: mpsc::Sender<oneshot::Sender<Feed>>,
+    codec_rx: watch::Receiver<Option<String>>,
 }
 
 impl MonitorSource {
@@ -42,11 +43,13 @@ impl MonitorSource {
         stream_type: StreamType,
         get_muxer_tx: mpsc::Sender<oneshot::Sender<ArcStreamerMuxer>>,
         subscribe_tx: mpsc::Sender<oneshot::Sender<Feed>>,
+        codec_rx: watch::Receiver<Option<String>>,
     ) -> Self {
         Self {
             stream_type,
             get_muxer_tx,
             subscribe_tx,
+            codec_rx,
         }
     }
 }
@@ -69,6 +72,11 @@ impl Source for MonitorSource {
             return None;
         };
         Some(muxer)
+    }
+
+    // Non-blocking snapshot of the running muxer's codec.
+    fn codec(&self) -> Option<String> {
+        self.codec_rx.borrow().clone()
     }
 
     // Subscribe to the raw feed. Will block until the source has started.
@@ -202,6 +210,7 @@ impl SourceRtsp {
         };
 
         let (started_tx, mut started_rx) = mpsc::channel(1);
+        let (codec_tx, codec_rx) = watch::channel(None);
 
         let task_token2 = task_token.clone();
         let token2 = token.clone();
@@ -213,10 +222,14 @@ impl SourceRtsp {
                     return;
                 }
 
-                match source.run(token2.child_token(), started_tx.clone()).await {
+                match source
+                    .run(token2.child_token(), started_tx.clone(), codec_tx.clone())
+                    .await
+                {
                     Ok(()) => source.log(LogLevel::Debug, "cancelled"),
                     Err(e) => source.log(LogLevel::Error, &format!("crashed: {e}")),
                 };
+                codec_tx.send_replace(None);
 
                 tokio::select! {
                     () = token2.cancelled() => {}
@@ -276,7 +289,12 @@ impl SourceRtsp {
             }
         });
 
-        Some(MonitorSource::new(stream_type, get_muxer_tx, subscribe_tx))
+        Some(MonitorSource::new(
+            stream_type,
+            get_muxer_tx,
+            subscribe_tx,
+            codec_rx,
+        ))
     }
 
     fn log(&self, level: LogLevel, msg: &str) {
@@ -288,6 +306,7 @@ impl SourceRtsp {
         &self,
         token: CancellationToken,
         started_tx: mpsc::Sender<(ArcStreamerMuxer, broadcast::Sender<H264Data>)>,
+        codec_tx: watch::Sender<Option<String>>,
     ) -> Result<(), SourceRtspRunError> {
         use SourceRtspRunError::*;
 
@@ -416,6 +435,8 @@ impl SourceRtsp {
                                         // Cancelled.
                                         return Ok(());
                                     };
+                                    codec_tx
+                                        .send_replace(Some(muxer.params().codec.clone()));
                                     stream_started = Some(StreamStarted{ hls_writer, start_time, first_sample_pts });
                                     // Notify successful start.
                                     _ = started_tx.send((muxer, feed_tx.clone())).await;
@@ -807,5 +828,24 @@ mod tests {
     fn pick_video_stream_no_video() {
         assert_eq!(None, pick(&[("audio", "mpeg4-generic")]));
         assert_eq!(None, pick(&[]));
+    }
+
+    #[test]
+    fn monitor_source_codec_snapshot() {
+        let (codec_tx, codec_rx) = watch::channel(None);
+        let (get_muxer_tx, _get_muxer_rx) = mpsc::channel(1);
+        let (subscribe_tx, _subscribe_rx) = mpsc::channel(1);
+        let source = MonitorSource::new(StreamType::Main, get_muxer_tx, subscribe_tx, codec_rx);
+
+        // Stream down: no codec.
+        assert_eq!(None, source.codec());
+
+        // Muxer started.
+        codec_tx.send_replace(Some("hvc1.1.6.L93.B0".to_owned()));
+        assert_eq!(Some("hvc1.1.6.L93.B0".to_owned()), source.codec());
+
+        // Muxer torn down.
+        codec_tx.send_replace(None);
+        assert_eq!(None, source.codec());
     }
 }

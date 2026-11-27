@@ -135,6 +135,61 @@ describe("feed", () => {
 </div>
 `);
 	});
+
+	test("codec badge shows the sub-stream codec when preferring low res", () => {
+		global.fetch = () => new Promise(() => {});
+		const feed = newSlowPollStream(
+			{
+				id: "a",
+				name: "m",
+				hasSubStream: true,
+				codec: "hvc1.1.6.L93.B0",
+				subCodec: "avc1.42E01E",
+			},
+			true,
+			[],
+		);
+		const badge = feed.elem.querySelector(".player-overlay-codec");
+		expect(badge?.textContent).toBe("avc1");
+		feed.destroy();
+	});
+
+	test("codec badge shows the main codec without preferLowRes", () => {
+		global.fetch = () => new Promise(() => {});
+		const feed = newSlowPollStream(
+			{
+				id: "a",
+				name: "m",
+				hasSubStream: true,
+				codec: "hvc1.1.6.L93.B0",
+				subCodec: "avc1.42E01E",
+			},
+			false,
+			[],
+		);
+		const badge = feed.elem.querySelector(".player-overlay-codec");
+		expect(badge?.textContent).toBe("hvc1");
+		feed.destroy();
+	});
+
+	test("codec badge falls back to main codec and is absent without codec", () => {
+		global.fetch = () => new Promise(() => {});
+		// Sub stream preferred but has no codec: fall back to main.
+		const feed = newSlowPollStream(
+			{ id: "a", name: "m", hasSubStream: true, codec: "avc1.42E01E" },
+			true,
+			[],
+		);
+		expect(feed.elem.querySelector(".player-overlay-codec")?.textContent).toBe(
+			"avc1",
+		);
+		feed.destroy();
+
+		// No codec at all: no badge.
+		const feed2 = newSlowPollStream({ id: "a", name: "m" }, true, []);
+		expect(feed2.elem.querySelector(".player-overlay-codec")).toBeNull();
+		feed2.destroy();
+	});
 });
 
 /*

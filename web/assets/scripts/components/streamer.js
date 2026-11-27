@@ -34,6 +34,11 @@ function newStreamer(monitor, preferLowRes, streamer, buttons = []) {
 function newSlowPollStream(monitor, preferLowRes, buttons = []) {
 	const monitorId = monitor["id"];
 	const subStream = monitor.hasSubStream && preferLowRes;
+	// Codec of the stream being played, from monitorsInfo (absent when the
+	// stream is down). Badge shows the codec family, e.g. "avc1"/"hvc1".
+	const codec = ((subStream && monitor["subCodec"]) || monitor["codec"] || "").split(
+		".",
+	)[0];
 
 	const buttonElems = [];
 	for (const button of buttons) {
@@ -91,7 +96,9 @@ function newSlowPollStream(monitor, preferLowRes, buttons = []) {
 					class="player-overlay absolute flex bg-color1 text-color text-1.3 px-1"
 					style="z-index: 2; left: 0; top: 0; border: none; border-bottom-right-radius: var(--radius-md);"
 				>
-					${monitor.name}
+					${monitor.name}${codec === ""
+						? ""
+						: `<span class="player-overlay-codec" style="margin-left: 0.4em; opacity: 0.7;">${codec}</span>`}
 				</div>`,
 			),
 			$overlay,
