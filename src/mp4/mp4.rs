@@ -356,18 +356,6 @@ pub async fn write_box_header2(
     Ok(())
 }
 
-pub fn write_single_box<W: Write>(w: &mut W, b: &dyn ImmutableBoxSync) -> Result<usize, Mp4Error> {
-    let size = 8 + b.size();
-
-    write_box_header(w, size, b.box_type())?;
-
-    // The size of a empty box is 8 bytes.
-    if size != 8 {
-        b.marshal(w)?;
-    }
-    Ok(size)
-}
-
 pub async fn write_single_box2(
     w: &mut (dyn AsyncWrite + Unpin + Send + Sync),
     b: &dyn ImmutableBoxAsync,
@@ -741,191 +729,6 @@ impl ImmutableBoxAsync for Url {
     }
 }
 
-/*************************** edts ****************************/
-
-pub const TYPE_EDTS: BoxType = *b"edts";
-
-pub struct Edts;
-impl_from!(Edts);
-
-impl ImmutableBox for Edts {
-    fn box_type(&self) -> BoxType {
-        TYPE_EDTS
-    }
-
-    fn size(&self) -> usize {
-        0
-    }
-}
-
-impl ImmutableBoxSync for Edts {
-    fn marshal(&self, _: &mut dyn Write) -> Result<(), Mp4Error> {
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl ImmutableBoxAsync for Edts {
-    async fn marshal(
-        &self,
-        _: &mut (dyn AsyncWrite + Unpin + Send + Sync),
-    ) -> Result<(), Mp4Error> {
-        Ok(())
-    }
-}
-
-/*************************** elst ****************************/
-
-pub const TYPE_ELST: BoxType = *b"elst";
-
-#[derive(Clone)]
-pub struct Elst {
-    pub flags: [u8; 3],
-    pub entries: ElstEntries,
-}
-impl_from!(Elst);
-
-impl ImmutableBox for Elst {
-    fn box_type(&self) -> BoxType {
-        TYPE_ELST
-    }
-
-    fn size(&self) -> usize {
-        match &self.entries {
-            ElstEntries::V0(v) => 8 + v.len() * 12,
-            ElstEntries::V1(v) => 8 + v.len() * 20,
-        }
-    }
-}
-
-impl ImmutableBoxSync for Elst {
-    fn marshal(&self, w: &mut dyn Write) -> Result<(), Mp4Error> {
-        match &self.entries {
-            ElstEntries::V0(entries) => {
-                w.write_all(&[0])?;
-                w.write_all(&self.flags)?;
-                w.write_all(
-                    &u32::try_from(entries.len())
-                        .map_err(|e| Mp4Error::FromInt("elst".to_owned(), e))?
-                        .to_be_bytes(),
-                )?;
-                for entry in entries {
-                    w.write_all(&entry.segment_duration.to_be_bytes())?;
-                    w.write_all(&entry.media_time.to_be_bytes())?;
-                    w.write_all(&entry.media_rate_integer.to_be_bytes())?;
-                    w.write_all(&entry.media_rate_fraction.to_be_bytes())?;
-                }
-            }
-            ElstEntries::V1(entries) => {
-                w.write_all(&[1])?;
-                w.write_all(&self.flags)?;
-                w.write_all(
-                    &u32::try_from(entries.len())
-                        .map_err(|e| Mp4Error::FromInt("elst".to_owned(), e))?
-                        .to_be_bytes(),
-                )?;
-                for entry in entries {
-                    w.write_all(&entry.segment_duration.to_be_bytes())?;
-                    w.write_all(&entry.media_time.to_be_bytes())?;
-                    w.write_all(&entry.media_rate_integer.to_be_bytes())?;
-                    w.write_all(&entry.media_rate_fraction.to_be_bytes())?;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl ImmutableBoxAsync for Elst {
-    async fn marshal(
-        &self,
-        w: &mut (dyn AsyncWrite + Unpin + Send + Sync),
-    ) -> Result<(), Mp4Error> {
-        match &self.entries {
-            ElstEntries::V0(entries) => {
-                w.write_all(&[0]).await?;
-                w.write_all(&self.flags).await?;
-                w.write_all(
-                    &u32::try_from(entries.len())
-                        .map_err(|e| Mp4Error::FromInt("elst".to_owned(), e))?
-                        .to_be_bytes(),
-                )
-                .await?;
-                for entry in entries {
-                    w.write_all(&entry.segment_duration.to_be_bytes()).await?;
-                    w.write_all(&entry.media_time.to_be_bytes()).await?;
-                    w.write_all(&entry.media_rate_integer.to_be_bytes()).await?;
-                    w.write_all(&entry.media_rate_fraction.to_be_bytes())
-                        .await?;
-                }
-            }
-            ElstEntries::V1(entries) => {
-                w.write_all(&[1]).await?;
-                w.write_all(&self.flags).await?;
-                w.write_all(
-                    &u32::try_from(entries.len())
-                        .map_err(|e| Mp4Error::FromInt("elst".to_owned(), e))?
-                        .to_be_bytes(),
-                )
-                .await?;
-                for entry in entries {
-                    w.write_all(&entry.segment_duration.to_be_bytes()).await?;
-                    w.write_all(&entry.media_time.to_be_bytes()).await?;
-                    w.write_all(&entry.media_rate_integer.to_be_bytes()).await?;
-                    w.write_all(&entry.media_rate_fraction.to_be_bytes())
-                        .await?;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
-pub enum ElstEntries {
-    V0(Vec<ElstEntryV0>),
-    V1(Vec<ElstEntryV1>),
-}
-
-#[derive(Clone)]
-pub struct ElstEntryV0 {
-    pub segment_duration: u32,
-    pub media_time: i32,
-    pub media_rate_integer: i16,
-    pub media_rate_fraction: i16,
-}
-
-impl Default for ElstEntryV0 {
-    fn default() -> Self {
-        Self {
-            segment_duration: 0,
-            media_time: 0,
-            media_rate_integer: 1,
-            media_rate_fraction: 0,
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct ElstEntryV1 {
-    pub segment_duration: u64,
-    pub media_time: i64,
-    pub media_rate_integer: i16,
-    pub media_rate_fraction: i16,
-}
-
-impl Default for ElstEntryV1 {
-    fn default() -> Self {
-        Self {
-            segment_duration: 0,
-            media_time: 0,
-            media_rate_integer: 1,
-            media_rate_fraction: 0,
-        }
-    }
-}
-
 /*************************** ftyp ****************************/
 
 pub const TYPE_FTYP: BoxType = *b"ftyp";
@@ -1033,40 +836,7 @@ impl ImmutableBoxAsync for Hdlr {
     }
 }
 
-/*************************** mdat ****************************/
-
 pub const TYPE_MDAT: BoxType = *b"mdat";
-
-pub struct Mdat(pub Vec<u8>);
-impl_from!(Mdat);
-
-impl ImmutableBox for Mdat {
-    fn box_type(&self) -> BoxType {
-        TYPE_MDAT
-    }
-
-    fn size(&self) -> usize {
-        self.0.len()
-    }
-}
-
-impl ImmutableBoxSync for Mdat {
-    fn marshal(&self, w: &mut dyn Write) -> Result<(), Mp4Error> {
-        w.write_all(&self.0)?;
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl ImmutableBoxAsync for Mdat {
-    async fn marshal(
-        &self,
-        w: &mut (dyn AsyncWrite + Unpin + Send + Sync),
-    ) -> Result<(), Mp4Error> {
-        w.write_all(&self.0).await?;
-        Ok(())
-    }
-}
 
 /*************************** mdia ****************************/
 
@@ -1657,180 +1427,7 @@ impl ImmutableBoxAsync for Avc1 {
     }
 }
 
-/**************** AVCDecoderConfiguration ****************.*/
-pub const AVC_BASELINE_PROFILE: u8 = 66; // 0x42
-pub const AVC_MAIN_PROFILE: u8 = 77; // 0x4d
-pub const AVC_EXTENDED_PROFILE: u8 = 88; // 0x58
-pub const AVC_HIGH_PROFILE: u8 = 100; // 0x64
-pub const AVC_HIGH_10_PROFILE: u8 = 110; // 0x6e
-pub const AVC_HIGH_422_PROFILE: u8 = 122; // 0x7a
-
-pub struct AvcParameterSet(Vec<u8>);
-
-impl AvcParameterSet {
-    fn field_size(&self) -> usize {
-        self.0.len() + 2
-    }
-
-    fn marshal_field(&self, w: &mut dyn Write) -> Result<(), Mp4Error> {
-        w.write_all(
-            &u16::try_from(self.0.len())
-                .map_err(|e| Mp4Error::FromInt("parameter set".to_owned(), e))?
-                .to_be_bytes(),
-        )?;
-        w.write_all(&self.0)?;
-        Ok(())
-    }
-    async fn marshal_field2(
-        &self,
-        w: &mut (dyn AsyncWrite + Unpin + Send + Sync),
-    ) -> Result<(), Mp4Error> {
-        w.write_all(
-            &u16::try_from(self.0.len())
-                .map_err(|e| Mp4Error::FromInt("parameter set".to_owned(), e))?
-                .to_be_bytes(),
-        )
-        .await?;
-        w.write_all(&self.0).await?;
-        Ok(())
-    }
-}
-
-/*************************** avcC ****************************/
-
 pub const TYPE_AVCC: BoxType = *b"avcC";
-
-pub struct AvcC {
-    pub configuration_version: u8,
-    pub profile: u8,
-    pub profile_compatibility: u8,
-    pub level: u8,
-    pub reserved: u8,                       // 6 bits.
-    pub length_size_minus_one: u8,          // 2 bits.
-    pub reserved2: u8,                      // 3 bits.
-    pub num_of_sequence_parameter_sets: u8, // 5 bits.
-    pub sequence_parameter_sets: Vec<AvcParameterSet>,
-    pub num_of_picture_parameter_sets: u8,
-    pub picture_parameter_sets: Vec<AvcParameterSet>,
-    pub high_profile_fields_enabled: bool,
-    pub reserved3: u8,               // 6 bits.
-    pub chroma_format: u8,           // 2 bits.
-    pub reserved4: u8,               // 5 bits.
-    pub bitdepth_luma_minus_8: u8,   // 3 bits.
-    pub reserved5: u8,               // 5 bits.
-    pub bitdepth_chroma_minus_8: u8, // 3 bits.
-    pub num_of_sequence_parameter_set_ext: u8,
-    pub sequence_parameter_sets_ext: Vec<AvcParameterSet>,
-}
-impl_from!(AvcC);
-
-impl ImmutableBox for AvcC {
-    fn box_type(&self) -> BoxType {
-        TYPE_AVCC
-    }
-
-    fn size(&self) -> usize {
-        let mut total = 7;
-        for sets in &self.sequence_parameter_sets {
-            total += sets.field_size();
-        }
-        for sets in &self.picture_parameter_sets {
-            total += sets.field_size();
-        }
-        if self.reserved3 != 0 {
-            total += 4;
-            for sets in &self.sequence_parameter_sets_ext {
-                total += sets.field_size();
-            }
-        }
-        total
-    }
-}
-
-impl ImmutableBoxSync for AvcC {
-    fn marshal(&self, w: &mut dyn Write) -> Result<(), Mp4Error> {
-        w.write_all(&self.configuration_version.to_be_bytes())?;
-        w.write_all(&self.profile.to_be_bytes())?;
-        w.write_all(&self.profile_compatibility.to_be_bytes())?;
-        w.write_all(&self.level.to_be_bytes())?;
-        w.write_all(&[(self.reserved << 2) | self.length_size_minus_one & 0b0000_0011])?;
-        w.write_all(&[(self.reserved2 << 5) | self.num_of_sequence_parameter_sets & 0b0001_1111])?;
-        for sets in &self.sequence_parameter_sets {
-            sets.marshal_field(w)?;
-        }
-        w.write_all(&self.num_of_picture_parameter_sets.to_be_bytes())?;
-        for sets in &self.picture_parameter_sets {
-            sets.marshal_field(w)?;
-        }
-        if self.high_profile_fields_enabled
-            && self.profile != AVC_HIGH_PROFILE
-            && self.profile != AVC_HIGH_10_PROFILE
-            && self.profile != AVC_HIGH_422_PROFILE
-            && self.profile != 144
-        {
-            panic!("fmp4 each values of profile and high_profile_fields_enabled are inconsistent")
-        }
-        if self.reserved3 != 0 {
-            w.write_all(&[(self.reserved3 << 2) | self.chroma_format & 0b0000_0011])?;
-            w.write_all(&[(self.reserved4 << 3) | self.bitdepth_luma_minus_8 & 0b0000_0111])?;
-            w.write_all(&[(self.reserved5 << 3) | self.bitdepth_chroma_minus_8 & 0b0000_0111])?;
-            w.write_all(&self.num_of_sequence_parameter_set_ext.to_be_bytes())?;
-            for sets in &self.sequence_parameter_sets_ext {
-                sets.marshal_field(w)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl ImmutableBoxAsync for AvcC {
-    async fn marshal(
-        &self,
-        w: &mut (dyn AsyncWrite + Unpin + Send + Sync),
-    ) -> Result<(), Mp4Error> {
-        w.write_all(&self.configuration_version.to_be_bytes())
-            .await?;
-        w.write_all(&self.profile.to_be_bytes()).await?;
-        w.write_all(&self.profile_compatibility.to_be_bytes())
-            .await?;
-        w.write_all(&self.level.to_be_bytes()).await?;
-        w.write_all(&[(self.reserved << 2) | self.length_size_minus_one & 0b0000_0011])
-            .await?;
-        w.write_all(&[(self.reserved2 << 5) | self.num_of_sequence_parameter_sets & 0b0001_1111])
-            .await?;
-        for sets in &self.sequence_parameter_sets {
-            sets.marshal_field2(w).await?;
-        }
-        w.write_all(&self.num_of_picture_parameter_sets.to_be_bytes())
-            .await?;
-        for sets in &self.picture_parameter_sets {
-            sets.marshal_field2(w).await?;
-        }
-        if self.high_profile_fields_enabled
-            && self.profile != AVC_HIGH_PROFILE
-            && self.profile != AVC_HIGH_10_PROFILE
-            && self.profile != AVC_HIGH_422_PROFILE
-            && self.profile != 144
-        {
-            panic!("fmp4 each values of profile and high_profile_fields_enabled are inconsistent")
-        }
-        if self.reserved3 != 0 {
-            w.write_all(&[(self.reserved3 << 2) | self.chroma_format & 0b0000_0011])
-                .await?;
-            w.write_all(&[(self.reserved4 << 3) | self.bitdepth_luma_minus_8 & 0b0000_0111])
-                .await?;
-            w.write_all(&[(self.reserved5 << 3) | self.bitdepth_chroma_minus_8 & 0b0000_0111])
-                .await?;
-            w.write_all(&self.num_of_sequence_parameter_set_ext.to_be_bytes())
-                .await?;
-            for sets in &self.sequence_parameter_sets_ext {
-                sets.marshal_field2(w).await?;
-            }
-        }
-        Ok(())
-    }
-}
 
 /*************************** stbl ****************************/
 
@@ -2238,7 +1835,6 @@ pub struct Tfdt {
 impl_from!(Tfdt);
 
 pub enum TfdtBaseMediaDecodeTime {
-    V0(u32),
     V1(u64),
 }
 
@@ -2249,7 +1845,6 @@ impl ImmutableBox for Tfdt {
 
     fn size(&self) -> usize {
         match self.base_media_decode_time {
-            TfdtBaseMediaDecodeTime::V0(_) => 8,
             TfdtBaseMediaDecodeTime::V1(_) => 12,
         }
     }
@@ -2258,11 +1853,6 @@ impl ImmutableBox for Tfdt {
 impl ImmutableBoxSync for Tfdt {
     fn marshal(&self, w: &mut dyn Write) -> Result<(), Mp4Error> {
         match self.base_media_decode_time {
-            TfdtBaseMediaDecodeTime::V0(v) => {
-                w.write_all(&[0])?;
-                w.write_all(&self.flags)?;
-                w.write_all(&v.to_be_bytes())?;
-            }
             TfdtBaseMediaDecodeTime::V1(v) => {
                 w.write_all(&[1])?;
                 w.write_all(&self.flags)?;
@@ -2280,11 +1870,6 @@ impl ImmutableBoxAsync for Tfdt {
         w: &mut (dyn AsyncWrite + Unpin + Send + Sync),
     ) -> Result<(), Mp4Error> {
         match self.base_media_decode_time {
-            TfdtBaseMediaDecodeTime::V0(v) => {
-                w.write_all(&[0]).await?;
-                w.write_all(&self.flags).await?;
-                w.write_all(&v.to_be_bytes()).await?;
-            }
             TfdtBaseMediaDecodeTime::V1(v) => {
                 w.write_all(&[1]).await?;
                 w.write_all(&self.flags).await?;
@@ -2693,61 +2278,14 @@ pub const TRUN_SAMPLE_FLAGS_PRESENT: u32 = 0b0100_0000_0000;
 pub const TRUN_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT: u32 = 0b1000_0000_0000;
 
 pub enum TrunEntries {
-    V0(Vec<TrunEntryV0>),
     V1(Vec<TrunEntryV1>),
 }
 
 impl TrunEntries {
     fn len(&self) -> usize {
         match self {
-            TrunEntries::V0(entries) => entries.len(),
             TrunEntries::V1(entries) => entries.len(),
         }
-    }
-}
-
-pub struct TrunEntryV0 {
-    pub sample_duration: u32,
-    pub sample_size: u32,
-    pub sample_flags: u32,
-    pub sample_composition_time_offset: u32,
-}
-
-impl TrunEntryV0 {
-    fn marshal_field(&self, w: &mut dyn Write, flags: [u8; 3]) -> Result<(), Mp4Error> {
-        if check_fullbox_flag(flags, TRUN_SAMPLE_DURATION_PRESENT) {
-            w.write_all(&self.sample_duration.to_be_bytes())?;
-        }
-        if check_fullbox_flag(flags, TRUN_SAMPLE_SIZE_PRESENT) {
-            w.write_all(&self.sample_size.to_be_bytes())?;
-        }
-        if check_fullbox_flag(flags, TRUN_SAMPLE_FLAGS_PRESENT) {
-            w.write_all(&self.sample_flags.to_be_bytes())?;
-        }
-        if check_fullbox_flag(flags, TRUN_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT) {
-            w.write_all(&self.sample_composition_time_offset.to_be_bytes())?;
-        }
-        Ok(())
-    }
-    async fn marshal_field2(
-        &self,
-        w: &mut (dyn AsyncWrite + Unpin + Send + Sync),
-        flags: [u8; 3],
-    ) -> Result<(), Mp4Error> {
-        if check_fullbox_flag(flags, TRUN_SAMPLE_DURATION_PRESENT) {
-            w.write_all(&self.sample_duration.to_be_bytes()).await?;
-        }
-        if check_fullbox_flag(flags, TRUN_SAMPLE_SIZE_PRESENT) {
-            w.write_all(&self.sample_size.to_be_bytes()).await?;
-        }
-        if check_fullbox_flag(flags, TRUN_SAMPLE_FLAGS_PRESENT) {
-            w.write_all(&self.sample_flags.to_be_bytes()).await?;
-        }
-        if check_fullbox_flag(flags, TRUN_SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT) {
-            w.write_all(&self.sample_composition_time_offset.to_be_bytes())
-                .await?;
-        }
-        Ok(())
     }
 }
 
@@ -2846,7 +2384,6 @@ impl ImmutableBox for Trun {
 impl ImmutableBoxSync for Trun {
     fn marshal(&self, w: &mut dyn Write) -> Result<(), Mp4Error> {
         match &self.entries {
-            TrunEntries::V0(_) => w.write_all(&[0])?,
             TrunEntries::V1(_) => w.write_all(&[1])?,
         }
         w.write_all(&self.flags)?;
@@ -2862,11 +2399,6 @@ impl ImmutableBoxSync for Trun {
             w.write_all(&self.first_sample_flags.to_be_bytes())?;
         }
         match &self.entries {
-            TrunEntries::V0(entries) => {
-                for entry in entries {
-                    entry.marshal_field(w, self.flags)?;
-                }
-            }
             TrunEntries::V1(entries) => {
                 for entry in entries {
                     entry.marshal_field(w, self.flags)?;
@@ -2884,7 +2416,6 @@ impl ImmutableBoxAsync for Trun {
         w: &mut (dyn AsyncWrite + Unpin + Send + Sync),
     ) -> Result<(), Mp4Error> {
         match &self.entries {
-            TrunEntries::V0(_) => w.write_all(&[0]).await?,
             TrunEntries::V1(_) => w.write_all(&[1]).await?,
         }
         w.write_all(&self.flags).await?;
@@ -2901,11 +2432,6 @@ impl ImmutableBoxAsync for Trun {
             w.write_all(&self.first_sample_flags.to_be_bytes()).await?;
         }
         match &self.entries {
-            TrunEntries::V0(entries) => {
-                for entry in entries {
-                    entry.marshal_field2(w, self.flags).await?;
-                }
-            }
             TrunEntries::V1(entries) => {
                 for entry in entries {
                     entry.marshal_field2(w, self.flags).await?;
