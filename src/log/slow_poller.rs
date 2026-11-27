@@ -29,7 +29,7 @@ struct DebugResponse {
 #[derive(Debug, PartialEq)]
 pub enum Response {
     Ok(Vec<LogEntryWithTime>),
-    TooManyConncetions,
+    TooManyConnections,
     Cancelled,
 }
 
@@ -129,7 +129,7 @@ impl SlowPoller {
                             if on_hold.len() == SlowPoller::MAX_CONNECTIONS {
                                 if let Some(oldest_req) = on_hold.pop_front() {
                                     // Client may have timed out.
-                                    _ = oldest_req.res.send(Response::TooManyConncetions);
+                                    _ = oldest_req.res.send(Response::TooManyConnections);
                                 }
                             }
                             on_hold.push_back(req);
@@ -427,7 +427,7 @@ mod tests {
             poll();
         }
 
-        assert_eq!(Response::TooManyConncetions, request1.await.unwrap());
+        assert_eq!(Response::TooManyConnections, request1.await.unwrap());
 
         tx.send(msg2.clone()).unwrap();
         assert_eq!(Response::Ok(vec![msg2]), request2.await.unwrap());

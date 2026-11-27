@@ -375,7 +375,7 @@ pub async fn log_slow_poll_handler(
 ) -> Response {
     match poller.slow_poll(query.0).await {
         slow_poller::Response::Ok(v) => Json::from(v).into_response(),
-        slow_poller::Response::TooManyConncetions => StatusCode::TOO_MANY_REQUESTS.into_response(),
+        slow_poller::Response::TooManyConnections => StatusCode::TOO_MANY_REQUESTS.into_response(),
         slow_poller::Response::Cancelled => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

@@ -47,7 +47,7 @@ use tokio_util::{sync::CancellationToken, task::task_tracker::TaskTrackerToken};
 //     level u8
 // }
 
-// 16666 minutes or 27.7 hours.
+// ~1667 minutes or 27.8 hours.
 const CHUNK_DURATION: u64 = 100_000 * SECOND;
 const SECOND: u64 = 1_000_000;
 
@@ -82,9 +82,9 @@ impl LogDb {
         storage_space: ByteSize,
         min_storage_usage: ByteSize,
         cache_capacity: usize,
-        write_buf_capacify: usize,
+        write_buf_capacity: usize,
     ) -> Result<Self, CreateLogDBError> {
-        assert!(cache_capacity >= write_buf_capacify);
+        assert!(cache_capacity >= write_buf_capacity);
         common::create_dir_all(&log_dir)
             .map_err(|e| CreateLogDBError::CreateLogDir(log_dir.clone(), e))?;
 
@@ -93,7 +93,7 @@ impl LogDb {
             writer: Arc::new(Mutex::new(LogDbWriter::new(
                 log_dir,
                 cache_capacity,
-                write_buf_capacify,
+                write_buf_capacity,
                 task_token,
             ))),
             storage_space,
@@ -231,7 +231,7 @@ pub(crate) struct LogDbWriter {
 
     cache: VecDeque<LogEntryWithTime>,
     cache_capacity: usize,
-    write_buf_capacify: usize,
+    write_buf_capacity: usize,
 
     cancelled: bool,
     _task_token: TaskTrackerToken,
@@ -242,7 +242,7 @@ impl LogDbWriter {
     pub fn new(
         log_dir: PathBuf,
         cache_capacity: usize,
-        write_buf_capacify: usize,
+        write_buf_capacity: usize,
         task_token: TaskTrackerToken,
     ) -> Self {
         Self {
@@ -251,7 +251,7 @@ impl LogDbWriter {
             prev_entry_time: UnixMicro::new(0),
             cache: VecDeque::with_capacity(cache_capacity),
             cache_capacity,
-            write_buf_capacify,
+            write_buf_capacity,
             cancelled: false,
             _task_token: task_token,
         }
@@ -280,7 +280,7 @@ impl LogDbWriter {
                     eprintln!("logdb: save log: flush: {e}");
                 }
                 let (encoder, prev_entry_time) =
-                    ChunkEncoder::new(self.log_dir.clone(), chunk_id, self.write_buf_capacify)
+                    ChunkEncoder::new(self.log_dir.clone(), chunk_id, self.write_buf_capacity)
                         .await?;
                 // This should only be true if the system clock was rewined at some point.
                 if self.prev_entry_time < prev_entry_time {
@@ -291,7 +291,7 @@ impl LogDbWriter {
         } else {
             // Encoder was None.
             let (encoder, prev_entry_time) =
-                ChunkEncoder::new(self.log_dir.clone(), chunk_id, self.write_buf_capacify).await?;
+                ChunkEncoder::new(self.log_dir.clone(), chunk_id, self.write_buf_capacity).await?;
             self.prev_entry_time = prev_entry_time;
             encoder
         };
@@ -592,7 +592,7 @@ where
     let entry = entry.into();
     let q = q.into();
     level_in_levels(entry.level, q.levels)
-        && source_in_souces(entry.source, q.sources)
+        && source_in_sources(entry.source, q.sources)
         && monitor_id_in_monitor_ids(entry.monitor_id, q.monitors)
 }
 
@@ -602,7 +602,7 @@ fn level_in_levels(level: LogLevel, levels: &[LogLevel]) -> bool {
 }
 
 // Returns true if source is in sources or if sources is empty.
-fn source_in_souces(source: &LogSource, sources: &[LogSource]) -> bool {
+fn source_in_sources(source: &LogSource, sources: &[LogSource]) -> bool {
     sources.is_empty() || sources.contains(source)
 }
 
