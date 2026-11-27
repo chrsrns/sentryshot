@@ -17,7 +17,7 @@ fn test_params() -> TrackParameters {
     TrackParameters {
         width: 64,
         height: 64,
-        codec: "test_codec".to_owned(),
+        codec: "avc1.42E01E".to_owned(),
         extra_data: Vec::new(),
     }
 }
@@ -237,7 +237,7 @@ async fn test_play() {
     assert_eq!(
         StartSessionResponseReady {
             start_time: UnixH264::new(3).into(),
-            codecs: "test_codec".to_owned(),
+            codecs: "avc1.42E01E".to_owned(),
         },
         streamer
             .start_session(m_id("test"), false, 123)
