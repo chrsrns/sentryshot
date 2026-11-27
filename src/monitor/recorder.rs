@@ -393,9 +393,11 @@ async fn generate_video(
         .ok_or(GenerateVideoError::Add)?;
 
     let header = MetaHeader {
+        version: 2,
         start_time,
         width: params.width,
         height: params.height,
+        codec: params.codec.clone(),
         extra_data: params.extra_data.clone(),
     };
 

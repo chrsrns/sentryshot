@@ -505,7 +505,6 @@ impl AsyncSeek for VodReader {
     }
 }
 
-
 struct RecPartWithSamples {
     rec: Rec,
     samples: Vec<Sample>,
@@ -1567,9 +1566,11 @@ mod tests {
         let mut meta = rec.new_file("meta").await.unwrap();
         let mut mdat = rec.new_file("mdat").await.unwrap();
         let header = MetaHeader {
+            version: 2,
             start_time,
             width: 640,
             height: 480,
+            codec: "avc1".to_owned(),
             extra_data: vec![0x33],
         };
 

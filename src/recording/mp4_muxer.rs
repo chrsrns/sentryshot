@@ -520,6 +520,7 @@ mod tests {
         let params = TrackParameters {
             width: 650,
             height: 450,
+            codec: "avc1".to_owned(),
             extra_data: vec![
                 1,    // Configuration version.
                 0x64, // Profile.
