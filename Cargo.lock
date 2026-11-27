@@ -2094,7 +2094,6 @@ dependencies = [
  "fs",
  "jiff",
  "pretty_assertions",
- "recording",
  "serde",
  "serde_json",
  "tempfile",
@@ -2108,14 +2107,12 @@ name = "recording"
 version = "0.3.11"
 dependencies = [
  "async-trait",
- "axum 0.8.1",
  "common",
  "mp4",
  "pin-project",
  "pretty-hex",
  "pretty_assertions",
  "sentryshot_padded_bytes",
- "serde",
  "tempfile",
  "test-case",
  "thiserror 2.0.11",
@@ -3201,7 +3198,6 @@ checksum = "49874b5167b65d7193b8aba1567f5c7d93d001cafc34600cee003eda787e483f"
 name = "vod"
 version = "0.3.11"
 dependencies = [
- "bytesize",
  "common",
  "pin-project",
  "pretty-hex",

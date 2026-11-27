@@ -18,15 +18,14 @@ common.path = "../common"
 recdb.path = "../recdb"
 recording.path = "../recording"
 
-bytesize.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 pin-project.workspace = true
 
 
 [dev-dependencies]
+serde_json.workspace = true
 pretty_assertions.workspace = true
 pretty-hex.workspace = true
 test-case.workspace = true
