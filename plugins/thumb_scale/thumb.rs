@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use common::{ArcLogger, LogEntry, LogLevel, monitor::MonitorConfig};
 use plugin::{Application, Plugin, types::Assets};
 use sentryshot_scale::{Frame, Scaler};
-use serde::Deserialize;
 use std::{borrow::Cow, ffi::c_char, num::NonZeroU16, sync::Arc};
 
 #[unsafe(no_mangle)]
@@ -40,18 +39,18 @@ impl Plugin for ThumbScalePlugin {
             });
         };
 
-        #[derive(Deserialize)]
-        #[allow(clippy::items_after_statements)]
-        struct Temp {
-            #[serde(rename = "thumbScale")]
-            thumb_scale: String,
-        }
-        let Ok(temp) = serde_json::from_value::<Temp>(config.raw().clone()) else {
-            log(LogLevel::Warning, "config is not set");
-            return frame;
+        let scale = match config.raw().get("thumbScale") {
+            // Not configured, nothing to do.
+            None => return frame,
+            Some(v) => match v.as_str() {
+                Some(s) => s,
+                None => {
+                    log(LogLevel::Warning, "invalid config: not a string");
+                    return frame;
+                }
+            },
         };
-        let scale = temp.thumb_scale;
-        let scale = match scale.as_str() {
+        let scale = match scale {
             "full" => return frame,
             "half" => 2,
             "third" => 3,
