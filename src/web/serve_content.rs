@@ -135,91 +135,6 @@ where
             HeaderValue::from_str(&send_size.to_string()).unwrap(),
         );
     }
-    /*w.Header().Set("Accept-Ranges", "bytes")
-    if w.Header().Get("Content-Encoding") == "" {
-        w.Header().Set("Content-Length", strconv.FormatInt(sendSize, 10))
-    }*/
-
-    //
-
-    /*if size >= 0 { //nolint:nestif
-        ranges, err := parseRange(rangeReq, size)
-        if err != nil {
-            //if errors.Is(err, errNoOverlap) {
-                // /*w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
-            //}
-            http.Error(w, err.Error(), http.StatusRequestedRangeNotSatisfiable)
-            return
-        }
-        if sumRangesSize(ranges) > size {
-            // The total number of bytes in all the ranges
-            // is larger than the size of the file by
-            // itself, so this is probably an attack, or a
-            // dumb client. Ignore the range request.
-            ranges = nil
-        }
-        switch {
-        case len(ranges) == 1:
-            // RFC 7233, Section 4.1:
-            // "If a single part is being transferred, the server
-            // generating the 206 response MUST generate a
-            // Content-Range header field, describing what range
-            // of the selected representation is enclosed, and a
-            // payload consisting of the range.
-            // ...
-            // A server MUST NOT generate a multipart response to
-            // a request for a single range, since a client that
-            // does not request multiple parts might not support
-            // multipart responses."
-            ra := ranges[0]
-            if _, err := content.Seek(ra.start, io.SeekStart); err != nil {
-                http.Error(w, err.Error(), http.StatusRequestedRangeNotSatisfiable)
-                return
-            }
-            sendSize = ra.length
-            code = http.StatusPartialContent
-            w.Header().Set("Content-Range", ra.contentRange(size))
-        case len(ranges) > 1:
-            sendSize = rangesMIMESize(ranges, size)
-            code = http.StatusPartialContent
-
-            pr, pw := io.Pipe()
-            mw := multipart.NewWriter(pw)
-            w.Header().Set("Content-Type", "multipart/byteranges; boundary="+mw.Boundary())
-            sendContent = pr
-            defer pr.Close() // cause writing goroutine to fail and exit if CopyN doesn't finish.
-            go func() {
-                for _, ra := range ranges {
-                    part, err := mw.CreatePart(ra.mimeHeader(size))
-                    if err != nil {
-                        pw.CloseWithError(err)
-                        return
-                    }
-                    if _, err := content.Seek(ra.start, io.SeekStart); err != nil {
-                        pw.CloseWithError(err)
-                        return
-                    }
-                    if _, err := io.CopyN(part, content, ra.length); err != nil {
-                        pw.CloseWithError(err)
-                        return
-                    }
-                }
-                mw.Close()
-                pw.Close()
-            }()
-        }
-
-        w.Header().Set("Accept-Ranges", "bytes")
-        if w.Header().Get("Content-Encoding") == "" {
-            w.Header().Set("Content-Length", strconv.FormatInt(sendSize, 10))
-        }
-    }
-
-    w.WriteHeader(code)
-
-    if r.Method != http.MethodHead {
-        io.CopyN(w, sendContent, sendSize) //nolint:errcheck
-    }*/
 
     let body = axum::body::Body::new(AsyncReadBody::limited(content, send_size));
     (response_code, response_headers, body).into_response()
@@ -401,16 +316,6 @@ impl HttpRange {
         )
     }
 
-    /*fn mime_header(&self, size: u64) -> HashMap<String, Vec<String>> {
-        HashMap::from([
-            ("Content-Range".to_owned(), vec![self.content_range(size)]),
-            ("Content-Type".to_owned(), vec!["video/mp4".to_owned()]),
-        ])
-        /*return textproto.MIMEHeader{
-            "Content-Range": {r.contentRange(size)},
-            "Content-Type":  {"video/mp4"},
-        }*/
-    }*/
 }
 
 #[derive(Debug, Error)]
@@ -495,20 +400,6 @@ fn parse_range(s: Option<String>, size: u64) -> Result<Vec<HttpRange>, ParseRang
             }
             r.start = size - i;
             r.length = size - r.start;
-            /*
-            if end == "" || end[0] == '-' {
-                return nil, errors.New("invalid range") //nolint:goerr113
-            }
-            i, err := strconv.ParseInt(end, 10, 64)
-            if i < 0 || err != nil {
-                return nil, errors.New("invalid range") //nolint:goerr113
-            }
-            if i > size {
-                i = size
-            }
-            r.start = size - i
-            r.length = size - r.start
-            */
         }
 
         ranges.push(r);
@@ -541,47 +432,7 @@ fn is_ascii_space(b: u8) -> bool {
     b == b' ' || b == b'\t' || b == b'\n' || b == b'\r'
 }
 
-// Counts how many bytes have been written to it.
-//struct CountingWriter(u64);
-
-/*impl Write for CountingWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0 += u64::try_from(buf.len()).expect("len to fit u64");
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}*/
-
-/*func (w *countingWriter) Write(p []byte) (int, error) {
-    *w += countingWriter(len(p))
-    return len(p), nil
-}*/
-
-// Returns the number of bytes it takes to encode
-// the provided ranges as a multipart response.
-/*fn ranges_mime_size(ranges: &Vec<HttpRange>, content_size: u64) -> u64 {
-    let mut enc_size = 0;
-    let mut w = CountingWriter(0);
-    let mut mw = MultiPartWriter::new();
-    //mw := multipart.NewWriter(&w)
-    for ra in ranges {
-        _ = mw.create_part(ra.mime_header(content_size), &mut w);
-        enc_size += ra.length;
-    }
-    /*for _, ra := range ranges {
-        mw.CreatePart(ra.mimeHeader(contentSize)) //nolint:errcheck
-        encSize += ra.length
-    }*/
-    enc_size += w.0;
-    //encSize += int64(w)
-    //return encSize*//*
-    enc_size
-}*/
-
-fn sum_ranges_size(ranges: &Vec<HttpRange>) -> u64 {
+fn sum_ranges_size(ranges: &[HttpRange]) -> u64 {
     let mut size = 0;
     for ra in ranges {
         size += ra.length;
@@ -589,117 +440,6 @@ fn sum_ranges_size(ranges: &Vec<HttpRange>) -> u64 {
     size
 }
 
-/*
-struct MultiPartWriter {
-    boundary: String,
-    first_part: bool,
-}
-
-impl MultiPartWriter {
-    fn new() -> Self {
-        Self {
-            boundary: random_boundary(),
-            first_part: true,
-        }
-    }
-    // CreatePart creates a new multipart section with the provided
-    // header. The body of the part should be written to the returned
-    // Writer. After calling CreatePart, any previous part may no longer
-    // be written to.
-    fn create_part(
-        &mut self,
-        header: HashMap<String, Vec<String>>,
-        w: &mut impl Write,
-    ) -> Result<(), CreatePartError> {
-        use CreatePartError::*;
-        /*if w.lastpart != nil {
-            if err := w.lastpart.close(); err != nil {
-                return nil, err
-            }
-        }*/
-
-        let mut b = Vec::new();
-        //var b bytes.Buffer
-        if !self.first_part {
-            write!(b, "\r\n--{}\r\n", self.boundary)?;
-        } else {
-            write!(b, "--{}\r\n", self.boundary)?;
-        }
-        /*if w.lastpart != nil {
-            fmt.Fprintf(&b, "\r\n--%s\r\n", w.boundary)
-        } else {
-            fmt.Fprintf(&b, "--%s\r\n", w.boundary)
-        }*/
-
-        let mut keys: Vec<String> = Vec::with_capacity(header.len());
-        for k in header.keys() {
-            keys.push(k.to_owned());
-        }
-        /*
-        keys := make([]string, 0, len(header))
-        for k := range header {
-            keys = append(keys, k)
-        }
-        */
-
-        keys.sort();
-        //sort.Strings(keys)
-
-        for k in keys {
-            for v in header.get(&k).unwrap() {
-                write!(b, "{}: {}\r\n", k, v)?;
-            }
-        }
-        /*for _, k := range keys {
-            for _, v := range header[k] {
-                fmt.Fprintf(&b, "%s: %s\r\n", k, v)
-            }
-        }*/
-
-        write!(b, "\r\n")?;
-        //fmt.Fprintf(&b, "\r\n")
-        std::io::copy(&mut Cursor::new(b), w).map_err(Copy)?;
-        /*_, err := io.Copy(w.w, &b)
-        if err != nil {
-            return nil, err
-        }
-        */
-
-        /*
-        p := &part{
-            mw: w,
-        }
-        */
-        //w.lastpart = p
-        //return p, nil
-        Ok(())
-    }
-}
-
-#[derive(Debug, Error)]
-enum CreatePartError {
-    #[error("write: {0}")]
-    Write(#[from] std::io::Error),
-
-    #[error("copy {0}")]
-    Copy(std::io::Error),
-}
-
-fn random_boundary() -> String {
-    let rng = rand::thread_rng();
-    let s: String = rng
-        .sample_iter(Alphanumeric)
-        .take(30)
-        .map(char::from)
-        .collect();
-    /*var buf [30]byte
-    _, err := io.ReadFull(rand.Reader, buf[:])
-    if err != nil {
-        panic(err)
-    }
-    return fmt.Sprintf("%x", buf[:])*/
-    s
-}*/
 
 /// Adapter that turns an [`impl AsyncRead`][tokio::io::AsyncRead] to an [`impl Body`][http_body::Body].
 #[derive(Debug)]
