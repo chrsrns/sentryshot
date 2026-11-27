@@ -49,9 +49,6 @@ struct RawConfigV0 {
 
     #[serde(rename = "feedRate")]
     feed_rate: FeedRateSec,
-    //#[serde(rename = "frameScale")]
-    //frame_scale: String,
-    //FrameScale string `json:"frameScale"`
     // Trigger duration.
     duration: DurationSec,
     zones: Vec<ZoneConfig>,
@@ -110,8 +107,7 @@ mod tests {
             "motion": {
                 "enable":     true,
                 "feedRate":   5,
-                "frameScale": "full",
-                "duration":   6,
+                    "duration":   6,
                 "zones":[
                     {
                         "enable": true,
@@ -162,8 +158,7 @@ mod tests {
             "motion": {
                 "enable":     false,
                 "feedRate":   5,
-                "frameScale": "full",
-                "duration":   6,
+                    "duration":   6,
                 "zones":[
                     {
                         "enable": true,

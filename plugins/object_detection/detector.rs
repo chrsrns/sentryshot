@@ -171,7 +171,6 @@ impl DetectorManager {
         &self.configs
     }
 
-    #[allow(unused)]
     pub(crate) fn get_detector(&self, name: &DetectorName) -> Option<ArcDetector> {
         self.detectors.get(name).cloned()
     }
