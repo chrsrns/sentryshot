@@ -307,13 +307,8 @@ impl SourceRtsp {
         .map_err(Describe)?;
 
         let video_stream_i = {
-            let s = session.streams().iter().position(|s| {
-                if s.media() == "video" {
-                    if s.encoding_name() == "h264" {
-                        self.log(LogLevel::Debug, "using h264 video stream");
-                        return true;
-                    }
-
+            for s in session.streams() {
+                if s.media() == "video" && !matches!(s.encoding_name(), "h264" | "h265") {
                     self.log(
                         LogLevel::Debug,
                         &format!(
@@ -322,12 +317,25 @@ impl SourceRtsp {
                         ),
                     );
                 }
-                false
-            });
-            let Some(s) = s else {
+            }
+
+            let picked = pick_video_stream(
+                session
+                    .streams()
+                    .iter()
+                    .map(|s| (s.media(), s.encoding_name())),
+            );
+            let Some(i) = picked else {
                 return Err(NoVideoStreamFound(format_streams(session.streams())));
             };
-            s
+            self.log(
+                LogLevel::Debug,
+                &format!(
+                    "using {} video stream",
+                    session.streams()[i].encoding_name()
+                ),
+            );
+            i
         };
 
         let transport = match self.config.protocol {
@@ -593,6 +601,28 @@ fn creds_from_url(url: &Url) -> Option<retina::client::Credentials> {
     }
 }
 
+// Picks the index of the preferred video stream: the first h264 stream
+// if any, otherwise the first h265 stream. h264 wins when the camera
+// offers both because browser HEVC playback support is device-dependent.
+fn pick_video_stream<'a>(streams: impl Iterator<Item = (&'a str, &'a str)>) -> Option<usize> {
+    let mut first_h265 = None;
+    for (i, (media, encoding)) in streams.enumerate() {
+        if media != "video" {
+            continue;
+        }
+        match encoding {
+            "h264" => return Some(i),
+            "h265" => {
+                if first_h265.is_none() {
+                    first_h265 = Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    first_h265
+}
+
 fn format_streams(streams: &[Stream]) -> String {
     streams
         .iter()
@@ -729,5 +759,53 @@ mod tests {
     fn creds_from_url_none() {
         let url = Url::parse("rtsp://192.168.1.1/stream").unwrap();
         assert!(creds_from_url(&url).is_none());
+    }
+
+    fn pick(streams: &[(&str, &str)]) -> Option<usize> {
+        pick_video_stream(streams.iter().copied())
+    }
+
+    #[test]
+    fn pick_video_stream_h264_only() {
+        assert_eq!(
+            Some(1),
+            pick(&[
+                ("audio", "mpeg4-generic"),
+                ("video", "h264"),
+                ("video", "h264"),
+            ])
+        );
+    }
+
+    #[test]
+    fn pick_video_stream_h265_only() {
+        assert_eq!(
+            Some(0),
+            pick(&[("video", "h265"), ("audio", "mpeg4-generic")])
+        );
+    }
+
+    #[test]
+    fn pick_video_stream_prefers_h264_over_h265() {
+        // h265 first: h264 still wins.
+        assert_eq!(Some(1), pick(&[("video", "h265"), ("video", "h264")]));
+        // h264 first: h264 wins.
+        assert_eq!(Some(0), pick(&[("video", "h264"), ("video", "h265")]));
+    }
+
+    #[test]
+    fn pick_video_stream_first_of_kind() {
+        assert_eq!(Some(0), pick(&[("video", "h265"), ("video", "h265")]));
+    }
+
+    #[test]
+    fn pick_video_stream_unsupported_codec() {
+        assert_eq!(None, pick(&[("video", "mjpeg")]));
+    }
+
+    #[test]
+    fn pick_video_stream_no_video() {
+        assert_eq!(None, pick(&[("audio", "mpeg4-generic")]));
+        assert_eq!(None, pick(&[]));
     }
 }
