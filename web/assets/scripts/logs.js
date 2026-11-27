@@ -812,9 +812,8 @@ function init(uiData) {
 	newLogSelector(logger, formFields, document.querySelector(".js-content"));
 
 	window.addEventListener("resize", logger.lazyLoadSavedLogs);
-	// Lazy-load on viewport changes: rotation and resize.
+	// Lazy-load on rotation too — no resize event fires.
 	window.addEventListener("orientationchange", logger.lazyLoadSavedLogs);
-	window.addEventListener("resize", logger.lazyLoadSavedLogs);
 	$logLists.addEventListener("scroll", logger.lazyLoadSavedLogs);
 }
 

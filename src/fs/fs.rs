@@ -82,7 +82,6 @@ pub enum Entry {
     File(Box<dyn File>),
 }
 
-#[allow(unused)]
 impl Entry {
     #[must_use]
     pub fn name(&self) -> &Path {
@@ -91,29 +90,11 @@ impl Entry {
             Entry::File(v) => v.name(),
         }
     }
-
-    fn is_dir(&self) -> bool {
-        matches!(self, Entry::Dir(_))
-    }
 }
 
 pub enum Open {
     File(Box<dyn File>),
     Dir(Box<dyn Dir>),
-}
-
-#[allow(unused)]
-impl Open {
-    fn name(&self) -> &Path {
-        match self {
-            Open::File(v) => v.name(),
-            Open::Dir(v) => v.name(),
-        }
-    }
-
-    fn is_dir(&self) -> bool {
-        matches!(self, Open::Dir(_))
-    }
 }
 
 pub trait File {

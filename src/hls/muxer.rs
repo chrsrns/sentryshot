@@ -84,17 +84,11 @@ impl HlsMuxer {
         }
 
         if name == "init.mp4" {
-            //sps := m.videoTrack.SPS
-
-            if self.init_content.lock().await.is_empty()
-            /*|| (!bytes.Equal(m.videoLastSPS, sps) ||
-            !bytes.Equal(m.videoLastPPS, m.videoTrack.PPS))*/
-            {
+            if self.init_content.lock().await.is_empty() {
                 let result = generate_init(&self.params);
                 match result {
                     Ok(init_content) => *self.init_content.lock().await = init_content,
                     Err(_) => {
-                        //m.logf(log.LevelError, "generate init.mp4: %w", err)
                         return MuxerFileResponse {
                             status: StatusCode::INTERNAL_SERVER_ERROR,
                             headers: None,
@@ -102,8 +96,6 @@ impl HlsMuxer {
                         };
                     }
                 }
-                //m.videoLastSPS = m.videoTrack.SPS
-                //m.videoLastPPS = m.videoTrack.PPS
             }
 
             let body = Box::new(Cursor::new(self.init_content.lock().await.clone()));

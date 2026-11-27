@@ -609,13 +609,6 @@ impl PlaylistState {
             self.segment_delete_count += 1;
         }
 
-        /*
-        self.nextSegmentsOnHold
-        .drain_filter(|req| segment.id > req.prevID)
-        .for_each(|req| {
-            req.res.send(segment.clone());
-        });
-        */
         let mut i = 0;
         while i < self.next_segments_on_hold.len() {
             if segment.id() > self.next_segments_on_hold[i].prev_id {
