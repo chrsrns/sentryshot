@@ -371,28 +371,6 @@ pub async fn write_single_box2(
     Ok(size)
 }
 
-/*
-// Marshal ImmutableBoxes to writer.
-fn (boxes ImmutableBoxes) marshal(&self, w: &mut dyn std::io::Write) -> Result<(), MarshalError> {
-    for _, b := range boxes {
-        if _, err := WriteSingleBox(w, b); err != nil {
-            return err
-        }
-    }
-    return nil
-}
-
-// Size combined size of boxes.
-fn (boxes ImmutableBoxes) size(&self) -> usize {
-    var n int
-    for _, b := range boxes {
-        n += 8
-        n += b.Size()
-    }
-    return n
-}
-
-*/
 /************************* FullBox **************************/
 
 #[derive(Clone, Copy, Default)]
@@ -787,8 +765,8 @@ pub const TYPE_HDLR: BoxType = *b"hdlr";
 pub struct Hdlr {
     pub full_box: FullBox,
     // Predefined corresponds to component_type of QuickTime.
-    // pre_defined of ISO-14496 has albufays zero,
-    // hobufever component_type has "mhlr" or "dhlr".
+    // pre_defined of ISO-14496 is always zero;
+    // component_type is "mhlr" or "dhlr".
     pub pre_defined: u32,
     pub handler_type: [u8; 4],
     pub reserved: [u32; 3],
