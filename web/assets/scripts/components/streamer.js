@@ -126,7 +126,6 @@ const newStreamerBtn = {
 	recordings: newRecordingsBtn,
 };
 
-
 const iconMaximizePath = "assets/icons/feather/maximize.svg";
 const iconMinimizePath = "assets/icons/feather/minimize.svg";
 
@@ -226,6 +225,8 @@ async function newStream(parentSignal, $video, debugOverlay, monitorId, subStrea
 	let cancelled = false;
 	/** @type {string} */
 	let lastError;
+	/** @type {Error | undefined} */
+	let fatalError;
 
 	/** @param {AbortSignal} signal */
 	const run = async (signal) => {
@@ -257,19 +258,22 @@ async function newStream(parentSignal, $video, debugOverlay, monitorId, subStrea
 
 		$video.disableRemotePlayback = true;
 
-		/** @type {MediaSource} */
-		let mediaSource;
+		// https://github.com/w3c/media-source/issues/320
+		/** @type {typeof MediaSource | undefined} */
 		// @ts-ignore
-		if (window.ManagedMediaSource) {
-			// https://github.com/w3c/media-source/issues/320
-			// @ts-ignore
-			// eslint-disable-next-line no-undef
-			mediaSource = new ManagedMediaSource();
-		} else if (window.MediaSource) {
-			mediaSource = new MediaSource();
-		} else {
+		const SourceApi = window.ManagedMediaSource || window.MediaSource;
+		if (SourceApi === undefined) {
 			throw new Error("no media source api available");
 		}
+		// Unsupported codec would throw in addSourceBuffer and retry
+		// forever; codec support is static per browser so retrying
+		// is pointless.
+		if (!SourceApi.isTypeSupported(mimeCodec)) {
+			fatalError = new Error(`codec unsupported by this browser: ${codecs}`);
+			return;
+		}
+
+		const mediaSource = new SourceApi();
 
 		const waitForSourceOpen = new Promise((resolve) => {
 			mediaSource.addEventListener("sourceopen", resolve, { once: true });
@@ -386,6 +390,11 @@ async function newStream(parentSignal, $video, debugOverlay, monitorId, subStrea
 			}
 		}
 		abort.abort();
+		if (fatalError !== undefined) {
+			lastError = fatalError.message;
+			console.error(fatalError);
+			return;
+		}
 		await sleep(parentSignal, 3000);
 	}
 }

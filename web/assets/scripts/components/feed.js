@@ -115,11 +115,35 @@ function newFeed(Hls, monitor, preferLowRes, buttons = []) {
 
 	try {
 		if (Hls.isSupported()) {
-			hls = new Hls(hlsConfig);
-			hls.onError = (error) => {
-				console.log(error);
+			const initHls = () => {
+				hls = new Hls(hlsConfig);
+				hls.onError = (error) => {
+					console.log(error);
+				};
+				hls.init($video, index);
 			};
-			hls.init($video, index);
+			// Gate on the playlist-declared codec; hls.js would hit an
+			// unsupported MSE error it can only log. Fails open on
+			// fetch/parse failure to preserve the down-monitor path.
+			fetch(index)
+				.then((response) => response.text())
+				.then((playlist) => {
+					const match = playlist.match(/CODECS="([^"]+)"/);
+					const codec = match === null ? undefined : match[1];
+					/** @type {typeof MediaSource | undefined} */
+					// @ts-ignore
+					const SourceApi = window.ManagedMediaSource || window.MediaSource;
+					if (
+						codec !== undefined &&
+						SourceApi !== undefined &&
+						!SourceApi.isTypeSupported(`video/mp4; codecs="${codec}"`)
+					) {
+						alert(`codec unsupported by this browser: ${codec}`);
+						return;
+					}
+					initHls();
+				})
+				.catch(initHls);
 		} else if ($video.canPlayType("application/vnd.apple.mpegurl")) {
 			// since it's not possible to detect timeout errors in iOS,
 			// wait for the playlist to be available before starting the stream
@@ -139,7 +163,7 @@ function newFeed(Hls, monitor, preferLowRes, buttons = []) {
 	return {
 		elem,
 		destroy() {
-			hls.destroy();
+			hls?.destroy();
 		},
 	};
 }

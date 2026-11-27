@@ -349,6 +349,38 @@ function newPlayer(data, isAdmin, token, onVideoLoad) {
 		element.replaceChildren(...video.elems);
 		element.classList.add("js-loaded");
 
+		// Source-selection failures (e.g. an h265 recording on a browser
+		// without HEVC) land on the <source> element, not video.error.
+		const showMediaUnsupported = () => {
+			if (element.querySelector(".js-media-unsupported") !== null) {
+				return;
+			}
+			element.append(
+				htmlToElem(/* HTML */ `
+					<div
+						class="js-media-unsupported absolute flex justify-center items-center w-full h-full text-color"
+						style="z-index: 3; top: 0; left: 0; background: rgb(0 0 0 / 60%);"
+					>
+						<span class="p-1"
+							>recording may use a codec this browser can't play (e.g.
+							h265)</span
+						>
+					</div>
+				`),
+			);
+		};
+		video.$video
+			.querySelector("source")
+			?.addEventListener("error", showMediaUnsupported);
+		video.$video.addEventListener("error", () => {
+			// 4 = MEDIA_ERR_SRC_NOT_SUPPORTED; also fires for non-codec
+			// causes, hence the hedged message.
+			const err = video.$video.error;
+			if (err !== null && err !== undefined && err.code === 4) {
+				showMediaUnsupported();
+			}
+		});
+
 		const playpause = () => {
 			if (video.$video.paused || video.$video.ended) {
 				video.$playpauseImg.src = iconPausePath;

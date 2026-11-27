@@ -6,8 +6,86 @@
 
 import { uidReset } from "../libs/common.js";
 import { newSlowPollStream, newStreamerBtn } from "./streamer.js";
+import { jest } from "@jest/globals";
 
 describe("feed", () => {
+	test("unsupported codec surfaces a fatal error without retrying", async () => {
+		const fetches = [];
+		global.fetch = (url) => {
+			fetches.push(String(url));
+			return Promise.resolve({
+				status: 200,
+				json: () =>
+					Promise.resolve({
+						startTimeNs: "0",
+						codecs: "hvc1.1.6.L93.B0",
+					}),
+			});
+		};
+		const isTypeSupported = jest.fn(() => false);
+		// @ts-ignore
+		window.MediaSource = class {
+			static isTypeSupported(mime) {
+				return isTypeSupported(mime);
+			}
+		};
+		const consoleError = jest.spyOn(console, "error").mockImplementation(() => {});
+
+		const feed = newSlowPollStream({ id: "a", name: "m" }, true, []);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		feed.destroy();
+
+		// The fatal path surfaces the error via console.error; a returned
+		// (retried) error never reaches it.
+		expect(consoleError).toHaveBeenCalledWith(
+			expect.objectContaining({
+				message: expect.stringContaining("codec unsupported"),
+			}),
+		);
+		consoleError.mockRestore();
+		// @ts-ignore
+		delete window.MediaSource;
+
+		expect(isTypeSupported).toHaveBeenCalledWith(
+			'video/mp4; codecs="hvc1.1.6.L93.B0"',
+		);
+		// Only the start-session fetch; play was never reached.
+		expect(fetches.filter((u) => u.includes("start-session")).length).toBe(1);
+		expect(fetches.filter((u) => u.includes("/play")).length).toBe(0);
+	});
+
+	test("supported codec passes the gate", async () => {
+		global.fetch = () =>
+			Promise.resolve({
+				status: 200,
+				json: () =>
+					Promise.resolve({
+						startTimeNs: "0",
+						codecs: "avc1.64001E",
+					}),
+			});
+		const isTypeSupported = jest.fn(() => true);
+		// @ts-ignore
+		window.MediaSource = class {
+			static isTypeSupported(mime) {
+				return isTypeSupported(mime);
+			}
+			addEventListener() {}
+		};
+		// @ts-ignore
+		URL.createObjectURL = () => "blob:x";
+
+		const feed = newSlowPollStream({ id: "a", name: "m" }, true, []);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		feed.destroy();
+		// @ts-ignore
+		delete window.MediaSource;
+		// @ts-ignore
+		delete URL.createObjectURL;
+
+		expect(isTypeSupported).toHaveBeenCalledWith('video/mp4; codecs="avc1.64001E"');
+	});
+
 	test("rendering", () => {
 		uidReset();
 		const monitor = { id: "a", name: "my-monitor" };

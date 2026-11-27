@@ -301,6 +301,9 @@ function newCategory(title, icon, form, onNav) {
 const maskUrlPassword = (url) =>
 	url.replace(/:\/\/([^/:@]+):[^/@]*@/, "://$1:•••@");
 
+// Codecs SentryShot can ingest, record and (browser permitting) play.
+const supportedScanCodecs = new Set(["h264", "h265"]);
+
 function newScanModal(token) {
 	const hostField = newField({
 		input: "text",
@@ -353,7 +356,9 @@ function newScanModal(token) {
 		`${st.role}: ${maskUrlPassword(st.rtspUrl)}${
 			st.profileName ? ` (${st.profileName})` : ""
 		}${st.live === false ? " [dead — no media]" : ""}${
-			st.videoCodec === "h264" ? "" : ` [${st.videoCodec} — unsupported]`
+			supportedScanCodecs.has(st.videoCodec)
+				? ""
+				: ` [${st.videoCodec} — unsupported]`
 		}`;
 
 	const renderResults = (result) => {
@@ -483,14 +488,16 @@ function newScanModal(token) {
 				};
 				pickBtn.onclick = () => {
 					const picked = [sel.main, sel.sub].filter((st) => st !== undefined);
-					const unsupported = picked.filter((st) => st.videoCodec !== "h264");
+					const unsupported = picked.filter(
+						(st) => !supportedScanCodecs.has(st.videoCodec),
+					);
 					const dead = picked.filter((st) => st.live === false);
 					const warnings = [
 						...(unsupported.length > 0
 							? [
 									`picked stream(s) use ${unsupported
 										.map((st) => st.videoCodec)
-										.join(", ")} — SentryShot only plays h264`,
+										.join(", ")} — SentryShot only supports h264 and h265`,
 								]
 							: []),
 						...(dead.length > 0
