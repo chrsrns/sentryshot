@@ -278,7 +278,8 @@ Response `200`:
 					"role": "main",
 					"profileName": "MainStream",
 					"auth": "digest",
-					"videoCodec": "h264"
+					"videoCodec": "h264",
+					"live": true
 				}
 			],
 			"ptz": false,
@@ -291,7 +292,7 @@ Response `200`:
 }
 ```
 
-- Every returned stream is DESCRIBE-probed once within the shared deadline; `videoCodec` is the SDP video `encoding_name` (`"h264"`, `"h265"`, …), `"none"` when the SDP has no video stream, or `"unknown"` when the probe could not complete (auth challenge, timeout). SentryShot only plays `h264`.
+- Every returned stream is DESCRIBE+PLAY-probed once within the shared deadline; `videoCodec` is the SDP video `encoding_name` (`"h264"`, `"h265"`, …), `"none"` when the SDP has no video stream, or `"unknown"` when DESCRIBE could not complete (auth challenge, timeout). `live` is `false` only when the PLAY window elapsed with zero media — a proven-dead stream; it stays `true` when media arrived, the stream was never probed, or SETUP/PLAY was rejected (e.g. a busy session-limited stream — undetermined, not dead). SentryShot plays `h264` and `h265`.
 - `backchannel` reports ONVIF-advertised two-way audio. `vigiTalk` reports a successful TP-Link VIGI private talk probe (port `8800`, run only when ONVIF shows no backchannel and request credentials were supplied) — it records a probe outcome, not capability proof; unreachable, refused, or busy reads `false`. Either flag means two-way audio may work.
 - One scan at a time: a semantically different concurrent request gets `409`; an identical one joins the running scan.
 - `truncated: true` means the 15-second budget cut the scan — results are partial.
