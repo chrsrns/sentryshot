@@ -109,6 +109,9 @@ impl LogDb {
         Ok(handle)
     }
 
+    // Bench-only helper — `#[cfg(test)]` can't reach bench targets, so
+    // it stays pub but hidden from docs.
+    #[doc(hidden)]
     pub async fn save_log_testing(&self, entry: LogEntryWithTime) {
         #[allow(clippy::unwrap_used)]
         self.save_log(entry).await.unwrap();
@@ -218,7 +221,7 @@ impl LogDb {
 }
 
 #[allow(clippy::module_name_repetitions)]
-pub struct LogDbWriter {
+pub(crate) struct LogDbWriter {
     log_dir: PathBuf,
     encoder: Option<ChunkEncoder>,
 
