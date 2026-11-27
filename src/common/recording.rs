@@ -432,6 +432,12 @@ pub fn vertex_inside_poly2(x: u32, y: u32, poly: &PolygonNormalized) -> bool {
     inside
 }
 
+// Feed rate in frames per second stored as a frame interval.
+// A configured rate of 0 yields a zero duration, which the
+// FrameRateLimiter treats as no limit. Negative rates are not
+// validated here; they produce a negative duration that fails the
+// u64 conversion when the limiter is constructed, so a bad config
+// surfaces as an init error rather than a panic.
 #[repr(transparent)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FeedRateSec(Duration);
@@ -503,6 +509,8 @@ fn feed_rate_to_duration(feed_rate: f32) -> Duration {
     Duration::new(((1.0 * SECOND as f32) / feed_rate) as i64)
 }
 
+// Drops frames above a configured rate.
+// A max_rate of 0 disables limiting entirely.
 pub struct FrameRateLimiter {
     max_rate: u64,
 
