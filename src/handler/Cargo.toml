@@ -34,7 +34,6 @@ rust-embed.path = "../rust-embed"
 axum.workspace = true
 #axum-macros = "0.3.7"
 http.workspace = true
-hyper.workspace = true
 mime_guess.workspace = true
 serde.workspace = true
 serde_json.workspace = true
