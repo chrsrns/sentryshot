@@ -2654,13 +2654,9 @@ version = "0.3.11"
 dependencies = [
  "async-trait",
  "common",
- "http",
  "mp4",
  "pretty-hex",
  "pretty_assertions",
- "rand 0.9.0",
- "rand_chacha 0.9.0",
- "retina",
  "sentryshot_padded_bytes",
  "serde",
  "thiserror 2.0.11",
