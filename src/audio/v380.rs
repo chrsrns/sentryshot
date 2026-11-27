@@ -61,7 +61,7 @@ const LOGIN_RESP_MIN: usize = 68;
 /// u16@4 = `22`, u16@6, ts u32@8, u32@12; a 272 B frame = 16 + one
 /// 256 B IMA block). prsyahmi's raw-audio 20 B skip does not match
 /// the v3 wire (R77).
-const AUDIO_FRAME_INNER_HDR: usize = 16;
+pub(crate) const AUDIO_FRAME_INNER_HDR: usize = 16;
 
 /// `Error` reuse — protocol faults + transport + timeout all map to
 /// the audio crate's error surface.

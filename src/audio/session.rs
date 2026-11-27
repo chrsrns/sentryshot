@@ -3763,7 +3763,11 @@ mod tests {
     /// decode offsets so the 16-vs-20 B inner header can be judged.
     #[tokio::test]
     #[ignore = "needs a live V380 camera on :8800"]
-    #[allow(clippy::too_many_lines)]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::naive_bytecount,
+        clippy::cast_precision_loss
+    )]
     async fn v380_live_listen_probe() {
         let host = std::env::var("V380_LIVE_HOST").expect("V380_LIVE_HOST");
         let user = std::env::var("V380_LIVE_USER").unwrap_or_else(|_| "Admin".into());
@@ -3825,9 +3829,12 @@ mod tests {
         let mut type_counts = std::collections::BTreeMap::<u8, u32>::new();
         let mut pending = Vec::<u8>::new();
         let mut frames = Vec::<Vec<u8>>::new();
+        let mut nonzero_bytes = 0_u64;
+        let mut nonzero_frames = 0_u64;
+        let mut audio_frames = 0_u64;
         let mut tick = tokio::time::interval(Duration::from_millis(2_500));
         tick.tick().await;
-        while tokio::time::Instant::now() < deadline && frames.len() < 6 {
+        while tokio::time::Instant::now() < deadline {
             tokio::select! {
                 frag = rd.next_fragment() => {
                     let frag = match frag {
@@ -3844,7 +3851,20 @@ mod tests {
                         }
                         pending.extend_from_slice(&frag.payload);
                         if frag.index + 1 == frag.total {
-                            frames.push(std::mem::take(&mut pending));
+                            let full = std::mem::take(&mut pending);
+                            audio_frames += 1;
+                            let nz = full
+                                .iter()
+                                .skip(crate::v380::AUDIO_FRAME_INNER_HDR)
+                                .filter(|&&b| b != 0)
+                                .count() as u64;
+                            nonzero_bytes += nz;
+                            if nz > 0 {
+                                nonzero_frames += 1;
+                            }
+                            if frames.len() < 6 {
+                                frames.push(full);
+                            }
                         }
                     }
                 }
@@ -3858,6 +3878,10 @@ mod tests {
         }
         let _ = wr.keepalive_stream(channel, false).await;
         eprintln!("fragment types seen: {type_counts:?}");
+        eprintln!(
+            "audio frames={audio_frames} nonzero_frames={nonzero_frames} \
+             nonzero_payload_bytes={nonzero_bytes}"
+        );
         assert!(!frames.is_empty(), "no IMA frames captured");
         for (i, f) in frames.iter().enumerate() {
             let n = f.len().min(48);
@@ -3872,6 +3896,29 @@ mod tests {
                          (step>88 ⇒ wrong offset)"
                     );
                 }
+            }
+            // Mic-presence analysis: a real mic produces varying IMA
+            // bytes and non-zero decoded amplitude; a dead/absent mic
+            // sends constant bytes (often 0x00) decoding to flat PCM.
+            let blk = &f[crate::v380::AUDIO_FRAME_INNER_HDR..];
+            if blk.len() >= crate::v380::IMA_BLOCK_BYTES {
+                let arr: &[u8; crate::v380::IMA_BLOCK_BYTES] =
+                    blk[..crate::v380::IMA_BLOCK_BYTES].try_into().unwrap();
+                let zeros = arr.iter().filter(|&&b| b == 0).count();
+                let distinct = arr.iter().collect::<std::collections::BTreeSet<_>>().len();
+                let pcm = crate::v380::ima_decode_block(arr);
+                let peak = pcm.iter().map(|s| s.abs()).max().unwrap_or(0);
+                let rms = (pcm
+                    .iter()
+                    .map(|&s| f64::from(s) * f64::from(s))
+                    .sum::<f64>()
+                    / pcm.len() as f64)
+                    .sqrt();
+                eprintln!(
+                    "  mic-sig: zeros={zeros}/{} distinct={distinct} \
+                     peak={peak} rms={rms:.0}",
+                    arr.len()
+                );
             }
         }
     }
