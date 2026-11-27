@@ -39,16 +39,13 @@ impl Plugin for ThumbScalePlugin {
             });
         };
 
-        let scale = match config.raw().get("thumbScale") {
+        let Some(scale) = config.raw().get("thumbScale") else {
             // Not configured, nothing to do.
-            None => return frame,
-            Some(v) => match v.as_str() {
-                Some(s) => s,
-                None => {
-                    log(LogLevel::Warning, "invalid config: not a string");
-                    return frame;
-                }
-            },
+            return frame;
+        };
+        let Some(scale) = scale.as_str() else {
+            log(LogLevel::Warning, "invalid config: not a string");
+            return frame;
         };
         let scale = match scale {
             "full" => return frame,
@@ -90,7 +87,7 @@ impl Plugin for ThumbScalePlugin {
         if let Err(e) = scaler.scale(&frame, &mut frame2) {
             log(LogLevel::Error, &format!("failed to scale frame: '{e}'"));
             return frame;
-        };
+        }
 
         frame2
     }
