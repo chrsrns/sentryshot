@@ -21,16 +21,12 @@ use tokio_util::io::ReaderStream;
 // Replies to the request using the content in the
 // provided ReadSeeker. The main benefit of serve_mp4_content over io::copy
 // is that it handles Range requests properly, sets the MIME type, and
-// handles If-Match, If-Unmodified-Since, If-None-Match, If-Modified-Since,
-// and If-Range requests.
+// handles If-Unmodified-Since and If-Modified-Since requests.
 //
 // If modtime is not the zero time or Unix epoch, serve_mp4_content
 // includes it in a Last-Modified header in the response. If the
 // request includes an If-Modified-Since header, serve_mp4_content uses
 // modtime to decide whether the content needs to be sent at all.
-//
-// If the caller has set w's ETag header formatted per RFC 7232, section 2.3,
-// ServeMP4Content uses it to handle requests using If-Match, If-None-Match, or If-Range.
 //
 // Content must be seeked to the beginning of the file.
 #[allow(clippy::too_many_lines, clippy::unwrap_used)]
@@ -242,96 +238,21 @@ fn check_preconditions(
     response_headers: HeaderMap,
     last_modified: Option<&LastModified>,
 ) -> PreconditionsResult {
-    // This function carefully follows RFC 7232 section 6.
-    let mut ch = check_if_match(headers);
-    if ch == CondResult::None {
-        ch = check_if_unmodified_since(headers, last_modified);
-    }
-    if ch == CondResult::False {
+    // Only date-form preconditions are evaluated — no ETag is ever
+    // emitted, so entity-tag checks (If-Match, If-None-Match, If-Range)
+    // would have nothing to compare against.
+    if check_if_unmodified_since(headers, last_modified) == CondResult::False {
         return PreconditionsResult::Done(
             (StatusCode::PRECONDITION_FAILED, response_headers, "1").into_response(),
         );
     }
 
-    match check_if_none_match(headers) {
-        CondResult::None => {
-            if check_if_modified_since(method, headers, last_modified) == CondResult::False {
-                return PreconditionsResult::Done(not_modified_response(response_headers));
-            }
-        }
-        CondResult::True => {}
-        CondResult::False => {
-            if method == Method::GET || method == Method::HEAD {
-                return PreconditionsResult::Done(not_modified_response(response_headers));
-            }
-            return PreconditionsResult::Done(
-                (
-                    StatusCode::PRECONDITION_FAILED,
-                    response_headers,
-                    "if none match",
-                )
-                    .into_response(),
-            );
-        }
+    if check_if_modified_since(method, headers, last_modified) == CondResult::False {
+        return PreconditionsResult::Done(not_modified_response(response_headers));
     }
 
-    let mut range_header = get_header(headers, header::RANGE);
-    if range_header.is_some() && check_if_range(method, headers, last_modified) == CondResult::False
-    {
-        range_header = None;
-    }
-
+    let range_header = get_header(headers, header::RANGE);
     PreconditionsResult::Range(range_header)
-}
-
-// Determines if a syntactically valid ETag is present at s. If so,
-// the ETag and remaining text after consuming ETag is returned.
-// Otherwise, it returns "", "".
-#[allow(clippy::unwrap_used)]
-fn scan_etag(s: String) -> Option<(String, String)> {
-    let s = trim_text_proto_string(Some(s));
-    let mut start = 0;
-    if let Some(s) = &s {
-        if s.starts_with("W/") {
-            start = 2;
-        }
-    }
-
-    let s = s?;
-    if s.as_bytes()[start..].len() < 2 || s.as_bytes()[start] != b'"' {
-        return None;
-    }
-
-    // ETag is either W/"text" or "text".
-    // See RFC 7232 2.3.
-    for i in start + 1..s.len() {
-        let c = s.as_bytes()[i];
-        if
-        // Character values allowed in ETags.
-        c == 0x21 || (0x23..0x7e).contains(&c) || c >= 0x80 {
-        } else if c == b'"' {
-            return Some((
-                String::from_utf8(s.as_bytes()[..=i].to_owned()).unwrap(),
-                String::from_utf8(s.as_bytes()[i + 1..].to_owned()).unwrap(),
-            ));
-        } else {
-            return None;
-        }
-    }
-
-    None
-}
-
-// Reports whether a and b match using strong ETag comparison.
-// Assumes a and b are valid ETags.
-fn etag_strong_match(a: &str, b: &str) -> bool {
-    a == b && !a.is_empty() && a.as_bytes()[0] == b'"'
-}
-
-// Reports whether a and b match using weak ETag comparison.
-// Assumes a and b are valid ETags.
-fn etag_weak_match(a: &str, b: &str) -> bool {
-    a.strip_prefix("W/").unwrap_or(a) == b.strip_prefix("W/").unwrap_or(b)
 }
 
 // condResult is the result of an HTTP request precondition check.
@@ -348,40 +269,6 @@ fn get_header(headers: &HeaderMap, name: HeaderName) -> Option<String> {
         return None;
     };
     Some(header.to_owned())
-}
-
-fn check_if_match(headers: &HeaderMap) -> CondResult {
-    let mut im = get_header(headers, header::IF_MATCH);
-    if im.is_none() {
-        return CondResult::None;
-    }
-
-    loop {
-        im = trim_text_proto_string(im);
-        let Some(im2) = im else {
-            break;
-        };
-        if im2.as_bytes()[0] == b',' {
-            im = Some(im2[1..].to_owned());
-            continue;
-        }
-        if im2.as_bytes()[0] == b'*' {
-            return CondResult::True;
-        }
-        let Some((etag, remain)) = scan_etag(im2) else {
-            break;
-        };
-
-        let etag2 = get_header(headers, header::ETAG);
-        if let Some(etag2) = etag2 {
-            if etag_strong_match(&etag, &etag2) {
-                return CondResult::True;
-            }
-        }
-        im = Some(remain);
-    }
-
-    CondResult::False
 }
 
 fn check_if_unmodified_since(headers: &HeaderMap, modified: Option<&LastModified>) -> CondResult {
@@ -404,42 +291,6 @@ fn check_if_unmodified_since(headers: &HeaderMap, modified: Option<&LastModified
         return CondResult::True;
     }
     CondResult::None
-}
-
-fn check_if_none_match(headers: &HeaderMap) -> CondResult {
-    let Some(inm) = get_header(headers, header::IF_NONE_MATCH) else {
-        return CondResult::None;
-    };
-
-    let mut buf = Some(inm);
-    loop {
-        buf = trim_text_proto_string(buf);
-        let Some(buf2) = buf else {
-            break;
-        };
-
-        if buf2.as_bytes()[0] == b',' {
-            buf = Some(buf2[1..].to_string());
-            continue;
-        }
-
-        if buf2.as_bytes()[0] == b'*' {
-            return CondResult::False;
-        }
-
-        let Some((etag, remain)) = scan_etag(buf2) else {
-            break;
-        };
-
-        if let Some(etag2) = get_header(headers, header::ETAG) {
-            if etag_weak_match(&etag, &etag2) {
-                return CondResult::False;
-            }
-        }
-
-        buf = Some(remain);
-    }
-    CondResult::True
 }
 
 fn check_if_modified_since(
@@ -465,43 +316,6 @@ fn check_if_modified_since(
     }
 
     CondResult::True
-}
-
-fn check_if_range(
-    method: &Method,
-    headers: &HeaderMap,
-    _modified: Option<&LastModified>,
-) -> CondResult {
-    if method != Method::GET && method != Method::HEAD {
-        return CondResult::None;
-    }
-
-    let Some(ir) = get_header(headers, header::IF_RANGE) else {
-        return CondResult::None;
-    };
-
-    if let Some((etag, _)) = scan_etag(ir) {
-        if let Some(etag2) = get_header(headers, header::ETAG) {
-            if etag_strong_match(&etag, &etag2) {
-                return CondResult::True;
-            }
-        }
-        return CondResult::False;
-    };
-
-    // The If-Range value is typically the ETag value, but it may also be
-    // the modtime date. See golang.org/issue/8367.
-    /*if modtime.IsZero() {
-        return condFalse
-    }
-    t, err := http.ParseTime(ir)
-    if err != nil {
-        return condFalse
-    }
-    if t.Unix() == modtime.Unix() {
-        return condTrue
-    }*/
-    CondResult::False
 }
 
 struct LastModified(HttpDate);
