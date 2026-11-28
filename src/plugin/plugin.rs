@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 pub mod object_detection;
+#[cfg(test)]
+mod test;
 pub mod types;
 
 use async_trait::async_trait;
@@ -214,6 +216,11 @@ impl PreLoadedPlugins {
     #[must_use]
     pub fn log_sources(&self) -> &[LogSource] {
         &self.log_sources
+    }
+
+    #[cfg(test)]
+    fn load_fns_count(&self) -> usize {
+        self.load_fns.len()
     }
 
     #[must_use]
