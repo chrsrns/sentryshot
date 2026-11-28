@@ -311,7 +311,14 @@ async function newStream(parentSignal, $video, debugOverlay, monitorId, subStrea
 			if (debugOverlay.enabled()) {
 				const currentTimeMs = $video.currentTime * 1000;
 				const delayMs = Date.now() - (startTimeMs + currentTimeMs);
-				const endMs = sourceBuffer.buffered.end(0) * 1000;
+				let endMs = 0;
+				try {
+					const ranges = sourceBuffer.buffered;
+					endMs = ranges.length > 0 ? ranges.end(0) * 1000 : 0;
+				} catch (error) {
+					lastError = String(error);
+					endMs = 0;
+				}
 				const bufferMs = endMs - currentTimeMs;
 				const playbackRate = $video.playbackRate;
 				debugOverlay.update(
@@ -352,6 +359,9 @@ async function newStream(parentSignal, $video, debugOverlay, monitorId, subStrea
 		let nUnchangedAppendsInARow = 0;
 		while (!cancelled) {
 			const response = await fetch(playUrl, { signal });
+			if (response.status !== 200) {
+				return new Error(`play failed: ${response.status}, ${await response.text()}`);
+			}
 			const buf = await response.arrayBuffer();
 
 			let prevEnd;
@@ -368,7 +378,8 @@ async function newStream(parentSignal, $video, debugOverlay, monitorId, subStrea
 			sourceBuffer.appendBuffer(buf);
 			await waitForUpdateEnd;
 
-			const end = sourceBuffer.buffered.end(0);
+			const end =
+				sourceBuffer.buffered.length > 0 ? sourceBuffer.buffered.end(0) : 0;
 			const endUnchanged = end === prevEnd;
 			if (endUnchanged) {
 				nUnchangedAppendsInARow += 1;
@@ -380,7 +391,7 @@ async function newStream(parentSignal, $video, debugOverlay, monitorId, subStrea
 			}
 
 			// Prune.
-			if (end - sourceBuffer.buffered.start(0) > 15) {
+			if (end > 0 && end - sourceBuffer.buffered.start(0) > 15) {
 				sourceBuffer.remove(0, end - 10);
 
 				const start = sourceBuffer.buffered.start(0);

@@ -57,6 +57,60 @@ describe("feed", () => {
 		expect(hint?.textContent).toContain("hvc1");
 	});
 
+	test("play error status is not appended and restarts the session", async () => {
+		const fetches = [];
+		global.fetch = (url) => {
+			fetches.push(String(url));
+			if (String(url).includes("start-session")) {
+				return Promise.resolve({
+					status: 200,
+					json: () =>
+						Promise.resolve({
+							startTimeNs: "0",
+							codecs: "avc1.42E01E",
+						}),
+				});
+			}
+			// play -> error status; its body must never reach appendBuffer.
+			return Promise.resolve({
+				status: 410,
+				arrayBuffer: () => Promise.resolve(new ArrayBuffer(4)),
+				text: () => Promise.resolve("frames expired"),
+			});
+		};
+		const appendBuffer = jest.fn();
+		// @ts-ignore
+		window.MediaSource = class {
+			static isTypeSupported() {
+				return true;
+			}
+			addEventListener(type, fn) {
+				if (type === "sourceopen") queueMicrotask(fn);
+			}
+			addSourceBuffer() {
+				return {
+					buffered: { length: 0 },
+					addEventListener() {},
+					appendBuffer,
+					remove() {},
+				};
+			}
+		};
+		// @ts-ignore
+		URL.createObjectURL = () => "blob:x";
+
+		const feed = newSlowPollStream({ id: "a", name: "m" }, true, []);
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		feed.destroy();
+		// @ts-ignore
+		delete window.MediaSource;
+		// @ts-ignore
+		delete URL.createObjectURL;
+
+		expect(appendBuffer).not.toHaveBeenCalled();
+		expect(fetches.filter((u) => u.includes("/play")).length).toBeGreaterThan(0);
+	});
+
 	test("supported codec passes the gate", async () => {
 		global.fetch = () =>
 			Promise.resolve({
