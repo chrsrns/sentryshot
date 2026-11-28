@@ -281,14 +281,14 @@ impl Playlist {
                 };
             }
 
-            if file_name != part_name(state.next_part_id) {
+            if base != part_name(state.next_part_id) {
                 return MUXER_FILE_RESPONSE_NOT_FOUND;
             }
 
             let res_tx: oneshot::Sender<MuxerFileResponse>;
             (res_tx, res_rx) = oneshot::channel();
             let req = BlockingPartRequest {
-                part_name: file_name.to_owned(),
+                part_name: base.to_owned(),
                 part_id: state.next_part_id,
                 res_tx,
             };
@@ -768,7 +768,7 @@ pub fn primary_playlist(codec: &str) -> MuxerFileResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::DummyLogger;
+    use common::{DummyLogger, time::{H264_SECOND, UnixH264}};
     use pretty_assertions::assert_eq;
     use tokio::io::AsyncReadExt;
 
@@ -821,6 +821,140 @@ stream.m3u8
 #EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"part0.mp4\"
 ";
         assert_eq!(want, String::from_utf8(got).unwrap());
+    }
+
+    fn seg(id: u64, num_parts: u64, duration: DurationH264) -> SegmentOrGap {
+        let parts = (0..num_parts)
+            .map(|p| {
+                Arc::new(PartFinalized {
+                    id: p,
+                    ..PartFinalized::default()
+                })
+            })
+            .collect();
+        SegmentOrGap::Segment(Arc::new(SegmentFinalized::new(
+            id,
+            0,
+            UnixH264::new(0),
+            format!("seg{id}"),
+            parts,
+            duration,
+        )))
+    }
+
+    #[test]
+    fn has_part_wraps_to_next_segment() {
+        let mut state = new_empty_playlist_state();
+        // seg0: parts 0,1. seg1: part 0.
+        state.segments.push_back(seg(0, 2, DurationH264::new(1)));
+        state.segments.push_back(seg(1, 1, DurationH264::new(1)));
+        state.next_segment_id = 2;
+        state.next_segment_parts = vec![Arc::new(PartFinalized {
+            id: 5,
+            ..PartFinalized::default()
+        })];
+
+        assert!(state.has_part(0, 0));
+        assert!(state.has_part(0, 1));
+        // Part 2 of seg0 wraps to part 0 of seg1.
+        assert!(state.has_part(0, 2));
+        // Part 1 of seg1 wraps to part 0 of the next (unfinalized) segment.
+        assert!(state.has_part(1, 1));
+        // One past the end of the pending next segment's parts.
+        assert!(!state.has_part(2, 1));
+        assert!(!state.has_part(9, 0));
+        // Any out-of-range part wraps to part 0 of the next segment,
+        // discarding the original index.
+        assert!(state.has_part(0, 9));
+    }
+
+    #[test]
+    fn has_part_empty_playlist() {
+        let state = new_empty_playlist_state();
+        assert!(!state.has_part(0, 0));
+    }
+
+    #[test]
+    fn full_playlist_delta_skip_math() {
+        let mut state = new_empty_playlist_state();
+        // 10 segments of 1s each: target=1, skip_boundary=6.
+        // Segments are shown until cumulative duration reaches the
+        // boundary, so the oldest 5 get skipped.
+        for i in 0..10 {
+            state
+                .segments
+                .push_back(seg(i, 0, DurationH264::new(H264_SECOND)));
+        }
+        let got = String::from_utf8(state.full_playlist(true).unwrap()).unwrap();
+        assert!(got.contains("#EXT-X-SKIP:SKIPPED-SEGMENTS=5\n"), "{got}");
+        // seg5 is the first emitted segment.
+        assert!(got.contains("seg5.mp4"), "{got}");
+        assert!(!got.contains("seg4.mp4"), "{got}");
+        // Non-delta render emits everything.
+        let got = String::from_utf8(state.full_playlist(false).unwrap()).unwrap();
+        assert!(got.contains("seg0.mp4"), "{got}");
+    }
+
+    #[test]
+    fn full_playlist_renders_gaps() {
+        let mut state = new_empty_playlist_state();
+        state
+            .segments
+            .push_back(SegmentOrGap::Gap(Gap(DurationH264::new(1))));
+        let got = String::from_utf8(state.full_playlist(false).unwrap()).unwrap();
+        assert!(got.contains("#EXT-X-GAP"), "{got}");
+        assert!(got.contains("gap.mp4"), "{got}");
+    }
+
+    #[tokio::test]
+    async fn blocking_part_waits_for_finalize() {
+        let playlist = Arc::new(Playlist::new(CancellationToken::new(), DummyLogger::new(), 10, 0));
+
+        // next_part_id is 0, so part0.mp4 parks until finalized.
+        let playlist2 = playlist.clone();
+        let pending = tokio::spawn(async move {
+            playlist2
+                .file("part0.mp4", &HlsQuery::default_for_test())
+                .await
+        });
+        // Yield so the request parks before the part lands.
+        tokio::task::yield_now().await;
+
+        playlist
+            .part_finalized(Arc::new(PartFinalized {
+                id: 0,
+                rendered_content: Some(bytes::Bytes::from_static(b"DATA")),
+                ..PartFinalized::default()
+            }))
+            .await
+            .unwrap();
+
+        let res = pending.await.unwrap();
+        assert_eq!(StatusCode::OK, res.status);
+        let mut body = Vec::new();
+        let mut reader = res.body.unwrap();
+        reader.read_to_end(&mut body).await.unwrap();
+        assert_eq!(b"DATA".as_slice(), &body);
+    }
+
+    #[tokio::test]
+    async fn part_reader_serves_finalized_part() {
+        let playlist = Arc::new(Playlist::new(CancellationToken::new(), DummyLogger::new(), 10, 0));
+        playlist
+            .part_finalized(Arc::new(PartFinalized {
+                id: 0,
+                rendered_content: Some(bytes::Bytes::from_static(b"DATA")),
+                ..PartFinalized::default()
+            }))
+            .await
+            .unwrap();
+
+        // A subsequent part request still parks -> NOT_FOUND for names
+        // that are neither finalized nor the next expected part.
+        let res = playlist
+            .file("part5.mp4", &HlsQuery::default_for_test())
+            .await;
+        assert_eq!(StatusCode::NOT_FOUND, res.status);
     }
 
     #[test]

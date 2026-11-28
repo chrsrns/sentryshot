@@ -530,3 +530,162 @@ async fn test_play_session_with_gop_larger_than_frame_cache() {
         "play must not expire the session anchor, got: {got:?}"
     );
 }
+
+fn frame(pts: i64, random_access: bool) -> H264Data {
+    H264Data {
+        pts: UnixH264::new(pts),
+        dts_offset: DtsOffset::new(0),
+        random_access_present: random_access,
+        avcc: Arc::new(PaddedBytes::new(vec![1])),
+    }
+}
+
+#[tokio::test]
+async fn test_play_frames_expired() {
+    let token = CancellationToken::new();
+    let streamer = Streamer::new(token.clone(), DummyLogger::new());
+
+    let (muxer, mut writer) = streamer
+        .new_muxer2(
+            token.clone(),
+            m_id("test"),
+            false,
+            test_params(),
+            UnixH264::new(0),
+            frame(0, true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Complete gop0 {f0}; the session anchors on f0 (frame id 1).
+    writer.write_h264(frame(1, true)).await.unwrap();
+    streamer
+        .start_session(m_id("test"), false, 7)
+        .await
+        .unwrap();
+
+    // Complete gop1 {f1}: the anchor moves to f1 (id 2), making f0
+    // evictable. Overflow the frame cache to push it out.
+    writer.write_h264(frame(2, true)).await.unwrap();
+    for i in 3..300 {
+        writer.write_h264(frame(i, false)).await.unwrap();
+    }
+
+    assert!(matches!(
+        streamer.play(m_id("test"), false, 7).await,
+        PlayReponse::FramesExpired
+    ));
+    drop(muxer);
+}
+
+#[tokio::test]
+async fn test_play_session_already_locked() {
+    let token = CancellationToken::new();
+    let streamer = Streamer::new(token.clone(), DummyLogger::new());
+
+    let (muxer, mut writer) = streamer
+        .new_muxer2(
+            token.clone(),
+            m_id("test"),
+            false,
+            test_params(),
+            UnixH264::new(0),
+            frame(0, true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    writer.write_h264(frame(1, true)).await.unwrap();
+    streamer
+        .start_session(m_id("test"), false, 7)
+        .await
+        .unwrap();
+
+    // Consume the cached frame so the next play parks on a new one.
+    streamer.play(m_id("test"), false, 7).await.unwrap();
+
+    let streamer2 = streamer.clone();
+    let parked = tokio::spawn(async move { streamer2.play(m_id("test"), false, 7).await });
+    while muxer.debug_state().await.frame_on_hold_count != 1 {
+        tokio::task::yield_now().await;
+    }
+
+    // The parked play holds the session lock while it waits.
+    assert!(matches!(
+        streamer.play(m_id("test"), false, 7).await,
+        PlayReponse::SessionAlreadyLocked
+    ));
+
+    // A new frame unblocks the parked play.
+    writer.write_h264(frame(2, true)).await.unwrap();
+    assert!(matches!(parked.await.unwrap(), PlayReponse::Ready(_)));
+}
+
+#[tokio::test]
+async fn test_max_gops_eviction() {
+    let token = CancellationToken::new();
+    let streamer = Streamer::new(token.clone(), DummyLogger::new());
+
+    let (muxer, mut writer) = streamer
+        .new_muxer2(
+            token.clone(),
+            m_id("test"),
+            false,
+            test_params(),
+            UnixH264::new(0),
+            frame(0, true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Each IDR completes a GOP; the deque is capped at MAX_GOPS.
+    for i in 1..6 {
+        writer.write_h264(frame(i, true)).await.unwrap();
+    }
+    assert_eq!(Muxer::MAX_GOPS, muxer.debug_state().await.gop_count);
+}
+
+#[tokio::test]
+async fn test_muxer_cancel_paths() {
+    let token = CancellationToken::new();
+    let streamer = Streamer::new(token.clone(), DummyLogger::new());
+
+    let (muxer, mut writer) = streamer
+        .new_muxer2(
+            token.clone(),
+            m_id("test"),
+            false,
+            test_params(),
+            UnixH264::new(0),
+            frame(0, true),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    writer.write_h264(frame(1, true)).await.unwrap();
+
+    muxer.cancel();
+
+    // Wait for the cancellation task to drop state.
+    for _ in 0..10_000 {
+        if matches!(
+            streamer.start_session(m_id("test"), false, 1).await,
+            StartSessionReponse::MuxerCancelled
+        ) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(matches!(
+        streamer.start_session(m_id("test"), false, 1).await,
+        StartSessionReponse::MuxerCancelled
+    ));
+    assert!(matches!(
+        streamer.play(m_id("test"), false, 1).await,
+        PlayReponse::MuxerCancelled
+    ));
+    assert!(muxer.next_segment(None).await.is_none());
+}
