@@ -317,9 +317,19 @@ impl MuxerState {
             .back()
             .map(|gop| gop.frames[0].id)
             .or_else(|| self.gop_in_progress.first().map(|f| f.id));
+        // The anchor target moves with each completed GOP, so also retain
+        // the oldest frame any live session still needs. Without this a
+        // session anchored mid-GOP expires at the next GOP boundary before
+        // it can catch up.
+        let floor = self
+            .sessions
+            .iter()
+            .filter_map(|(_, s)| s.try_lock().ok().map(|s| s.next_frame_id))
+            .chain(anchor_id)
+            .min();
         while self.frames.len() >= Muxer::FRAME_CACHE_SIZE
             && self.frames.front().is_some_and(|f| {
-                anchor_id.is_none_or(|anchor| f.id < anchor)
+                floor.is_none_or(|floor| f.id < floor)
             })
         {
             self.frames.pop_front();

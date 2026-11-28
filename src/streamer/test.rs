@@ -541,7 +541,7 @@ fn frame(pts: i64, random_access: bool) -> H264Data {
 }
 
 #[tokio::test]
-async fn test_play_frames_expired() {
+async fn test_play_session_survives_gop_boundary() {
     let token = CancellationToken::new();
     let streamer = Streamer::new(token.clone(), DummyLogger::new());
 
@@ -565,17 +565,18 @@ async fn test_play_frames_expired() {
         .await
         .unwrap();
 
-    // Complete gop1 {f1}: the anchor moves to f1 (id 2), making f0
-    // evictable. Overflow the frame cache to push it out.
+    // Complete gop1 {f1}: the new-session anchor moves to f1 (id 2),
+    // but the live session still needs f0; overflow the frame cache.
     writer.write_h264(frame(2, true)).await.unwrap();
     for i in 3..300 {
         writer.write_h264(frame(i, false)).await.unwrap();
     }
 
-    assert!(matches!(
-        streamer.play(m_id("test"), false, 7).await,
-        PlayReponse::FramesExpired
-    ));
+    let got = streamer.play(m_id("test"), false, 7).await;
+    assert!(
+        matches!(got, PlayReponse::Ready(_)),
+        "live session must survive the anchor moving past its position, got: {got:?}"
+    );
     drop(muxer);
 }
 
