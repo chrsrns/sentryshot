@@ -116,3 +116,184 @@ async fn test_serve_mp4_range(r: &str, code: StatusCode, ranges: Vec<WantRange>)
         );
     }
 }
+
+// If-Modified-Since >= last_modified -> 304 without body metadata.
+#[tokio::test]
+async fn test_serve_mp4_if_modified_since_not_modified() {
+    let file = vec![0_u8; 10];
+    let last_modified = UNIX_EPOCH;
+
+    let mut headers = HeaderMap::new();
+    // Any date >= UNIX_EPOCH makes the resource unmodified.
+    headers.insert(
+        header::IF_MODIFIED_SINCE,
+        HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+    );
+
+    let response = serve_mp4_content(
+        &Method::GET,
+        &headers,
+        Some(last_modified),
+        10,
+        Cursor::new(file),
+    )
+    .await;
+
+    assert_eq!(StatusCode::NOT_MODIFIED, response.status());
+    assert!(response.headers().get(header::CONTENT_TYPE).is_none());
+    assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
+}
+
+// If-Modified-Since < last_modified -> 200 with body.
+#[tokio::test]
+async fn test_serve_mp4_if_modified_since_modified() {
+    let file = vec![0_u8; 10];
+    let last_modified = UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::IF_MODIFIED_SINCE,
+        HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+    );
+
+    let response = serve_mp4_content(
+        &Method::GET,
+        &headers,
+        Some(last_modified),
+        10,
+        Cursor::new(file.clone()),
+    )
+    .await;
+
+    assert_eq!(StatusCode::OK, response.status());
+    assert_eq!(
+        file,
+        to_bytes(response.into_body(), usize::MAX).await.unwrap()
+    );
+}
+
+// If-Modified-Since on a non-GET/HEAD request is ignored.
+#[tokio::test]
+async fn test_serve_mp4_if_modified_since_ignored_on_post() {
+    let file = vec![0_u8; 10];
+    let last_modified = UNIX_EPOCH;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::IF_MODIFIED_SINCE,
+        HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+    );
+
+    let response = serve_mp4_content(
+        &Method::POST,
+        &headers,
+        Some(last_modified),
+        10,
+        Cursor::new(file.clone()),
+    )
+    .await;
+
+    assert_eq!(StatusCode::OK, response.status());
+    assert_eq!(
+        file,
+        to_bytes(response.into_body(), usize::MAX).await.unwrap()
+    );
+}
+
+// If-Unmodified-Since < last_modified -> 412.
+#[tokio::test]
+async fn test_serve_mp4_if_unmodified_since_failed() {
+    let file = vec![0_u8; 10];
+    let last_modified = UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::IF_UNMODIFIED_SINCE,
+        HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+    );
+
+    let response = serve_mp4_content(
+        &Method::GET,
+        &headers,
+        Some(last_modified),
+        10,
+        Cursor::new(file),
+    )
+    .await;
+
+    assert_eq!(StatusCode::PRECONDITION_FAILED, response.status());
+}
+
+// If-Unmodified-Since >= last_modified -> precondition passes.
+#[tokio::test]
+async fn test_serve_mp4_if_unmodified_since_passes() {
+    let file = vec![0_u8; 10];
+    let last_modified = UNIX_EPOCH;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::IF_UNMODIFIED_SINCE,
+        HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+    );
+
+    let response = serve_mp4_content(
+        &Method::GET,
+        &headers,
+        Some(last_modified),
+        10,
+        Cursor::new(file.clone()),
+    )
+    .await;
+
+    assert_eq!(StatusCode::OK, response.status());
+    assert_eq!(
+        file,
+        to_bytes(response.into_body(), usize::MAX).await.unwrap()
+    );
+}
+
+// Multi-range requests are refused with 416.
+#[tokio::test]
+async fn test_serve_mp4_multi_range_refused() {
+    let file = vec![0_u8; 10];
+
+    let mut headers = HeaderMap::new();
+    headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-2,5-7"));
+
+    let response = serve_mp4_content(&Method::GET, &headers, None, 10, Cursor::new(file)).await;
+
+    assert_eq!(StatusCode::RANGE_NOT_SATISFIABLE, response.status());
+}
+
+// Range past end of file -> 416 with `bytes */size` Content-Range.
+#[tokio::test]
+async fn test_serve_mp4_range_no_overlap() {
+    let file = vec![0_u8; 10];
+
+    let mut headers = HeaderMap::new();
+    headers.insert(header::RANGE, HeaderValue::from_static("bytes=100-200"));
+
+    let response = serve_mp4_content(&Method::GET, &headers, None, 10, Cursor::new(file)).await;
+
+    assert_eq!(StatusCode::RANGE_NOT_SATISFIABLE, response.status());
+    assert_eq!("bytes */10", response.headers()[header::CONTENT_RANGE]);
+}
+
+// Whitespace inside a range-spec is trimmed (textproto semantics).
+#[tokio::test]
+async fn test_serve_mp4_range_whitespace() {
+    let file = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+
+    let mut headers = HeaderMap::new();
+    headers.insert(header::RANGE, HeaderValue::from_static("bytes= 2 - 4 "));
+
+    let response =
+        serve_mp4_content(&Method::GET, &headers, None, 10, Cursor::new(file.clone())).await;
+
+    assert_eq!(StatusCode::PARTIAL_CONTENT, response.status());
+    assert_eq!("bytes 2-4/10", response.headers()[header::CONTENT_RANGE]);
+    assert_eq!(
+        &file[2..5],
+        to_bytes(response.into_body(), usize::MAX).await.unwrap()
+    );
+}

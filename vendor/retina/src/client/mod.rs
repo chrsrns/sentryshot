@@ -1058,7 +1058,12 @@ impl State for Described {}
 enum KeepaliveState {
     Idle,
     Flushing { cseq: u32, method: KeepaliveMethod },
-    Waiting { cseq: u32, method: KeepaliveMethod },
+    Waiting {
+        cseq: u32,
+        method: KeepaliveMethod,
+        /// `received_data_msgs` when the request was sent.
+        recv_at_send: u64,
+    },
 }
 
 #[repr(u8)]
@@ -1163,6 +1168,12 @@ struct SessionInner {
 
     /// The state of the keepalive request; only used in state `Playing`.
     keepalive_state: KeepaliveState,
+
+    /// Interleaved data messages received in state `Playing`.
+    /// Interleaved media arrival proves session liveness as well as a
+    /// keepalive response does; some cameras starve RTSP replies while
+    /// continuing to stream.
+    received_data_msgs: u64,
 
     keepalive_timer: Option<Pin<Box<tokio::time::Sleep>>>,
 
@@ -1533,6 +1544,7 @@ impl Session<Described> {
                 describe_cseq: cseq,
                 describe_status,
                 keepalive_state: KeepaliveState::Idle,
+                received_data_msgs: 0,
                 keepalive_timer: None,
                 flags: 0,
                 udp_next_poll_i: 0,
@@ -2118,16 +2130,28 @@ impl Session<Playing> {
                     ),
                 ),
             }),
-            KeepaliveState::Waiting { cseq, .. } => bail!(ErrorInt::RtspReadError {
-                conn_ctx: *conn.inner.ctx(),
-                msg_ctx: conn.inner.eof_ctx(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "Server failed to respond to keepalive {cseq} within {keepalive_interval:?}",
-                    ),
-                ),
-            }),
+            KeepaliveState::Waiting {
+                cseq,
+                recv_at_send,
+                ..
+            } => {
+                if *inner.received_data_msgs == *recv_at_send {
+                    bail!(ErrorInt::RtspReadError {
+                        conn_ctx: *conn.inner.ctx(),
+                        msg_ctx: conn.inner.eof_ctx(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "Server failed to respond to keepalive {cseq} within {keepalive_interval:?}",
+                            ),
+                        ),
+                    });
+                }
+                debug!(
+                    "keepalive {cseq} unanswered but interleaved data still arriving; \
+                     treating session as alive"
+                );
+            }
             KeepaliveState::Idle => {}
         }
 
@@ -2168,7 +2192,11 @@ impl Session<Playing> {
             .start_send_unpin(rtsp_types::Message::Request(req))
             .expect("encoding is infallible");
         *inner.keepalive_state = match conn.inner.poll_flush_unpin(cx) {
-            Poll::Ready(Ok(())) => KeepaliveState::Waiting { cseq, method },
+            Poll::Ready(Ok(())) => KeepaliveState::Waiting {
+                cseq,
+                method,
+                recv_at_send: *inner.received_data_msgs,
+            },
             Poll::Ready(Err(e)) => bail!(e),
             Poll::Pending => KeepaliveState::Flushing { cseq, method },
         };
@@ -2189,7 +2217,7 @@ impl Session<Playing> {
     ) -> Result<(), Error> {
         let inner = self.0.as_mut().project();
         match inner.keepalive_state {
-            KeepaliveState::Waiting { cseq, method }
+            KeepaliveState::Waiting { cseq, method, .. }
                 if parse::get_cseq(&response) == Some(*cseq) =>
             {
                 // We don't care if the keepalive response succeeds or fails, but we should
@@ -2547,6 +2575,7 @@ impl futures::Stream for Session<Playing> {
             match Pin::new(&mut self.0.conn.as_mut().unwrap().inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(msg))) => match msg.msg {
                     rtsp_types::Message::Data(data) => {
+                        self.0.received_data_msgs = self.0.received_data_msgs.wrapping_add(1);
                         match self.as_mut().handle_data(&msg.ctx, data) {
                             Err(e) => return Poll::Ready(Some(Err(e))),
                             Ok(Some(pkt)) => return Poll::Ready(Some(Ok(pkt))),
@@ -2594,7 +2623,11 @@ impl futures::Stream for Session<Playing> {
             if let KeepaliveState::Flushing { cseq, method } = self.0.keepalive_state {
                 match self.0.conn.as_mut().unwrap().inner.poll_flush_unpin(cx) {
                     Poll::Ready(Ok(())) => {
-                        self.0.keepalive_state = KeepaliveState::Waiting { cseq, method }
+                        self.0.keepalive_state = KeepaliveState::Waiting {
+                            cseq,
+                            method,
+                            recv_at_send: self.0.received_data_msgs,
+                        }
                     }
                     Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(Error(Arc::new(e))))),
                     Poll::Pending => {}
@@ -2877,6 +2910,100 @@ mod tests {
             elapsed < std::time::Duration::from_secs(60),
             "elapsed={elapsed:?}"
         );
+    }
+
+    /// A server that ignores keepalives but keeps streaming interleaved data
+    /// must not cause a session failure; silence must.
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_unanswered_but_media_flows() {
+        init_logging();
+        let (conn, mut server) = connect_to_mock().await;
+        let url = Url::parse("rtsp://192.168.5.206:554/h264Preview_01_main").unwrap();
+
+        let (session, _) = tokio::join!(
+            Session::describe_with_conn(
+                conn,
+                SessionOptions::default()
+                    .unassigned_channel_data(UnassignedChannelDataPolicy::Ignore),
+                url
+            ),
+            req_response(
+                &mut server,
+                rtsp_types::Method::Describe,
+                response(include_bytes!("testdata/reolink_describe.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+        tokio::join!(
+            async {
+                session.setup(0, SetupOptions::default()).await.unwrap();
+            },
+            req_response(
+                &mut server,
+                rtsp_types::Method::Setup,
+                response(include_bytes!("testdata/reolink_setup.txt"))
+            ),
+        );
+        let (session, _) = tokio::join!(
+            session.play(PlayOptions::default()),
+            req_response(
+                &mut server,
+                rtsp_types::Method::Play,
+                response(include_bytes!("testdata/reolink_play.txt"))
+            ),
+        );
+        let mut session = session.unwrap();
+        tokio::pin!(session);
+
+        // Fire the first keepalive immediately; the PLAY response specifies no
+        // timeout so the default 60 s -> 30 s interval applies after that.
+        session.0.keepalive_timer =
+            Some(Box::pin(tokio::time::sleep(std::time::Duration::ZERO)));
+
+        let server_task = async {
+            for i in 0u16..3 {
+                // Read the keepalive request, never answer it, but keep
+                // streaming interleaved media.
+                let msg = server.next().await.unwrap().unwrap();
+                assert!(matches!(msg.msg, rtsp_types::Message::Request(_)));
+                let mut pkt = Vec::from(
+                    &b"\x80\x60\x41\xd4\x00\x00\x00\x00\xdc\xc4\xa0\xd8hello world"[..],
+                );
+                pkt[2..4].copy_from_slice(&(0x41d4u16 + i).to_be_bytes());
+                server
+                    .send(rtsp_types::Message::Data(rtsp_types::Data::new(
+                        0,
+                        Bytes::from(pkt),
+                    )))
+                    .await
+                    .unwrap();
+            }
+            // Read one more unanswered keepalive, then go silent.
+            let msg = server.next().await.unwrap().unwrap();
+            assert!(matches!(msg.msg, rtsp_types::Message::Request(_)));
+        };
+
+        let client_task = async {
+            // Three media packets despite the unanswered keepalives.
+            for _ in 0..3 {
+                match session.next().await {
+                    Some(Ok(PacketItem::Rtp(_))) => {}
+                    o => panic!("unexpected item: {o:#?}"),
+                }
+            }
+            // Then the stream goes silent; the session must fail.
+            match session.next().await {
+                Some(Err(e)) => {
+                    assert!(
+                        e.to_string().contains("keepalive"),
+                        "unexpected error: {e}"
+                    );
+                }
+                o => panic!("expected keepalive error, got: {o:#?}"),
+            }
+        };
+
+        tokio::join!(server_task, client_task);
     }
 
     /// As above, but TEARDOWN fails until session expiration.

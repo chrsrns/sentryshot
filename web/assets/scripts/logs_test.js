@@ -11,6 +11,8 @@ import {
 	newMultiSelect,
 	newMonitorPicker,
 	newLogSelector,
+	newFeedLogger,
+	newSavedLogsLoader,
 } from "./logs.js";
 
 describe("logger", () => {
@@ -440,5 +442,134 @@ describe("logSelector", () => {
 			element.querySelector(".js-back").click();
 			expect($list.classList.contains("log-list-open")).toBe(false);
 		});
+	});
+});
+
+describe("newFeedLogger", () => {
+	const wait = (ms) =>
+		new Promise((resolve) => {
+			setTimeout(resolve, ms);
+		});
+
+	test("poll appends logs and updates the time cursor", async () => {
+		document.body.replaceChildren();
+		const element = document.createElement("div");
+		const urls = [];
+
+		let call = 0;
+		global.fetch = /** @type {any} */ ((url) => {
+			urls.push(String(url));
+			call += 1;
+			const logs =
+				call === 1
+					? [{ time: 100, message: "first" }]
+					: [{ time: 200, message: "second" }];
+			return Promise.resolve({
+				status: 200,
+				json: () => Promise.resolve(logs),
+			});
+		});
+
+		const formatLog = (log) => `msg:${log.message}`;
+		const logger = newFeedLogger(formatLog, element, 0, [], [], []);
+		await wait(350);
+		logger.cancel();
+		await wait(50);
+
+		expect(element.textContent).toContain("msg:first");
+		expect(urls[0]).toContain("api/log/slow-poll");
+		expect(urls[0]).toContain("time=0");
+	});
+
+	test("non-200 response stops the feed", async () => {
+		document.body.replaceChildren();
+		const element = document.createElement("div");
+		global.fetch = /** @type {any} */ (() =>
+			Promise.resolve({ status: 500, text: () => Promise.resolve("x") }));
+
+		const alerts = [];
+		const realAlert = globalThis.alert;
+		globalThis.alert = (m) => alerts.push(m);
+
+		const logger = newFeedLogger((l) => `${l}`, element, 0, [], [], []);
+		await wait(350);
+		logger.cancel();
+		globalThis.alert = realAlert;
+
+		expect(alerts.length).toBeGreaterThan(0);
+		expect(element.textContent).toBe("");
+	});
+});
+
+describe("newSavedLogsLoader", () => {
+	const log = (time, message) => ({ time, message });
+
+	const loadingIndicator = () => ({
+		loading: false,
+		setLoading(v) {
+			this.loading = v;
+		},
+		cancel() {
+			this.loading = "cancelled";
+		},
+	});
+
+	test("lazyLoad appends logs then stops on empty", async () => {
+		document.body.replaceChildren();
+		const element = document.createElement("div");
+		// jsdom rects are 0, so "three screens ahead" never fires.
+		const calls = [];
+		const fetchLogs = (signal, levels, sources, monitors, time) => {
+			calls.push(time);
+			return Promise.resolve(
+				calls.length === 1 ? [log(9, "a"), log(10, "b")] : [],
+			);
+		};
+		const loader = newSavedLogsLoader(
+			loadingIndicator(),
+			(l) => `x${l.message}`,
+			fetchLogs,
+			element,
+			5,
+			[],
+			[],
+			[],
+		);
+		await loader.lazyLoad();
+
+		expect(element.textContent).toContain("xa");
+		expect(element.textContent).toContain("xb");
+		expect(element.textContent).toContain("Last log.");
+		// Second call carried the last log's time forward.
+		expect(calls).toEqual([5, 10]);
+	});
+
+	test("cancel aborts the loop", async () => {
+		document.body.replaceChildren();
+		const element = document.createElement("div");
+		const indicator = loadingIndicator();
+		let release;
+		const pending = new Promise((resolve) => {
+			release = resolve;
+		});
+		const fetchLogs = () => pending;
+
+		const loader = newSavedLogsLoader(
+			indicator,
+			(l) => `${l}`,
+			fetchLogs,
+			element,
+			0,
+			[],
+			[],
+			[],
+		);
+		const p = loader.lazyLoad();
+		loader.cancel();
+		release([log(1, "a")]);
+		await p;
+
+		// Loop returned instead of appending the resolved logs.
+		expect(element.textContent).toBe("");
 	});
 });

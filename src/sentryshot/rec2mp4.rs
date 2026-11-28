@@ -23,41 +23,7 @@ pub enum RecToMp4Error {
 
 #[allow(clippy::unwrap_used)]
 pub async fn rec_to_mp4(path: PathBuf) -> Result<(), RecToMp4Error> {
-    use RecToMp4Error::*;
-
-    let mut recording_paths = Vec::new();
-    let mut dirs_to_visit = VecDeque::new();
-    dirs_to_visit.push_back(path);
-
-    while let Some(dir) = dirs_to_visit.pop_front() {
-        let entries = std::fs::read_dir(dir).map_err(ReadDir)?;
-        for entry in entries {
-            let entry = entry.map_err(Entry)?;
-
-            let metadata = entry.metadata().map_err(Metadata)?;
-
-            if metadata.is_dir() {
-                dirs_to_visit.push_back(entry.path());
-                continue;
-            }
-
-            let meta_path = entry.path();
-            let is_meta_file = meta_path
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("meta"));
-            if !is_meta_file {
-                continue;
-            }
-
-            let mut mdat_path = meta_path.clone();
-            mdat_path.set_extension("mdat");
-            if !mdat_path.exists() {
-                continue;
-            }
-
-            recording_paths.push((meta_path, mdat_path));
-        }
-    }
+    let recording_paths = find_recordings(path)?;
 
     let n_recordings = recording_paths.len();
     println!("Found {n_recordings} recordings");
@@ -94,6 +60,47 @@ pub async fn rec_to_mp4(path: PathBuf) -> Result<(), RecToMp4Error> {
     }
 
     Ok(())
+}
+
+// Recursively finds .meta/.mdat recording pairs under path. A .meta
+// file without a sibling .mdat is skipped.
+fn find_recordings(path: PathBuf) -> Result<Vec<(PathBuf, PathBuf)>, RecToMp4Error> {
+    use RecToMp4Error::*;
+
+    let mut recording_paths = Vec::new();
+    let mut dirs_to_visit = VecDeque::new();
+    dirs_to_visit.push_back(path);
+
+    while let Some(dir) = dirs_to_visit.pop_front() {
+        let entries = std::fs::read_dir(dir).map_err(ReadDir)?;
+        for entry in entries {
+            let entry = entry.map_err(Entry)?;
+
+            let metadata = entry.metadata().map_err(Metadata)?;
+
+            if metadata.is_dir() {
+                dirs_to_visit.push_back(entry.path());
+                continue;
+            }
+
+            let meta_path = entry.path();
+            let is_meta_file = meta_path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("meta"));
+            if !is_meta_file {
+                continue;
+            }
+
+            let mut mdat_path = meta_path.clone();
+            mdat_path.set_extension("mdat");
+            if !mdat_path.exists() {
+                continue;
+            }
+
+            recording_paths.push((meta_path, mdat_path));
+        }
+    }
+    Ok(recording_paths)
 }
 
 struct ConvertResult {
@@ -134,4 +141,72 @@ async fn convert(meta_path: PathBuf, mdat_path: &Path) -> Result<(), ConvertErro
         .map_err(Copy)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use tempfile::tempdir;
+
+    fn touch(path: &Path) {
+        std::fs::write(path, b"x").unwrap();
+    }
+
+    #[test]
+    fn test_find_recordings_pairs() {
+        let temp_dir = tempdir().unwrap();
+        let dir = temp_dir.path();
+
+        // Paired.
+        touch(&dir.join("a.meta"));
+        touch(&dir.join("a.mdat"));
+        // Unpaired meta.
+        touch(&dir.join("b.meta"));
+        // Orphan mdat.
+        touch(&dir.join("c.mdat"));
+        // Other extension.
+        touch(&dir.join("d.txt"));
+        // Uppercase meta still matches.
+        touch(&dir.join("e.META"));
+        touch(&dir.join("e.mdat"));
+        // Nested pair.
+        let nested = dir.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        touch(&nested.join("f.meta"));
+        touch(&nested.join("f.mdat"));
+
+        let mut got = find_recordings(dir.to_path_buf())
+            .unwrap()
+            .into_iter()
+            .map(|(meta, _)| meta.file_name().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        got.sort();
+
+        assert_eq!(
+            vec![
+                std::ffi::OsString::from("a.meta"),
+                std::ffi::OsString::from("e.META"),
+                std::ffi::OsString::from("f.meta"),
+            ],
+            got
+        );
+    }
+
+    #[test]
+    fn test_find_recordings_empty() {
+        let temp_dir = tempdir().unwrap();
+        assert_eq!(
+            Vec::<(PathBuf, PathBuf)>::new(),
+            find_recordings(temp_dir.path().to_path_buf()).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_find_recordings_not_a_dir() {
+        let temp_dir = tempdir().unwrap();
+        let file = temp_dir.path().join("x");
+        touch(&file);
+        assert!(find_recordings(file).is_err());
+    }
 }

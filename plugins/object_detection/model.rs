@@ -213,6 +213,9 @@ fn calculate_checksum(data: &[u8]) -> ModelChecksum {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::StubFetcher;
+    use common::DummyLogger;
+    use tempfile::tempdir;
 
     #[test]
     fn test_calculate_checksum() {
@@ -222,5 +225,41 @@ mod tests {
                 .parse()
                 .unwrap()
         );
+    }
+
+    fn new_test_cache(fetcher: DynFetcher) -> (tempfile::TempDir, ModelCache) {
+        let temp_dir = tempdir().unwrap();
+        let models_dir = temp_dir.path().join("models");
+        std::fs::create_dir(&models_dir).unwrap();
+        let cache = ModelCache::new(DummyLogger::new(), fetcher, models_dir).unwrap();
+        (temp_dir, cache)
+    }
+
+    // The fetched bytes hash to a different checksum than requested:
+    // the model must be rejected and nothing written.
+    #[tokio::test]
+    async fn test_fetch_bad_checksum() {
+        let url: Url = "https://test.com/model.tflite".parse().unwrap();
+        let fetcher = StubFetcher::new(HashMap::from([(url.clone(), vec![1, 2, 3])]));
+        let (_dir, cache) = new_test_cache(Box::new(fetcher));
+
+        let wrong = ModelChecksum::new([9; 32]);
+        let e = cache.fetch(&url, &wrong).await.unwrap_err();
+        assert!(matches!(e, ModelCacheError::BadChecksum(..)));
+    }
+
+    // A model already on disk is returned without hitting the fetcher.
+    #[tokio::test]
+    async fn test_fetch_cache_hit() {
+        let fetcher = StubFetcher::new(HashMap::new());
+        let (dir, mut cache) = new_test_cache(Box::new(fetcher));
+        let checksum = ModelChecksum::new([7; 32]);
+        let model_path = dir.path().join("models").join(checksum.as_string());
+        std::fs::write(&model_path, b"cached").unwrap();
+        cache.models.insert(checksum.clone(), model_path.clone());
+
+        let url: Url = "https://test.com/nothing".parse().unwrap();
+        // Fetcher would panic on this unknown URL if consulted.
+        assert_eq!(model_path, cache.fetch(&url, &checksum).await.unwrap());
     }
 }

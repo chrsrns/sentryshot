@@ -243,7 +243,12 @@ mod tests {
     use super::*;
     use bytesize::GB;
     use pretty_assertions::assert_eq;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    // Serializes tests that read STREAMER/WEEK_START — process-env mutation
+    // is global and would otherwise race between cases.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_config() {
@@ -256,6 +261,7 @@ mod tests {
     }
     #[test]
     fn test_parse_config_ok() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let temp_dir = TempDir::new().unwrap();
         std::fs::create_dir(temp_dir.path().join("plugins")).unwrap();
         let storage_dir = temp_dir.path().join("storage");
@@ -334,6 +340,67 @@ mod tests {
             Err(ParseEnvConfigError::PathNotAbsolute(..))
         ));
     }
+    #[test]
+    fn test_parse_config_env_flags() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let storage_dir = temp_dir.path().join("storage");
+        let config_dir = temp_dir.path().join("config");
+        let plugin_dir = temp_dir.path().join("plugin");
+        std::fs::create_dir(&config_dir).unwrap();
+        std::fs::create_dir(&plugin_dir).unwrap();
+
+        let config = format!(
+            "
+            port = 2020
+            storage_dir = {:?}
+            config_dir = {:?}
+            plugin_dir = {:?}
+            max_disk_usage = 1
+        ",
+            storage_dir.to_str().unwrap(),
+            config_dir.to_str().unwrap(),
+            plugin_dir.to_str().unwrap(),
+        );
+
+        let parse_flags = |streamer: Option<&str>, week_start: Option<&str>| {
+            // SAFETY: serialized via ENV_LOCK; vars are restored before return.
+            unsafe {
+                match streamer {
+                    Some(v) => std::env::set_var("STREAMER", v),
+                    None => std::env::remove_var("STREAMER"),
+                }
+                match week_start {
+                    Some(v) => std::env::set_var("WEEK_START", v),
+                    None => std::env::remove_var("WEEK_START"),
+                }
+            }
+            let flags = parse_config(config.clone()).unwrap().flags;
+            unsafe {
+                std::env::remove_var("STREAMER");
+                std::env::remove_var("WEEK_START");
+            }
+            flags
+        };
+
+        let f = parse_flags(Some("hls"), Some("sunday"));
+        assert_eq!(Streamer::Hls, f.streamer);
+        assert!(f.week_start_sunday);
+
+        let f = parse_flags(Some("HLS"), Some("SUNDAY"));
+        assert_eq!(Streamer::Hls, f.streamer);
+        assert!(f.week_start_sunday);
+
+        let f = parse_flags(Some("sp"), Some("monday"));
+        assert_eq!(Streamer::Sp, f.streamer);
+        assert!(!f.week_start_sunday);
+
+        let f = parse_flags(None, None);
+        assert_eq!(Streamer::Sp, f.streamer);
+        assert!(!f.week_start_sunday);
+    }
+
     #[test]
     fn test_parse_config_plugin_dir_abs_error() {
         let config = "

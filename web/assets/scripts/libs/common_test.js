@@ -321,13 +321,47 @@ describe("sanitizeMonitorName", () => {
 	test("strips spaces and punctuation", () => {
 		expect(sanitizeMonitorName("My Cam (front)!", "1.2.3.4")).toBe("MyCamfront");
 	});
-	test("caps at 24 utf-8 bytes without splitting a code point", () => {
-		const name = sanitizeMonitorName("aaaaaaaaaaaaaaaaaaaaaaaé", "1.2.3.4");
-		expect(name.length).toBeLessThanOrEqual(24);
-		expect(name).toBe("aaaaaaaaaaaaaaaaaaaaaaa");
+	test("caps at 64 utf-8 bytes without splitting a code point", () => {
+		const name = sanitizeMonitorName(
+			"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaé",
+			"1.2.3.4",
+		);
+		expect(name.length).toBeLessThanOrEqual(64);
+		expect(name).toBe(
+			"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		);
+		expect(sanitizeMonitorName("a".repeat(64), "1.2.3.4")).toBe("a".repeat(64));
 	});
 	test("falls back to dashed-ip camera name", () => {
 		expect(sanitizeMonitorName("...", "192.168.1.5")).toBe("Camera-192-168-1-5");
 		expect(sanitizeMonitorName(undefined, "10.0.0.2")).toBe("Camera-10-0-0-2");
+	});
+});
+
+describe("htmlToElem cache", () => {
+	test("repeated calls return separate clean clones", () => {
+		const first = htmlToElem("<div><p>cached</p></div>");
+		// Mutate the returned element; the cached copy must be unaffected.
+		first.textContent = "mutated";
+		const second = htmlToElem("<div><p>cached</p></div>");
+		expect(second).not.toBe(first);
+		expect(second.textContent).toBe("cached");
+	});
+	test("children are appended on both miss and hit", () => {
+		const html = "<div id=\"cachechildren\"></div>";
+		const child = document.createElement("span");
+		const a = htmlToElem(html, [child]);
+		const b = htmlToElem(html, [child.cloneNode(true)]);
+		expect(a.querySelector("span")).not.toBeNull();
+		expect(b.querySelector("span")).not.toBeNull();
+	});
+	test("cache stays bounded past ELEM_CACHE_MAX", () => {
+		// 210 unique htmls exceed the 200-entry cap without error.
+		for (let i = 0; i < 210; i++) {
+			htmlToElem(`<div data-i="${i}"></div>`);
+		}
+		// Evicted entries re-parse cleanly.
+		const elem = htmlToElem("<div>after-eviction</div>");
+		expect(elem.textContent).toBe("after-eviction");
 	});
 });

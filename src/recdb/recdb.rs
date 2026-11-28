@@ -313,13 +313,13 @@ impl RecDb {
                     }
                 };
                 let path = file.path();
-                let Some(file_name) = path.file_name() else {
+                let Some(file_stem) = path.file_stem() else {
                     continue;
                 };
-                let Some(file_name) = file_name.to_str() else {
+                let Some(file_stem) = file_stem.to_str() else {
                     continue;
                 };
-                if file_name.starts_with(rec_id.as_str()) {
+                if file_stem == rec_id.as_str() {
                     let file_size = path.metadata().map(|m| m.len()).unwrap_or(0);
                     if let Err(e) = std::fs::remove_file(path) {
                         err = Some(DeleteRecordingError::Delete(e));
@@ -407,12 +407,14 @@ impl RecDb {
         }
         let max_usage = self.storage.max_usage().0;
         let target_storage_usage = (max_usage * 98) / 100; // 98% of max.
-        let bytes_to_delete = ByteSize(
-            usage
-                .used
-                .checked_sub(target_storage_usage)
-                .expect("storage usage must be greater than target usage"),
-        );
+        let Some(bytes_to_delete) = usage.used.checked_sub(target_storage_usage) else {
+            self.logger.log2(
+                LogLevel::Error,
+                "storage usage below target while above the prune threshold, skipping prune",
+            );
+            return (None, None);
+        };
+        let bytes_to_delete = ByteSize(bytes_to_delete);
         self.logger.log2(
             LogLevel::Info,
             &format!("deleting {bytes_to_delete} of recordings"),
@@ -636,6 +638,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_recording_file_by_ext() {
+        let temp_dir = TempDir::new().unwrap();
+        let recordings_dir = std::fs::canonicalize(temp_dir.path()).unwrap();
+        let rec_db = new_test_recdb(&recordings_dir).await;
+
+        let rec_id = RecordingId::try_from("2000-01-01_01-01-01_x".to_owned()).unwrap();
+        let rec_dir = recordings_dir
+            .join("2000")
+            .join("01")
+            .join("01")
+            .join("x");
+        std::fs::create_dir_all(&rec_dir).unwrap();
+
+        // Missing file -> None.
+        assert!(
+            rec_db
+                .recording_file_by_ext(&rec_id, "meta")
+                .await
+                .is_none()
+        );
+
+        // Real file -> Some(canonical path).
+        std::fs::write(rec_dir.join("2000-01-01_01-01-01_x.meta"), b"m").unwrap();
+        assert_eq!(
+            Some(rec_dir.join("2000-01-01_01-01-01_x.meta")),
+            rec_db.recording_file_by_ext(&rec_id, "meta").await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recording_file_by_ext_symlink_escape() {
+        let temp_dir = TempDir::new().unwrap();
+        let recordings_dir = std::fs::canonicalize(temp_dir.path()).unwrap();
+        let rec_db = new_test_recdb(&recordings_dir).await;
+
+        let rec_id = RecordingId::try_from("2000-01-01_01-01-01_x".to_owned()).unwrap();
+        let rec_dir = recordings_dir
+            .join("2000")
+            .join("01")
+            .join("01")
+            .join("x");
+        std::fs::create_dir_all(&rec_dir).unwrap();
+
+        // Target lives outside the recordings tree.
+        let outside = TempDir::new().unwrap();
+        let outside_file = outside.path().join("evil.json");
+        std::fs::write(&outside_file, b"{}").unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                &outside_file,
+                rec_dir.join("2000-01-01_01-01-01_x.json"),
+            )
+            .unwrap();
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(
+                &outside_file,
+                rec_dir.join("2000-01-01_01-01-01_x.json"),
+            )
+            .unwrap();
+        }
+
+        // Canonicalized path escapes recordings_dir -> None.
+        assert!(
+            rec_db
+                .recording_file_by_ext(&rec_id, "json")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn test_new_recording() {
         let temp_dir = TempDir::new().unwrap();
 
@@ -727,6 +804,44 @@ mod tests {
         );
     }
 
+    // Recordings whose ids share a prefix: `_m1` must not delete `_m1b`.
+    #[tokio::test]
+    async fn test_delete_recording_prefix_collision() {
+        let recordings_dir = TempDir::new().unwrap();
+        let rec_dir = recordings_dir
+            .path()
+            .join("2000")
+            .join("01")
+            .join("01")
+            .join("m1");
+        let rec_id = "2000-01-01_02-02-02_m1";
+        let rec_id_b = "2000-01-01_02-02-02_m1b";
+        let files = vec![
+            rec_id.to_owned() + ".meta",
+            rec_id.to_owned() + ".mdat",
+            rec_id.to_owned() + ".json",
+            rec_id_b.to_owned() + ".meta",
+            rec_id_b.to_owned() + ".mdat",
+        ];
+        std::fs::create_dir_all(&rec_dir).unwrap();
+        create_files(&rec_dir, &files);
+
+        let rec_db = new_test_recdb(recordings_dir.path()).await;
+        assert_eq!(rec_db.count_recordings().await, 2);
+        let (_, err) = rec_db
+            .delete_recording(rec_id.to_owned().try_into().unwrap())
+            .await;
+        assert!(err.is_none());
+        // Sibling recording survives untouched.
+        assert_eq!(
+            vec![
+                rec_id_b.to_owned() + ".mdat",
+                rec_id_b.to_owned() + ".meta",
+            ],
+            list_directory(&rec_dir)
+        );
+    }
+
     fn create_files(dir: &Path, files: &[String]) {
         for file in files {
             std::fs::OpenOptions::new()
@@ -790,6 +905,74 @@ mod tests {
         assert!(recdb.prune().await.1.is_none());
 
         assert_eq!(after, list_empty_files(temp_dir.path()));
+    }
+
+    struct StubStorage {
+        used: u64,
+        percent: f32,
+        max: ByteSize,
+        partial_err: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl common::Storage for StubStorage {
+        async fn usage(
+            &self,
+            _: Duration,
+        ) -> (
+            Result<common::StorageUsage, StorageUsageError>,
+            Option<common::UsageBytesError>,
+        ) {
+            let err = self
+                .partial_err
+                .then(|| common::UsageBytesError::DirEntry(std::io::Error::other("x")));
+            (
+                Ok(common::StorageUsage {
+                    used: self.used,
+                    percent: self.percent,
+                }),
+                err,
+            )
+        }
+        async fn usage_cached(&self) -> Option<(common::StorageUsage, Duration)> {
+            None
+        }
+        fn max_usage(&self) -> ByteSize {
+            self.max
+        }
+    }
+
+    async fn prune_with_stub(used: u64, percent: f32, max: ByteSize) -> (TempDir, RecDb) {
+        let temp_dir = TempDir::new().unwrap();
+        let recordings_dir = temp_dir.path().join("recordings");
+        std::fs::create_dir_all(&recordings_dir).unwrap();
+        let storage = Arc::new(StubStorage {
+            used,
+            percent,
+            max,
+            partial_err: false,
+        });
+        let recdb = RecDb::new(DummyLogger::new(), recordings_dir, storage).await;
+        (temp_dir, recdb)
+    }
+
+    // percent == 99 with used below the 98% target: inconsistent inputs
+    // must not panic.
+    #[tokio::test]
+    async fn test_prune_usage_below_target() {
+        let (_t, recdb) = prune_with_stub(50, 99.0, ByteSize(100)).await;
+        let (oldest, err) = recdb.prune().await;
+        assert!(oldest.is_none());
+        assert!(err.is_none());
+    }
+
+    // max_usage == 0: target usage is 0, nothing to delete.
+    #[tokio::test]
+    async fn test_prune_zero_max_usage() {
+        let (_t, recdb) = prune_with_stub(0, f32::INFINITY, ByteSize(0)).await;
+        let (oldest, err) = recdb.prune().await;
+        assert!(oldest.is_none());
+        assert!(err.is_none());
     }
 
     fn write_empty_files(base: &Path, paths: &[&str]) {

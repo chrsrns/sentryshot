@@ -1142,3 +1142,411 @@ fn test_generate_moof_minimal_real() {
     ];
     assert_eq!(want, got);
 }
+
+// Box that reports size 0 but writes a marker if marshal is invoked.
+// Used to verify the empty-box skip.
+struct LoudEmpty;
+
+impl ImmutableBox for LoudEmpty {
+    fn box_type(&self) -> BoxType {
+        *b"loud"
+    }
+    fn size(&self) -> usize {
+        0
+    }
+}
+impl ImmutableBoxSync for LoudEmpty {
+    fn marshal(&self, w: &mut dyn Write) -> Result<(), Mp4Error> {
+        w.write_all(&[0xaa])?;
+        Ok(())
+    }
+}
+#[async_trait]
+impl ImmutableBoxAsync for LoudEmpty {
+    async fn marshal(
+        &self,
+        w: &mut (dyn AsyncWrite + Unpin + Send + Sync),
+    ) -> Result<(), Mp4Error> {
+        w.write_all(&[0xaa]).await?;
+        Ok(())
+    }
+}
+impl From<LoudEmpty> for Box<dyn ImmutableBoxSync> {
+    fn from(value: LoudEmpty) -> Self {
+        Box::new(value)
+    }
+}
+impl From<LoudEmpty> for Box<dyn ImmutableBoxAsync> {
+    fn from(value: LoudEmpty) -> Self {
+        Box::new(value)
+    }
+}
+
+// Box whose reported size overflows u32 once the 8-byte header is added.
+struct HugeBox;
+
+impl ImmutableBox for HugeBox {
+    fn box_type(&self) -> BoxType {
+        *b"huge"
+    }
+    fn size(&self) -> usize {
+        u32::MAX as usize
+    }
+}
+impl ImmutableBoxSync for HugeBox {
+    fn marshal(&self, _: &mut dyn Write) -> Result<(), Mp4Error> {
+        Ok(())
+    }
+}
+#[async_trait]
+impl ImmutableBoxAsync for HugeBox {
+    async fn marshal(
+        &self,
+        _: &mut (dyn AsyncWrite + Unpin + Send + Sync),
+    ) -> Result<(), Mp4Error> {
+        Ok(())
+    }
+}
+
+#[test]
+fn test_boxes_marshal_tree() {
+    // moov(trak(mdia(btrt)), mvex) -> preorder DFS.
+    let tree = Boxes::new(Moov).with_children2(
+        Boxes::new(Trak).with_child(Boxes::new(Mdia).with_child(Boxes::new(Btrt {
+            buffer_size_db: 0x1111_2222,
+            max_bitrate: 0x3333_4444,
+            avg_bitrate: 0x5555_6666,
+        }))),
+        Boxes::new(Mvex),
+    );
+
+    let mut buf = Vec::<u8>::new();
+    tree.marshal(&mut buf).unwrap();
+    assert_eq!(
+        buf,
+        [
+            0x00, 0x00, 0x00, 0x34, b'm', b'o', b'o', b'v', // size 52.
+            0x00, 0x00, 0x00, 0x24, b't', b'r', b'a', b'k', // size 36.
+            0x00, 0x00, 0x00, 0x1c, b'm', b'd', b'i', b'a', // size 28.
+            0x00, 0x00, 0x00, 0x14, b'b', b't', b'r', b't', // size 20.
+            0x11, 0x11, 0x22, 0x22, // buffer_size_db.
+            0x33, 0x33, 0x44, 0x44, // max_bitrate.
+            0x55, 0x55, 0x66, 0x66, // avg_bitrate.
+            0x00, 0x00, 0x00, 0x08, b'm', b'v', b'e', b'x', // size 8.
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_boxes_async_marshal_tree() {
+    let tree = BoxesAsync::new(Moov).with_children2(
+        BoxesAsync::new(Trak).with_child(BoxesAsync::new(Mdia).with_child(BoxesAsync::new(
+            Btrt {
+                buffer_size_db: 0x1111_2222,
+                max_bitrate: 0x3333_4444,
+                avg_bitrate: 0x5555_6666,
+            },
+        ))),
+        BoxesAsync::new(Mvex),
+    );
+
+    let mut buf = Vec::<u8>::new();
+    tree.marshal(&mut buf).await.unwrap();
+    assert_eq!(
+        buf,
+        [
+            0x00, 0x00, 0x00, 0x34, b'm', b'o', b'o', b'v', // size 52.
+            0x00, 0x00, 0x00, 0x24, b't', b'r', b'a', b'k', // size 36.
+            0x00, 0x00, 0x00, 0x1c, b'm', b'd', b'i', b'a', // size 28.
+            0x00, 0x00, 0x00, 0x14, b'b', b't', b'r', b't', // size 20.
+            0x11, 0x11, 0x22, 0x22, // buffer_size_db.
+            0x33, 0x33, 0x44, 0x44, // max_bitrate.
+            0x55, 0x55, 0x66, 0x66, // avg_bitrate.
+            0x00, 0x00, 0x00, 0x08, b'm', b'v', b'e', b'x', // size 8.
+        ]
+    );
+}
+
+#[test]
+fn test_boxes_marshal_empty_box_skip() {
+    // Leaf node of total size 8: header only, marshal never invoked
+    // (LoudEmpty would append 0xaa if it were).
+    let tree = Boxes::new(Moov).with_child(Boxes::new(LoudEmpty));
+    let mut buf = Vec::<u8>::new();
+    tree.marshal(&mut buf).unwrap();
+    assert_eq!(
+        buf,
+        [
+            0x00, 0x00, 0x00, 0x10, b'm', b'o', b'o', b'v', // size 16.
+            0x00, 0x00, 0x00, 0x08, b'l', b'o', b'u', b'd', // size 8.
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_boxes_async_marshal_empty_box_skip() {
+    let tree = BoxesAsync::new(Moov).with_child(BoxesAsync::new(LoudEmpty));
+    let mut buf = Vec::<u8>::new();
+    tree.marshal(&mut buf).await.unwrap();
+    assert_eq!(
+        buf,
+        [
+            0x00, 0x00, 0x00, 0x10, b'm', b'o', b'o', b'v', // size 16.
+            0x00, 0x00, 0x00, 0x08, b'l', b'o', b'u', b'd', // size 8.
+        ]
+    );
+}
+
+#[test]
+fn test_write_box_header_overflow() {
+    let mut buf = Vec::<u8>::new();
+    let result = write_box_header(&mut buf, u32::MAX as usize + 1, TYPE_MOOV);
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_write_box_header2_overflow() {
+    let mut buf = Vec::<u8>::new();
+    let result = write_box_header2(&mut buf, u32::MAX as usize + 1, TYPE_MOOV).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_write_single_box2() {
+    // Empty box: header only, marshal skipped, returns 8.
+    let mut buf = Vec::<u8>::new();
+    let n = write_single_box2(&mut buf, &LoudEmpty).await.unwrap();
+    assert_eq!(n, 8);
+    assert_eq!(buf, [0x00, 0x00, 0x00, 0x08, b'l', b'o', b'u', b'd']);
+
+    // Box with payload: header + fields.
+    let mut buf = Vec::<u8>::new();
+    let n = write_single_box2(
+        &mut buf,
+        &Btrt {
+            buffer_size_db: 1,
+            max_bitrate: 2,
+            avg_bitrate: 3,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(n, 20);
+    assert_eq!(
+        buf,
+        [
+            0x00, 0x00, 0x00, 0x14, b'b', b't', b'r', b't', // header.
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03,
+        ]
+    );
+
+    // Size that doesn't fit u32: error before writing the payload.
+    let mut buf = Vec::<u8>::new();
+    let result = write_single_box2(&mut buf, &HugeBox).await;
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_url_location() {
+    // Non-URL_NOPT flag writes location + NUL.
+    let url = Url {
+        full_box: FullBox {
+            version: 0,
+            flags: [0, 0, 0],
+        },
+        location: "abc".to_owned(),
+    };
+    let mut buf = Vec::<u8>::new();
+    ImmutableBoxSync::marshal(&url, &mut buf).unwrap();
+    assert_eq!(buf, [0, 0, 0, 0, b'a', b'b', b'c', 0]);
+    assert_eq!(url.size(), 8);
+}
+
+#[test_case(
+        Tfhd{
+            full_box: FullBox{
+                version: 0,
+                flags: [0, 0, TFHD_SAMPLE_DESCRIPTION_INDEX_PRESENT as u8],
+            },
+            track_id: 1,
+            base_data_offset: 0,
+            sample_description_index: 0x0123_4567,
+            default_sample_duration: 0,
+            default_sample_size: 0,
+            default_sample_flags: 0,
+        },
+        &[
+            0,                // version
+            0x00, 0x00, 0x02, // flags
+            0x00, 0x00, 0x00, 0x01, // track ID
+            0x01, 0x23, 0x45, 0x67, // sample description index
+        ]; "tfhd: sample description index"
+    )]
+#[test_case(
+        Tfhd{
+            full_box: FullBox{
+                version: 0,
+                flags: [
+                    0,
+                    0,
+                    (TFHD_DEFAULT_SAMPLE_SIZE_PRESENT
+                        | TFHD_DEFAULT_SAMPLE_FLAGS_PRESENT) as u8,
+                ],
+            },
+            track_id: 2,
+            base_data_offset: 0,
+            sample_description_index: 0,
+            default_sample_duration: 0,
+            default_sample_size: 0x0123_4567,
+            default_sample_flags: 0x89ab_cdef,
+        },
+        &[
+            0,                // version
+            0x00, 0x00, 0x30, // flags
+            0x00, 0x00, 0x00, 0x02, // track ID
+            0x01, 0x23, 0x45, 0x67, // default sample size
+            0x89, 0xab, 0xcd, 0xef, // default sample flags
+        ]; "tfhd: default sample size & flags"
+    )]
+#[test_case(
+        Tfhd{
+            full_box: FullBox{
+                version: 0,
+                flags: [
+                    (TFHD_DEFAULT_BASE_IS_MOOF >> 16) as u8 | 0x01,
+                    0,
+                    0,
+                ],
+            },
+            track_id: 3,
+            base_data_offset: 0,
+            sample_description_index: 0,
+            default_sample_duration: 0,
+            default_sample_size: 0,
+            default_sample_flags: 0,
+        },
+        &[
+            0,                // version
+            0x03, 0x00, 0x00, // flags (duration-is-empty | default-base-is-moof)
+            0x00, 0x00, 0x00, 0x03, // track ID
+        ]; "tfhd: duration is empty & default base is moof"
+    )]
+#[test_case(
+        Tfhd{
+            full_box: FullBox{
+                version: 0,
+                flags: [0, 0, 0x3b],
+            },
+            track_id: 4,
+            base_data_offset: 0x0123_4567_89ab_cdef,
+            sample_description_index: 0x1111_2222,
+            default_sample_duration: 0x3333_4444,
+            default_sample_size: 0x5555_6666,
+            default_sample_flags: 0x7777_8888,
+        },
+        &[
+            0,                // version
+            0x00, 0x00, 0x3b, // flags: all five field flags.
+            0x00, 0x00, 0x00, 0x04, // track ID
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, // base data offset
+            0x11, 0x11, 0x22, 0x22, // sample description index
+            0x33, 0x33, 0x44, 0x44, // default sample duration
+            0x55, 0x55, 0x66, 0x66, // default sample size
+            0x77, 0x77, 0x88, 0x88, // default sample flags
+        ]; "tfhd: all fields"
+    )]
+#[test_case(
+        Trun{
+            flags: [0, 0, TRUN_DATA_OFFSET_PRESENT as u8],
+            data_offset: -0x1111_2222,
+            first_sample_flags: 0,
+            entries: TrunEntries::V1(vec![]),
+        },
+        &[
+            1,                // version
+            0x00, 0x00, 0x01, // flags
+            0x00, 0x00, 0x00, 0x00, // sample count
+            0xee, 0xee, 0xdd, 0xde, // data offset
+        ]; "trun: data offset"
+    )]
+#[test_case(
+        Trun{
+            flags: [0, 0, TRUN_FIRST_SAMPLE_FLAGS_PRESENT as u8],
+            data_offset: 0,
+            first_sample_flags: 0x0123_4567,
+            entries: TrunEntries::V1(vec![]),
+        },
+        &[
+            1,                // version
+            0x00, 0x00, 0x04, // flags
+            0x00, 0x00, 0x00, 0x00, // sample count
+            0x01, 0x23, 0x45, 0x67, // first sample flags
+        ]; "trun: first sample flags"
+    )]
+#[test_case(
+        Trun{
+            flags: [
+                0,
+                (TRUN_SAMPLE_DURATION_PRESENT >> 8) as u8
+                    | (TRUN_SAMPLE_SIZE_PRESENT >> 8) as u8
+                    | (TRUN_SAMPLE_FLAGS_PRESENT >> 8) as u8,
+                0,
+            ],
+            data_offset: 0,
+            first_sample_flags: 0,
+            entries: TrunEntries::V1(vec![TrunEntryV1{
+                sample_duration: 0x1111_2222,
+                sample_size: 0x3333_4444,
+                sample_flags: 0x5555_6666,
+                sample_composition_time_offset: 0,
+            }]),
+        },
+        &[
+            1,                // version
+            0x00, 0x07, 0x00, // flags
+            0x00, 0x00, 0x00, 0x01, // sample count
+            0x11, 0x11, 0x22, 0x22, // sample duration
+            0x33, 0x33, 0x44, 0x44, // sample size
+            0x55, 0x55, 0x66, 0x66, // sample flags
+        ]; "trun: duration size & flags per entry"
+    )]
+#[test_case(
+        Trun{
+            flags: [0, 0x0f, 0x05],
+            data_offset: 0x0123_4567,
+            first_sample_flags: 0x89ab_cdef,
+            entries: TrunEntries::V1(vec![
+                TrunEntryV1{
+                    sample_duration: 1,
+                    sample_size: 2,
+                    sample_flags: 3,
+                    sample_composition_time_offset: 4,
+                },
+                TrunEntryV1{
+                    sample_duration: 5,
+                    sample_size: 6,
+                    sample_flags: 7,
+                    sample_composition_time_offset: -8,
+                },
+            ]),
+        },
+        &[
+            1,                // version
+            0x00, 0x0f, 0x05, // flags: all set
+            0x00, 0x00, 0x00, 0x02, // sample count
+            0x01, 0x23, 0x45, 0x67, // data offset
+            0x89, 0xab, 0xcd, 0xef, // first sample flags
+            0x00, 0x00, 0x00, 0x01, // duration
+            0x00, 0x00, 0x00, 0x02, // size
+            0x00, 0x00, 0x00, 0x03, // flags
+            0x00, 0x00, 0x00, 0x04, // composition time offset
+            0x00, 0x00, 0x00, 0x05, // duration
+            0x00, 0x00, 0x00, 0x06, // size
+            0x00, 0x00, 0x00, 0x07, // flags
+            0xff, 0xff, 0xff, 0xf8, // composition time offset
+        ]; "trun: all flags"
+    )]
+#[tokio::test]
+async fn test_flag_combos<T: Into<Box<dyn ImmutableBoxBoth>>>(src: T, bin: &[u8]) {
+    test_box_types(src, bin).await;
+}

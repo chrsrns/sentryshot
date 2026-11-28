@@ -107,9 +107,10 @@ pub trait Dir {
     fn read_dir_file(&mut self) -> Result<Vec<Entry>, FsError>;
 }
 
-#[allow(clippy::unwrap_used)]
 fn valid_path(name: &Path) -> bool {
-    let mut name = name.to_str().unwrap();
+    let Some(mut name) = name.to_str() else {
+        return false;
+    };
     if name == "." {
         // Special case.
         return true;

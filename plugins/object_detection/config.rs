@@ -350,4 +350,28 @@ mod tests {
         let config = set_enable(&config, true).unwrap();
         assert!(parse(config.raw()).is_some());
     }
+
+    fn monitor_config(object_detection: &serde_json::Value) -> MonitorConfig {
+        serde_json::from_value(json!({
+            "id": "123",
+            "name": "test",
+            "enable": true,
+            "alwaysRecord": false,
+            "videoLength": 0,
+            "source": "rtsp",
+            "sourcertsp": { "protocol": "tcp", "mainStream": "rtsp://x" },
+            "objectDetection": object_detection,
+        }))
+        .unwrap()
+    }
+
+    // Every None-branch of set_enable: no objectDetection object or
+    // no bool "enable" field inside it.
+    #[test]
+    fn test_set_enable_none_branches() {
+        assert!(set_enable(&monitor_config(&json!({})), true).is_none());
+        assert!(set_enable(&monitor_config(&json!("x")), true).is_none());
+        assert!(set_enable(&monitor_config(&json!({"enable": "x"})), true).is_none());
+        assert!(set_enable(&monitor_config(&json!({"enable": 1})), true).is_none());
+    }
 }

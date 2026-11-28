@@ -223,10 +223,10 @@ pub enum ParseGroupNameError {
 const ALLOWED_GROUP_NAME_CHARS: [char; 2] = ['-', '_'];
 
 impl TryFrom<String> for GroupName {
-    type Error = ParseGroupIdError;
+    type Error = ParseGroupNameError;
 
     fn try_from(s: String) -> Result<Self, Self::Error> {
-        use ParseGroupIdError::*;
+        use ParseGroupNameError::*;
         if s.is_empty() {
             return Err(Empty);
         }
@@ -235,7 +235,7 @@ impl TryFrom<String> for GroupName {
                 return Err(InvalidChar(c));
             }
         }
-        if s.len() > GROUP_ID_MAX_LENGTH {
+        if s.len() > GROUP_NAME_MAX_LENGTH {
             return Err(MaxLength);
         }
         Ok(Self(s))
@@ -298,17 +298,107 @@ mod tests {
         assert_eq!(map1, monitor_groups.get().await);
     }
 
+    #[tokio::test]
+    async fn test_set_write_error() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path();
+        let storage_dir = temp_path.join("storage");
+        let configs_dir = temp_path.join("configs");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        std::fs::create_dir_all(&configs_dir).unwrap();
+        let monitor_groups = MonitorGroups::new(&storage_dir, &configs_dir)
+            .await
+            .unwrap();
+
+        // Unwritable configs dir -> WriteFile error, in-memory map untouched.
+        std::fs::remove_dir(&configs_dir).unwrap();
+        let groups = Groups::new();
+        assert!(matches!(
+            monitor_groups.set(groups).await.unwrap_err(),
+            SetMonitorGroupsError::WriteFile(..)
+        ));
+        assert!(monitor_groups.get().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_group_key_id_mismatch_persists() {
+        // Current semantics: the map key and Group.id are independent and
+        // both are persisted verbatim — a mismatch is stored, not rejected.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path();
+        let storage_dir = temp_path.join("storage");
+        let configs_dir = temp_path.join("configs");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        std::fs::create_dir_all(&configs_dir).unwrap();
+        let monitor_groups = MonitorGroups::new(&storage_dir, &configs_dir)
+            .await
+            .unwrap();
+
+        let key: GroupId = "keyid".to_owned().try_into().unwrap();
+        let group = Group {
+            id: "otherid".to_owned().try_into().unwrap(),
+            name: "name1".to_owned().try_into().unwrap(),
+            monitors: Vec::new(),
+        };
+        let map = HashMap::from([(key, group)]);
+
+        monitor_groups.set(map.clone()).await.unwrap();
+        assert_eq!(map, monitor_groups.get().await);
+
+        drop(monitor_groups);
+        let monitor_groups = MonitorGroups::new(&storage_dir, &configs_dir)
+            .await
+            .unwrap();
+        assert_eq!(map, monitor_groups.get().await);
+    }
+
+    #[test]
+    fn test_parse_group_id() {
+        GroupId::try_from("a".to_owned()).unwrap();
+        GroupId::try_from("123".to_owned()).unwrap();
+        GroupId::try_from("a".repeat(24)).unwrap();
+
+        assert_eq!(
+            GroupId::try_from(String::new()).unwrap_err(),
+            ParseGroupIdError::Empty
+        );
+        // IDs are alphanumeric only — unlike names, `-`/`_` are rejected.
+        assert!(matches!(
+            GroupId::try_from("a-b".to_owned()).unwrap_err(),
+            ParseGroupIdError::InvalidChar('-')
+        ));
+        assert!(matches!(
+            GroupId::try_from("a_b".to_owned()).unwrap_err(),
+            ParseGroupIdError::InvalidChar('_')
+        ));
+        assert_eq!(
+            GroupId::try_from("a".repeat(25)).unwrap_err(),
+            ParseGroupIdError::MaxLength
+        );
+    }
+
     #[test]
     fn test_parse_group_name() {
         GroupName::try_from("a".to_owned()).unwrap();
         GroupName::try_from("1-1".to_owned()).unwrap();
         GroupName::try_from("1_1".to_owned()).unwrap();
+        GroupName::try_from("a".repeat(24)).unwrap();
 
-        GroupName::try_from(String::new()).unwrap_err();
-        GroupName::try_from("a a".to_owned()).unwrap_err();
+        assert_eq!(
+            GroupName::try_from(String::new()).unwrap_err(),
+            ParseGroupNameError::Empty
+        );
+        assert!(matches!(
+            GroupName::try_from("a a".to_owned()).unwrap_err(),
+            ParseGroupNameError::InvalidChar(' ')
+        ));
         GroupName::try_from("{".to_owned()).unwrap_err();
         GroupName::try_from("(".to_owned()).unwrap_err();
         GroupName::try_from("<".to_owned()).unwrap_err();
+        assert_eq!(
+            GroupName::try_from("a".repeat(25)).unwrap_err(),
+            ParseGroupNameError::MaxLength
+        );
     }
 
     #[tokio::test]

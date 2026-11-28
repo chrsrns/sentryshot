@@ -194,7 +194,7 @@ impl Segmenter {
                 let next_segment = Segment::new(
                     self.segment_id_counter.next_id(),
                     self.muxer_id,
-                    sample_dts,
+                    next_dts,
                     self.muxer_start_time,
                     self.segment_max_size,
                     self.playlist.clone(),
@@ -264,4 +264,206 @@ fn find_compatible_part_duration(
         i = i.checked_add(DurationH264::new(5 * H264_MILLISECOND))?;
     }
     Some(i)
+}
+
+#[allow(clippy::unwrap_used)]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::{
+        DummyLogger,
+        time::{DtsOffset, UnixH264},
+    };
+    use sentryshot_padded_bytes::PaddedBytes;
+    use tokio_util::sync::CancellationToken;
+
+    fn frame(pts: i64, random_access: bool) -> H264Data {
+        H264Data {
+            pts: UnixH264::new(pts),
+            dts_offset: DtsOffset::new(0),
+            avcc: Arc::new(PaddedBytes::new(vec![1])),
+            random_access_present: random_access,
+        }
+    }
+
+    fn test_playlist() -> Arc<Playlist> {
+        Arc::new(Playlist::new(
+            CancellationToken::new(),
+            DummyLogger::new(),
+            10,
+            0,
+        ))
+    }
+
+    #[test]
+    fn part_duration_is_compatible_basic() {
+        // Sample duration larger than part duration.
+        assert_eq!(
+            Some(false),
+            part_duration_is_compatible(DurationH264::new(90_000), DurationH264::new(90_001))
+        );
+        // Divides evenly: always compatible.
+        assert_eq!(
+            Some(true),
+            part_duration_is_compatible(DurationH264::new(90_000), DurationH264::new(45_000))
+        );
+        // Non-divisible: ceil multiple must be >= part_duration/0.85.
+        assert_eq!(
+            Some(true),
+            part_duration_is_compatible(DurationH264::new(90_000), DurationH264::new(46_000))
+        );
+        assert_eq!(
+            Some(false),
+            part_duration_is_compatible(DurationH264::new(90_000), DurationH264::new(89_000))
+        );
+        // Zero sample duration -> None.
+        assert_eq!(
+            None,
+            part_duration_is_compatible(DurationH264::new(90_000), DurationH264::new(0))
+        );
+    }
+
+    #[test]
+    fn find_compatible_part_duration_basic() {
+        // Empty set: minimum is returned as-is.
+        assert_eq!(
+            Some(DurationH264::new(90_000)),
+            find_compatible_part_duration(DurationH264::new(90_000), &HashSet::new())
+        );
+        // Compatible minimum is not bumped.
+        assert_eq!(
+            Some(DurationH264::new(90_000)),
+            find_compatible_part_duration(
+                DurationH264::new(90_000),
+                &HashSet::from([DurationH264::new(45_000)])
+            )
+        );
+        // sd=60000: first i >= min where 2*60000*0.85 < i is 90000+27*450.
+        assert_eq!(
+            Some(DurationH264::new(102_150)),
+            find_compatible_part_duration(
+                DurationH264::new(90_000),
+                &HashSet::from([DurationH264::new(60_000)])
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn segmenter_new_rejects_non_idr() {
+        let got = Segmenter::new(
+            DurationH264::new(H264_SECOND),
+            DurationH264::new(H264_SECOND / 3),
+            1_000_000,
+            test_playlist(),
+            0,
+            UnixNano::new(0),
+            frame(0, false),
+        );
+        assert!(matches!(
+            got,
+            Err(crate::error::CreateSegmenterError::NotIdr)
+        ));
+    }
+
+    #[tokio::test]
+    async fn segmenter_new_rejects_nonzero_dts() {
+        let mut first = frame(0, true);
+        first.dts_offset = DtsOffset::new(1);
+        let got = Segmenter::new(
+            DurationH264::new(H264_SECOND),
+            DurationH264::new(H264_SECOND / 3),
+            1_000_000,
+            test_playlist(),
+            0,
+            UnixNano::new(0),
+            first,
+        );
+        assert!(matches!(
+            got,
+            Err(crate::error::CreateSegmenterError::DtsNotZero)
+        ));
+    }
+
+    #[tokio::test]
+    async fn adjust_part_duration_edges() {
+        let mut s = Segmenter::new(
+            DurationH264::new(H264_SECOND),
+            DurationH264::new(H264_SECOND / 3),
+            1_000_000,
+            test_playlist(),
+            0,
+            UnixNano::new(0),
+            frame(0, true),
+        )
+        .unwrap();
+
+        // Zero durations are skipped entirely.
+        s.adjust_part_duration(DurationH264::new(0)).unwrap();
+        assert!(s.sample_durations.is_empty());
+
+        // New durations get recorded.
+        s.adjust_part_duration(DurationH264::new(30_000)).unwrap();
+        assert!(s.sample_durations.contains(&DurationH264::new(30_000)));
+
+        // Once the first segment is finalized, durations freeze.
+        s.first_segment_finalized = true;
+        s.adjust_part_duration(DurationH264::new(60_000)).unwrap();
+        assert!(!s.sample_durations.contains(&DurationH264::new(60_000)));
+    }
+
+    #[tokio::test]
+    async fn segment_switch_start_dts() {
+        // The new segment is anchored on the incoming IDR's dts.
+        let playlist = test_playlist();
+        let mut s = Segmenter::new(
+            DurationH264::new(90_000),
+            DurationH264::new(30_000),
+            1_000_000,
+            playlist.clone(),
+            0,
+            UnixNano::new(0),
+            frame(0, true),
+        )
+        .unwrap();
+
+        // Segments switch when an IDR arrives at least segment_duration
+        // after the segment start.
+        s.write_h264(frame(45_000, false)).await.unwrap();
+        s.write_h264(frame(90_000, false)).await.unwrap();
+        s.write_h264(frame(200_000, true)).await.unwrap();
+
+        assert!(s.first_segment_finalized);
+        assert_eq!(
+            UnixH264::new(200_000),
+            s.current_segment.as_ref().unwrap().start_dts()
+        );
+        assert_eq!(1, playlist.debug_state().await.num_segments);
+    }
+
+    #[tokio::test]
+    async fn segmenter_write_rejects_over_max_size() {
+        let mut s = Segmenter::new(
+            DurationH264::new(H264_SECOND),
+            DurationH264::new(H264_SECOND / 3),
+            2, // segment_max_size bytes
+            test_playlist(),
+            0,
+            UnixNano::new(0),
+            frame(0, true),
+        )
+        .unwrap();
+
+        let mut big = frame(45_000, false);
+        big.avcc = Arc::new(PaddedBytes::new(vec![0; 64]));
+        // Samples are written one call late; the big sample lands on the
+        // next write and blows the 2-byte segment budget.
+        s.write_h264(big).await.unwrap();
+        let got = s.write_h264(frame(90_000, false)).await;
+        assert!(matches!(
+            got,
+            Err(crate::error::SegmenterWriteH264Error::WriteH264(
+                crate::error::PartWriteH264Error::MaximumSegmentSize
+            ))
+        ));
+    }
 }

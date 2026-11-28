@@ -195,6 +195,17 @@ pub struct HlsQuery {
     is_delta_update: bool,
 }
 
+impl HlsQuery {
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn default_for_test() -> Self {
+        Self {
+            msn_and_part: None,
+            is_delta_update: false,
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for HlsQuery {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -263,6 +274,54 @@ mod tests {
     use super::*;
     use common::{DummyLogger, StreamerMuxer};
     use pretty_assertions::assert_eq;
+
+    fn parse_query(v: serde_json::Value) -> Result<HlsQuery, serde_json::Error> {
+        serde_json::from_value(v)
+    }
+
+    #[test]
+    fn hls_query_deser_both_msn_and_part() {
+        let q = parse_query(serde_json::json!({
+            "_HLS_msn": "3",
+            "_HLS_part": "7",
+        }))
+        .unwrap();
+        assert_eq!(Some((3, 7)), q.msn_and_part);
+        assert!(!q.is_delta_update);
+    }
+
+    #[test]
+    fn hls_query_deser_requires_both() {
+        assert!(parse_query(serde_json::json!({"_HLS_msn": "3"})).is_err());
+        assert!(parse_query(serde_json::json!({"_HLS_part": "7"})).is_err());
+    }
+
+    #[test]
+    fn hls_query_deser_rejects_non_numeric() {
+        assert!(
+            parse_query(serde_json::json!({
+                "_HLS_msn": "x",
+                "_HLS_part": "7",
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn hls_query_deser_skip_variants() {
+        // v2 and YES are the only recognized skip values.
+        for skip in ["v2", "YES"] {
+            let q = parse_query(serde_json::json!({"_HLS_skip": skip})).unwrap();
+            assert!(q.is_delta_update, "skip={skip}");
+        }
+        for skip in ["yes", "v1", ""] {
+            let q = parse_query(serde_json::json!({"_HLS_skip": skip})).unwrap();
+            assert!(!q.is_delta_update, "skip={skip}");
+        }
+        let q = parse_query(serde_json::json!({})).unwrap();
+        assert_eq!(None, q.msn_and_part);
+        assert!(!q.is_delta_update);
+    }
 
     #[tokio::test]
     async fn test_part_duration() {

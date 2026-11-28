@@ -52,6 +52,8 @@ int c_detector_load_model(CDetector *d, const char *model_path,
     // Create edgetpu delegate.
     d->delegate = edgetpu_create_delegate(device_type, device, NULL, 0);
     if (d->delegate == NULL) {
+      TfLiteModelDelete(model);
+      TfLiteInterpreterOptionsDelete(options);
       return ERROR_EDGETPU_DELEGATE_CREATE
     }
     TfLiteInterpreterOptionsAddDelegate(options, d->delegate);
@@ -59,6 +61,8 @@ int c_detector_load_model(CDetector *d, const char *model_path,
 
   d->interpreter = TfLiteInterpreterCreate(model, options);
   if (d->interpreter == NULL) {
+    TfLiteModelDelete(model);
+    TfLiteInterpreterOptionsDelete(options);
     return ERROR_INTERPRETER_CREATE
   }
   TfLiteModelDelete(model);
@@ -66,6 +70,8 @@ int c_detector_load_model(CDetector *d, const char *model_path,
 
   // Allocate tensors.
   if ((ret = TfLiteInterpreterAllocateTensors(d->interpreter)) != 0) {
+    TfLiteInterpreterDelete(d->interpreter);
+    d->interpreter = NULL;
     return ret;
   }
 

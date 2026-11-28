@@ -685,6 +685,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_recording_by_query_corrupt_data() {
+        // A .json file that fails to parse behaves like no data at all.
+        let fs: DynFs = Box::new(MapFs(
+            map_fs_item_with_data(
+                "2098/01/01/m1/2098-01-01_01-01-11_m1",
+                b"not json".to_vec(),
+            )
+            .into_iter()
+            .collect(),
+        ));
+        let c = Crawler::new(fs);
+        let query = RecDbQuery {
+            recording_id: RecordingId::max(),
+            end: None,
+            limit: NonZeroUsize::new(1).unwrap(),
+            reverse: false,
+            monitors: Vec::new(),
+            include_data: true,
+        };
+        let rec = c.recordings_by_query(query, HashMap::new()).await.unwrap();
+        assert_eq!(1, rec.len());
+        assert!(rec[0].assert_finalized().data.is_none());
+    }
+
+    #[tokio::test]
     async fn test_recording_by_query_missing_data() {
         let c = Crawler::new(crawler_test_fs());
         let query = RecDbQuery {

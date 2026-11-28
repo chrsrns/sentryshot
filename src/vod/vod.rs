@@ -19,7 +19,7 @@ use std::{
     io::SeekFrom,
     num::NonZeroUsize,
     path::PathBuf,
-    pin::{Pin, pin},
+    pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
@@ -525,7 +525,10 @@ impl AsyncSeek for VodReader {
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
                 Ok(())
             }
-            _ => unimplemented!(),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "only SeekFrom::Start is supported",
+            )),
         }
     }
 
@@ -561,7 +564,7 @@ mod tests {
     use pretty_hex::pretty_hex;
     use recdb::RecDb;
     use recording::{MetaHeader, VideoWriter};
-    use std::{path::Path, sync::Arc};
+    use std::{path::Path, pin::pin, sync::Arc};
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -964,6 +967,39 @@ mod tests {
         };
         let result = VodReader::new(&rec_db, &VodCache::new(), query).await;
         assert!(matches!(result, Err(CreateVodReaderError::MaxDuration)));
+    }
+
+    // Non-Start SeekFrom is unsupported but must error, not panic.
+    #[tokio::test]
+    async fn test_vod_seek_non_start_errors() {
+        let year_2000: UnixH264 = UnixNano::new(946_684_800 * SECOND).into();
+        let start_time: UnixH264 = year_2000 + UnixNano::new(10 * MINUTE).into();
+        let (_tmp_dir, rec_db) = single_recording(start_time).await;
+
+        let query = VodQuery {
+            monitor_id: "x".to_owned().try_into().unwrap(),
+            start: start_time.into(),
+            end: (start_time + UnixH264::new(SECOND)).into(),
+            cache_id: 0,
+        };
+        let reader = VodReader::new(&rec_db, &VodCache::new(), query)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut reader = pin!(reader);
+
+        let err = reader
+            .as_mut()
+            .start_seek(SeekFrom::End(0))
+            .unwrap_err();
+        assert_eq!(std::io::ErrorKind::InvalidInput, err.kind());
+        let err = reader
+            .as_mut()
+            .start_seek(SeekFrom::Current(0))
+            .unwrap_err();
+        assert_eq!(std::io::ErrorKind::InvalidInput, err.kind());
+        // Start seek still works.
+        reader.as_mut().start_seek(SeekFrom::Start(5)).unwrap();
     }
 
     fn test_header(start_time: UnixH264, codec: &str) -> MetaHeader {

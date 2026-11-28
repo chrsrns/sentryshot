@@ -714,6 +714,34 @@ mod tests {
     }
 
     #[test]
+    fn raw_round_trips_unknown_keys() {
+        let mut v = minimal_monitor_json();
+        v["unknownPluginField"] = serde_json::json!({"nested": [1, "two", null]});
+        v["customFlag"] = serde_json::json!(true);
+
+        let cfg: MonitorConfig =
+            serde_json::from_value(v.clone()).unwrap_or_else(|e| panic!("{e}"));
+
+        // Unknown keys survive the deserialize → serialize round-trip verbatim.
+        assert_eq!(v, *cfg.raw());
+        assert_eq!(v, serde_json::to_value(&cfg).unwrap_or_else(|e| panic!("{e}")));
+    }
+
+    #[test]
+    fn raw_round_trips_typed_fields() {
+        let v = minimal_monitor_json();
+        let cfg: MonitorConfig =
+            serde_json::from_value(v.clone()).unwrap_or_else(|e| panic!("{e}"));
+
+        // Parsed fields agree with the raw document.
+        assert_eq!("m1", &**cfg.id());
+        assert_eq!("cam", cfg.name().to_string());
+        assert!(cfg.enabled());
+        assert!(!cfg.always_record());
+        assert_eq!(v, serde_json::to_value(&cfg).unwrap_or_else(|e| panic!("{e}")));
+    }
+
+    #[test]
     fn onvif_addr_validation() {
         let ok = |a: &str| PtzConfig::new(false, a.to_owned()).onvif_addr_ok();
         assert!(ok(""));
@@ -741,12 +769,12 @@ mod tests {
         let a = parse(serde_json::json!(
             {"v380DeviceId": "46078507", "v380User": "bob"}
         ));
-        assert_eq!(Some(46078507), a.v380_device_id());
+        assert_eq!(Some(46_078_507), a.v380_device_id());
         assert_eq!(Some("bob"), a.v380_user());
         // A JSON number is lenient-parsed too.
         assert_eq!(
-            Some(46078507),
-            parse(serde_json::json!({"v380DeviceId": 46078507})).v380_device_id()
+            Some(46_078_507),
+            parse(serde_json::json!({"v380DeviceId": 46_078_507})).v380_device_id()
         );
         // Malformed ⇒ unset, never a deser failure.
         assert_eq!(
