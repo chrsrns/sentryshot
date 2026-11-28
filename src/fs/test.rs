@@ -31,6 +31,28 @@ fn test_map_fs() {
     }
 }
 
+// Non-UTF8 names must be rejected with an error, not a panic (valid_path
+// previously unwrapped `name.to_str()`).
+#[test]
+fn test_open_non_utf8_name() {
+    use crate::sub_fs::SubFs;
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = Path::new(std::ffi::OsStr::from_bytes(b"\xff\xfe"));
+
+    let map: &dyn Fs = &MapFs(HashMap::new());
+    assert!(map.open(name).is_err());
+
+    let dir = dir_fs(PathBuf::from("testdata"));
+    assert!(dir.open(name).is_err());
+
+    let sub: &dyn Fs = &SubFs {
+        fsys: map.clone(),
+        dir: PathBuf::from("sub"),
+    };
+    assert!(sub.open(name).is_err());
+}
+
 #[test]
 fn test_dir_fs() {
     // On Windows, we force the MFT to update by reading the actual metadata from GetFileInformationByHandle and then

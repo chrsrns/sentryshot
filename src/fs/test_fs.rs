@@ -181,7 +181,7 @@ impl FsTester {
             let path = PathBuf::from(&path_string);
             self.check_stat(&path, info);
             self.check_open(&path_string);
-            if info.is_dir() {
+            if matches!(info, Entry::Dir(_)) {
                 self.check_dir(&path);
             } else {
                 self.check_file(&path);
@@ -397,12 +397,20 @@ impl FsTester {
 
 // Formats an DirEntry into a string for error messages and comparison.
 fn format_entry(entry: &Entry) -> String {
-    format!("{:?} is_dir={}", entry.name(), entry.is_dir())
+    format!(
+        "{:?} is_dir={}",
+        entry.name(),
+        matches!(entry, Entry::Dir(_))
+    )
 }
 
 // Formats an fs.FileInfo into a string like the result of formatEntry, for error messages and comparison.
 fn format_info_entry2(info: &Open) -> String {
-    format!("{:?} is_dir={}", info.name(), info.is_dir())
+    let name = match info {
+        Open::File(f) => f.name(),
+        Open::Dir(d) => d.name(),
+    };
+    format!("{:?} is_dir={}", name, matches!(info, Open::Dir(_)))
 }
 
 // formatInfo formats an fs.FileInfo into a string for error messages and comparison.
@@ -410,7 +418,7 @@ fn format_info(info: &Entry) -> String {
     format!(
         "{:?} is_dir={} Size=x ModTime=x",
         info.name(),
-        info.is_dir(),
+        matches!(info, Entry::Dir(_)),
         //info.Size(),
         //info.ModTime(),
     )
@@ -418,10 +426,14 @@ fn format_info(info: &Entry) -> String {
 
 // formatInfo formats an fs.FileInfo into a string for error messages and comparison.
 fn format_info2(info: &Open) -> String {
+    let name = match info {
+        Open::File(f) => f.name(),
+        Open::Dir(d) => d.name(),
+    };
     format!(
         "{:?} is_dir={} Size=x ModTime=x",
-        info.name(),
-        info.is_dir(),
+        name,
+        matches!(info, Open::Dir(_)),
         //info.Size(),
         //info.ModTime(),
     )
