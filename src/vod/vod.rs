@@ -19,7 +19,7 @@ use std::{
     io::SeekFrom,
     num::NonZeroUsize,
     path::PathBuf,
-    pin::{Pin, pin},
+    pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
@@ -564,7 +564,7 @@ mod tests {
     use pretty_hex::pretty_hex;
     use recdb::RecDb;
     use recording::{MetaHeader, VideoWriter};
-    use std::{path::Path, sync::Arc};
+    use std::{path::Path, pin::pin, sync::Arc};
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
