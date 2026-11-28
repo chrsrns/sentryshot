@@ -943,3 +943,94 @@ mod audio_tests {
     }
 }
 // SPDX-SnippetEnd
+
+use crate::{hls_handler, parse_path};
+use axum::extract::Query;
+use common::DummyLogger;
+use hls::HlsServer;
+use http::{HeaderValue, Method, Uri};
+use test_case::test_case;
+use tokio_util::sync::CancellationToken;
+
+#[test_case("a/b.m3u8", ("a", "b.m3u8"); "m3u8")]
+#[test_case("a/b/c.ts", ("a/b", "c.ts"); "ts nested dir")]
+#[test_case("m/f.mp4", ("m", "f.mp4"); "mp4")]
+#[test_case("m/f.mp", ("m", "f.mp"); "safari truncated mp")]
+#[test_case("f.m3u8", ("", "f.m3u8"); "no dir")]
+#[test_case("plain", ("plain", ""); "no suffix")]
+#[test_case("", ("", ""); "empty")]
+#[test_case("../f.mp4", ("..", "f.mp4"); "dotdot dir kept verbatim")]
+#[test_case("a/../f.mp4", ("a/..", "f.mp4"); "dotdot inside not normalized")]
+#[test_case("f.MP4", ("f.MP4", ""); "uppercase suffix no match")]
+fn test_parse_path(input: &str, expected: (&str, &str)) {
+    let (dir, name) = parse_path(input.to_owned()).unwrap();
+    assert_eq!((expected.0.to_owned(), expected.1.to_owned()), (dir, name));
+}
+
+fn new_test_hls_server() -> (CancellationToken, HlsServer) {
+    let token = CancellationToken::new();
+    let server = HlsServer::new(token.clone(), DummyLogger::new());
+    (token, server)
+}
+
+#[tokio::test]
+async fn test_hls_handler_options() {
+    let (_token, server) = new_test_hls_server();
+    let mut req_headers = HeaderMap::new();
+    req_headers.insert(
+        "Access-Control-Request-Headers",
+        HeaderValue::from_static("x-a, x-b"),
+    );
+    let query = Query::try_from_uri(&Uri::from_static("/hls")).unwrap();
+
+    let resp = hls_handler(
+        Path("m/f.m3u8".to_owned()),
+        State(server),
+        Method::OPTIONS,
+        req_headers,
+        query,
+    )
+    .await;
+
+    assert_eq!(StatusCode::OK, resp.status());
+    assert_eq!(
+        "GET, OPTIONS",
+        resp.headers()["Access-Control-Allow-Methods"]
+    );
+    // Requested headers echoed back.
+    assert_eq!("x-a, x-b", resp.headers()["Access-Control-Allow-Headers"]);
+}
+
+#[tokio::test]
+async fn test_hls_handler_method_not_allowed() {
+    let (_token, server) = new_test_hls_server();
+    let query = Query::try_from_uri(&Uri::from_static("/hls")).unwrap();
+
+    let resp = hls_handler(
+        Path("m/f.m3u8".to_owned()),
+        State(server),
+        Method::POST,
+        HeaderMap::new(),
+        query,
+    )
+    .await;
+
+    assert_eq!(StatusCode::METHOD_NOT_ALLOWED, resp.status());
+}
+
+#[tokio::test]
+async fn test_hls_handler_muxer_not_found() {
+    let (_token, server) = new_test_hls_server();
+    let query = Query::try_from_uri(&Uri::from_static("/hls")).unwrap();
+
+    let resp = hls_handler(
+        Path("m/f.m3u8".to_owned()),
+        State(server),
+        Method::GET,
+        HeaderMap::new(),
+        query,
+    )
+    .await;
+
+    assert_eq!(StatusCode::NOT_FOUND, resp.status());
+}
