@@ -349,7 +349,7 @@ impl TryFrom<String> for MonitorName {
                 return Err(InvalidChar(c));
             }
         }
-        if s.len() > MONITOR_ID_MAX_LENGTH {
+        if s.len() > MONITOR_NAME_MAX_LENGTH {
             return Err(TooLong);
         }
         Ok(Self(s))
@@ -936,9 +936,18 @@ mod tests {
         MonitorName::try_from("123".to_owned()).unwrap();
         MonitorName::try_from("a-a".to_owned()).unwrap();
         MonitorName::try_from("a_a".to_owned()).unwrap();
+        MonitorName::try_from("a".repeat(64)).unwrap();
+        MonitorName::try_from("a".repeat(25)).unwrap();
 
-        MonitorName::try_from(String::new()).unwrap_err();
+        assert_eq!(
+            MonitorName::try_from(String::new()).unwrap_err(),
+            ParseMonitorNameError::Empty
+        );
         MonitorName::try_from("a a".to_owned()).unwrap_err();
+        assert_eq!(
+            MonitorName::try_from("a".repeat(65)).unwrap_err(),
+            ParseMonitorNameError::TooLong
+        );
     }
 
     #[test]

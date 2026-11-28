@@ -321,10 +321,16 @@ describe("sanitizeMonitorName", () => {
 	test("strips spaces and punctuation", () => {
 		expect(sanitizeMonitorName("My Cam (front)!", "1.2.3.4")).toBe("MyCamfront");
 	});
-	test("caps at 24 utf-8 bytes without splitting a code point", () => {
-		const name = sanitizeMonitorName("aaaaaaaaaaaaaaaaaaaaaaaé", "1.2.3.4");
-		expect(name.length).toBeLessThanOrEqual(24);
-		expect(name).toBe("aaaaaaaaaaaaaaaaaaaaaaa");
+	test("caps at 64 utf-8 bytes without splitting a code point", () => {
+		const name = sanitizeMonitorName(
+			"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaé",
+			"1.2.3.4",
+		);
+		expect(name.length).toBeLessThanOrEqual(64);
+		expect(name).toBe(
+			"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		);
+		expect(sanitizeMonitorName("a".repeat(64), "1.2.3.4")).toBe("a".repeat(64));
 	});
 	test("falls back to dashed-ip camera name", () => {
 		expect(sanitizeMonitorName("...", "192.168.1.5")).toBe("Camera-192-168-1-5");

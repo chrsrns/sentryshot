@@ -364,7 +364,7 @@ async function fetchPostJson(url, data, token) {
 
 /**
  * Reduce a camera-supplied name to the backend `MonitorName` charset:
- * unicode alphanumerics plus `_` and `-`, capped at 24 UTF-8 bytes.
+ * unicode alphanumerics plus `_` and `-`, capped at 64 UTF-8 bytes.
  *
  * @param {string | undefined | null} name
  * @param {string} ip Fallback source when `name` sanitizes to empty.
@@ -377,7 +377,7 @@ function sanitizeMonitorName(name, ip) {
 		/[\s!-,./:-@[-^`{-~]/g,
 		"",
 	);
-	// 24-byte UTF-8 boundary, no mid-character cuts.
+	// 64-byte UTF-8 boundary, no mid-character cuts.
 	let out = "";
 	let bytes = 0;
 	for (const c of clean) {
@@ -390,7 +390,7 @@ function sanitizeMonitorName(name, ip) {
 		} else if (cp < 0x10000) {
 			n = 3;
 		}
-		if (bytes + n > 24) {
+		if (bytes + n > 64) {
 			break;
 		}
 		out += c;
