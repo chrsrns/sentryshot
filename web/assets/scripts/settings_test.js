@@ -3,7 +3,15 @@
 // @ts-check
 
 import { jest } from "@jest/globals";
-import { newScanModal, newPtzField, newAudioField } from "./settings.js";
+import {
+	newScanModal,
+	newPtzField,
+	newAudioField,
+	newMonitor,
+	newSourceField,
+	newSourceRTSP,
+} from "./settings.js";
+import { newField, newErrorField, inputRules } from "./components/form.js";
 
 describe("newScanModal", () => {
 	test("open attaches modal to the document", () => {
@@ -1344,5 +1352,161 @@ describe("newAudioField", () => {
 		};
 		field.set(cfg);
 		expect(field.value()).toEqual(cfg);
+	});
+});
+
+describe("newMonitor", () => {
+	const textField = () =>
+		newField({ input: "text", label: "x", placeholder: "" });
+
+	const newFields = () => ({
+		id: newErrorField([inputRules.notEmpty], {
+			input: "text",
+			label: "ID",
+			placeholder: "",
+		}),
+		name: textField(),
+	});
+
+	// Click the button carrying label inside the category DOM.
+	const clickButton = (elem, label) => {
+		const btn = [...elem.querySelectorAll("button")].find(
+			(b) => b.textContent.trim().toLowerCase() === label,
+		);
+		btn.click();
+	};
+
+	const flush = async () => {
+		for (let i = 0; i < 10; i++) {
+			await Promise.resolve();
+		}
+	};
+
+	test("save puts assembled monitor then restarts it", async () => {
+		document.body.replaceChildren();
+		const calls = [];
+		global.fetch = /** @type {any} */ ((url, opts) => {
+			calls.push({ url: String(url), opts });
+			const isMonitors = String(url).includes("api/monitors");
+			return Promise.resolve({
+				status: 200,
+				json: () => Promise.resolve(isMonitors ? {} : undefined),
+				text: () => Promise.resolve(""),
+			});
+		});
+
+		const fields = newFields();
+		fields.id.set("test-id");
+		fields.name.set("cam1");
+		const monitors = {};
+		const category = newMonitor("token", fields, () => "test-id", monitors);
+		document.body.append(category.elem);
+
+		clickButton(category.elem, "save");
+		await flush();
+
+		const put = calls.find((c) => c.opts.method === "put");
+		expect(put.url).toContain("api/monitor");
+		const body = JSON.parse(put.opts.body);
+		expect(body.name).toBe("cam1");
+
+		const restart = calls.find((c) => String(c.url).includes("api/monitor/restart"));
+		expect(restart).toBeDefined();
+		expect(restart.url).toContain("id=test-id");
+	});
+
+	test("save with invalid form does not fetch", async () => {
+		document.body.replaceChildren();
+		const calls = [];
+		global.fetch = /** @type {any} */ ((url, opts) => {
+			calls.push({ url: String(url), opts });
+			return Promise.resolve({ status: 200, json: () => Promise.resolve({}) });
+		});
+		const alerts = [];
+		const realAlert = globalThis.alert;
+		globalThis.alert = (m) => alerts.push(m);
+
+		// id left empty -> notEmpty rule fails.
+		const fields = newFields();
+		const category = newMonitor("token", fields, () => "test-id", {});
+		document.body.append(category.elem);
+
+		clickButton(category.elem, "save");
+		await flush();
+		globalThis.alert = realAlert;
+
+		expect(alerts).toHaveLength(1);
+		expect(calls).toHaveLength(0);
+	});
+
+	test("delete issues DELETE then reloads monitors", async () => {
+		document.body.replaceChildren();
+		global.confirm = () => true;
+		const calls = [];
+		global.fetch = /** @type {any} */ ((url, opts = {}) => {
+			calls.push({ url: String(url), opts });
+			const isMonitors = String(url).includes("api/monitors");
+			return Promise.resolve({
+				status: 200,
+				json: () => Promise.resolve(isMonitors ? {} : undefined),
+				text: () => Promise.resolve(""),
+			});
+		});
+
+		const fields = newFields();
+		fields.id.set("monitor-1");
+		const category = newMonitor("token", fields, () => "test-id", {});
+		document.body.append(category.elem);
+
+		clickButton(category.elem, "delete");
+		await flush();
+
+		const del = calls.find((c) => c.opts.method === "delete");
+		expect(del.url).toContain("api/monitor");
+		expect(del.url).toContain("id=monitor-1");
+		const reload = calls.find((c) => String(c.url).includes("api/monitors"));
+		expect(reload).toBeDefined();
+	});
+});
+
+describe("newSourceField", () => {
+	test("set/value round-trip and validate delegates to selected source", () => {
+		document.body.replaceChildren();
+		const getField = (name) => {
+			expect(name).toBe("sourcertsp");
+			return {
+				open() {},
+				validateSource() {},
+			};
+		};
+		const field = newSourceField(["rtsp"], getField);
+		document.body.append(...field.elems);
+
+		field.set(undefined);
+		expect(field.value()).toBe("rtsp");
+		field.set("rtsp");
+		expect(field.value()).toBe("rtsp");
+		expect(field.validate()).toBeUndefined();
+		expect(() => field.validate()).not.toThrow();
+	});
+});
+
+describe("newSourceRTSP", () => {
+	test("value returns filled fields minus empties", () => {
+		document.body.replaceChildren();
+		const field = newSourceRTSP();
+		document.body.append(...field.elems);
+		field.open();
+
+		const inputs = [...field.elems[0].querySelectorAll("input")];
+		const main = inputs.find((i) =>
+			i.placeholder.includes("rtsp://"),
+		);
+		main.value = "rtsp://cam/main";
+
+		const value = field.value();
+		expect(value.protocol).toBe("tcp");
+		expect(value.mainStream).toBe("rtsp://cam/main");
+		expect(value.subStream).toBeUndefined();
 	});
 });

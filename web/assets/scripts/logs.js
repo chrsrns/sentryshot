@@ -824,4 +824,6 @@ export {
 	newMultiSelect,
 	newMonitorPicker,
 	newLogSelector,
+	newFeedLogger,
+	newSavedLogsLoader,
 };

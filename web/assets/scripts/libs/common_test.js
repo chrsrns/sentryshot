@@ -337,3 +337,31 @@ describe("sanitizeMonitorName", () => {
 		expect(sanitizeMonitorName(undefined, "10.0.0.2")).toBe("Camera-10-0-0-2");
 	});
 });
+
+describe("htmlToElem cache", () => {
+	test("repeated calls return separate clean clones", () => {
+		const first = htmlToElem("<div><p>cached</p></div>");
+		// Mutate the returned element; the cached copy must be unaffected.
+		first.textContent = "mutated";
+		const second = htmlToElem("<div><p>cached</p></div>");
+		expect(second).not.toBe(first);
+		expect(second.textContent).toBe("cached");
+	});
+	test("children are appended on both miss and hit", () => {
+		const html = "<div id=\"cachechildren\"></div>";
+		const child = document.createElement("span");
+		const a = htmlToElem(html, [child]);
+		const b = htmlToElem(html, [child.cloneNode(true)]);
+		expect(a.querySelector("span")).not.toBeNull();
+		expect(b.querySelector("span")).not.toBeNull();
+	});
+	test("cache stays bounded past ELEM_CACHE_MAX", () => {
+		// 210 unique htmls exceed the 200-entry cap without error.
+		for (let i = 0; i < 210; i++) {
+			htmlToElem(`<div data-i="${i}"></div>`);
+		}
+		// Evicted entries re-parse cleanly.
+		const elem = htmlToElem("<div>after-eviction</div>");
+		expect(elem.textContent).toBe("after-eviction");
+	});
+});

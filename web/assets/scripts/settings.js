@@ -1664,4 +1664,13 @@ function init(uiData) {
 		.replaceChildren(...rendererCategories([monitor, group, account]));
 }
 
-export { init, newScanModal, newPtzField, newPtzPanel, newAudioField };
+export {
+	init,
+	newScanModal,
+	newPtzField,
+	newPtzPanel,
+	newAudioField,
+	newMonitor,
+	newSourceField,
+	newSourceRTSP,
+};
