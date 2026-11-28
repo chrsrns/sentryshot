@@ -100,14 +100,14 @@ pub fn new_recorder(
                             let Some((trigger_duration, event)) = event else {
                                 return
                             };
-                            let Some(end) = event.time.checked_add(trigger_duration.into()) else {
+                            let Some(end) = live_event_end(
+                                event.time,
+                                trigger_duration,
+                                UnixNano::now(),
+                            ) else {
                                 state = State::NotRecording(prev_seg);
                                 continue
                             };
-                            if !end.after(UnixNano::now()) {
-                                state = State::NotRecording(prev_seg);
-                                continue
-                            }
 
                             state = State::Recording(RecordingSession::new(
                                 &token,
@@ -131,6 +131,31 @@ enum State {
 }
 
 type PrevSeg = Option<Segment>;
+
+// Extend a running session's timer when an event's end lands past the
+// current end. `None` timer_end (alwaysRecord) and unrepresentable ends
+// leave the timer untouched.
+fn extend_timer(
+    timer_end: Option<UnixNano>,
+    event_time: UnixNano,
+    trigger_duration: Duration,
+) -> Option<UnixNano> {
+    let timer_end = timer_end?;
+    let Some(end) = event_time.checked_add(trigger_duration.into()) else {
+        return Some(timer_end);
+    };
+    Some(if end.after(timer_end) { end } else { timer_end })
+}
+
+// Event end if the event is still live at `now`, else None (drop expired).
+fn live_event_end(
+    event_time: UnixNano,
+    trigger_duration: Duration,
+    now: UnixNano,
+) -> Option<UnixNano> {
+    let end = event_time.checked_add(trigger_duration.into())?;
+    end.after(now).then_some(end)
+}
 
 struct RecordingSession {
     token: CancellationToken,
@@ -172,19 +197,18 @@ impl RecordingSession {
         let Some((trigger_duration, event)) = event else {
             return;
         };
+        if self.timer_end.is_none() {
+            return;
+        }
 
         // Update timer if the monitor isn't set to always record.
-        if let Some(timer_end) = self.timer_end {
-            let Some(end) = event.time.checked_add(trigger_duration.into()) else {
-                return;
-            };
-            if end.after(timer_end) {
-                self.logger.log(
-                    LogLevel::Debug,
-                    "new event, already recording, updating timer",
-                );
-                self.timer_end = Some(end);
-            }
+        let new_timer_end = extend_timer(self.timer_end, event.time, trigger_duration);
+        if new_timer_end != self.timer_end {
+            self.logger.log(
+                LogLevel::Debug,
+                "new event, already recording, updating timer",
+            );
+            self.timer_end = new_timer_end;
         }
     }
 
@@ -221,14 +245,38 @@ impl Future for Sleep {
     }
 }
 
+type RunFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), RunRecordingError>> + Send + 'a>>;
+type RunRecordingFn =
+    for<'a> fn(CancellationToken, RecordingContext, &'a mut PrevSeg) -> RunFuture<'a>;
+
 async fn run_recording_session(
     recording_session_token: CancellationToken,
     c: RecordingContext,
     prev_seg: &mut PrevSeg,
 ) {
-    let restart_sleep = std::time::Duration::from_secs(3);
+    fn run(t: CancellationToken, c: RecordingContext, p: &mut PrevSeg) -> RunFuture<'_> {
+        Box::pin(run_recording(t, c, p))
+    }
+    run_recording_session_loop(
+        recording_session_token,
+        c,
+        prev_seg,
+        run,
+        std::time::Duration::from_secs(3),
+    )
+    .await;
+}
+
+async fn run_recording_session_loop(
+    recording_session_token: CancellationToken,
+    c: RecordingContext,
+    prev_seg: &mut PrevSeg,
+    run: RunRecordingFn,
+    restart_sleep: std::time::Duration,
+) {
     loop {
-        if let Err(e) = run_recording(recording_session_token.clone(), c.clone(), prev_seg).await {
+        if let Err(e) = run(recording_session_token.clone(), c.clone(), prev_seg).await {
             c.log(LogLevel::Error, &format!("recording crashed: {e}"));
 
             tokio::select! {
@@ -370,6 +418,20 @@ enum GenerateVideoError {
     SkippedSegment(u64, u64),
 }
 
+// The next segment must be exactly prev_seg_id + 1, else a segment was
+// skipped (disk or muxer issue). checked_add guards the u64::MAX edge the
+// old `prev_seg_id + 1` would panic on.
+fn check_next_segment(prev_seg_id: u64, seg_id: u64) -> Result<(), GenerateVideoError> {
+    let expected = prev_seg_id
+        .checked_add(1)
+        .ok_or(GenerateVideoError::Add)?;
+    if seg_id == expected {
+        Ok(())
+    } else {
+        Err(GenerateVideoError::SkippedSegment(expected, seg_id))
+    }
+}
+
 async fn generate_video(
     token: CancellationToken,
     recording: &RecordingHandle,
@@ -422,9 +484,7 @@ async fn generate_video(
             return Ok(end_time);
         };
 
-        if seg.id() != prev_seg_id + 1 {
-            return Err(SkippedSegment(seg.id(), prev_seg_id + 1));
-        }
+        check_next_segment(prev_seg_id, seg.id())?;
 
         w.write_frames(seg.frames()).await?;
         let end_time = seg
@@ -699,5 +759,185 @@ mod tests {
   \"events\": []
 }";
         assert_eq!(want, got);
+    }
+
+    #[test]
+    fn extend_timer_extends_on_later_end() {
+        let timer_end = UnixNano::new(1_000);
+        let got = extend_timer(Some(timer_end), UnixNano::new(2_000), Duration::new(500));
+        assert_eq!(Some(UnixNano::new(2_500)), got);
+    }
+
+    #[test]
+    fn extend_timer_keeps_earlier_end() {
+        let timer_end = UnixNano::new(5_000);
+        let got = extend_timer(Some(timer_end), UnixNano::new(1_000), Duration::new(500));
+        assert_eq!(Some(timer_end), got);
+    }
+
+    #[test]
+    fn extend_timer_always_record_untouched() {
+        // None timer_end means alwaysRecord: events never modify it.
+        let got = extend_timer(None, UnixNano::new(1_000), Duration::new(500));
+        assert_eq!(None, got);
+    }
+
+    #[test]
+    fn extend_timer_overflow_keeps_end() {
+        let timer_end = UnixNano::new(1_000);
+        let got = extend_timer(Some(timer_end), UnixNano::new(i64::MAX), Duration::new(1));
+        assert_eq!(Some(timer_end), got);
+    }
+
+    #[test]
+    fn live_event_end_drops_expired() {
+        // Event ended before now -> dropped.
+        let got = live_event_end(UnixNano::new(1_000), Duration::new(100), UnixNano::new(2_000));
+        assert_eq!(None, got);
+    }
+
+    #[test]
+    fn live_event_end_accepts_live() {
+        let got = live_event_end(UnixNano::new(1_000), Duration::new(5_000), UnixNano::new(2_000));
+        assert_eq!(Some(UnixNano::new(6_000)), got);
+    }
+
+    #[test]
+    fn live_event_end_drops_overflow() {
+        let got = live_event_end(UnixNano::new(i64::MAX), Duration::new(1), UnixNano::new(0));
+        assert_eq!(None, got);
+    }
+
+    #[test]
+    fn check_next_segment_ok() {
+        check_next_segment(0, 1).unwrap();
+        check_next_segment(41, 42).unwrap();
+    }
+
+    #[test]
+    fn check_next_segment_skipped() {
+        // Fields are (expected, got) to match the error message.
+        match check_next_segment(10, 12) {
+            Err(GenerateVideoError::SkippedSegment(expected, got)) => {
+                assert_eq!((11, 12), (expected, got));
+            }
+            other => panic!("expected SkippedSegment, got {other:?}"),
+        }
+        // Behind is also an error.
+        assert!(matches!(
+            check_next_segment(10, 10),
+            Err(GenerateVideoError::SkippedSegment(..))
+        ));
+    }
+
+    #[test]
+    fn check_next_segment_prev_max() {
+        // u64::MAX prev id: no overflow panic, clean Add error.
+        assert!(matches!(
+            check_next_segment(u64::MAX, 0),
+            Err(GenerateVideoError::Add)
+        ));
+    }
+
+    struct TestSource;
+
+    #[async_trait::async_trait]
+    impl common::monitor::Source for TestSource {
+        fn stream_type(&self) -> &common::StreamType {
+            &common::StreamType::Main
+        }
+        async fn muxer(&self) -> Option<ArcStreamerMuxer> {
+            None
+        }
+        async fn subscribe(&self) -> Option<common::monitor::Feed> {
+            None
+        }
+        async fn subscribe_decoded(
+            &self,
+            _rt_handle: tokio::runtime::Handle,
+            _logger: ArcMsgLogger,
+            _limiter: Option<common::recording::FrameRateLimiter>,
+        ) -> Option<Result<common::monitor::FeedDecoded, common::monitor::SubscribeDecodedError>>
+        {
+            None
+        }
+    }
+
+    async fn test_recording_context() -> RecordingContext {
+        let tempdir = tempdir().unwrap();
+        RecordingContext {
+            hooks: common::monitor::DummyMonitorHooks::new(),
+            logger: DummyLogger::new(),
+            source_main: Arc::new(TestSource),
+            config: MonitorConfig::new(
+                common::monitor::Config {
+                    id: "x".to_owned().try_into().unwrap(),
+                    name: "x".to_owned().try_into().unwrap(),
+                    enable: true,
+                    source: common::monitor::SelectedSource::Rtsp,
+                    always_record: false,
+                    video_length: 0.0,
+                    ptz: common::monitor::PtzConfig::default(),
+                    audio: common::monitor::AudioConfig::default(),
+                },
+                common::monitor::SourceConfig::Rtsp(common::monitor::SourceRtspConfig {
+                    protocol: common::monitor::Protocol::Tcp,
+                    main_stream: "rtsp://x".parse().unwrap(),
+                    sub_stream: None,
+                }),
+                serde_json::json!({}),
+            ),
+            recdb: Arc::new(new_test_recdb(&tempdir.path().join("recordings")).await),
+        }
+    }
+
+    static CRASH_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn crashy_run(
+        _t: CancellationToken,
+        _c: RecordingContext,
+        _p: &mut PrevSeg,
+    ) -> RunFuture<'_> {
+        let n = CRASH_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async move {
+            if n == 0 {
+                Err(RunRecordingError::GenerateVideo(
+                    GenerateVideoError::Add,
+                ))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn session_restarts_after_crash_and_normal_exit() {
+        use std::sync::atomic::Ordering;
+        CRASH_RUNS.store(0, Ordering::SeqCst);
+
+        let token = CancellationToken::new();
+        let c = test_recording_context().await;
+        let mut prev_seg = None;
+
+        let handle = tokio::spawn({
+            let token = token.clone();
+            async move {
+                run_recording_session_loop(
+                    token,
+                    c,
+                    &mut prev_seg,
+                    crashy_run,
+                    std::time::Duration::from_millis(1),
+                )
+                .await;
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        token.cancel();
+        handle.await.unwrap();
+
+        // crash -> sleep -> retry Ok -> sleep -> restart(s) before cancel.
+        assert!(CRASH_RUNS.load(Ordering::SeqCst) >= 3);
     }
 }

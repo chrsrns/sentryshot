@@ -879,7 +879,7 @@ mod tests {
             Config, DummyMonitorHooks, DynH264Writer, Protocol, PtzConfig, SelectedSource,
             SourceConfig, SourceRtspConfig, StreamerImpl,
         },
-        time::UnixH264,
+        time::{UnixH264, UnixNano},
     };
     use pretty_assertions::assert_eq;
     use serde_json::json;
@@ -1492,6 +1492,152 @@ mod tests {
             manager.monitor_restart(m_id("x")).await.unwrap(),
             Err(MonitorRestartError::NotExist(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn test_restart_monitor() {
+        let (token, tracker, _temp_dir, _, manager) = new_test_manager().await;
+
+        let config = MonitorConfig::new(
+            Config {
+                id: m_id("r1"),
+                name: name("r1"),
+                enable: false,
+                source: SelectedSource::Rtsp,
+                always_record: false,
+                video_length: 0.0,
+                ptz: PtzConfig::default(),
+                audio: common::monitor::AudioConfig::default(),
+            },
+            SourceConfig::Rtsp(SourceRtspConfig {
+                protocol: Protocol::Tcp,
+                main_stream: "rtsp://x".parse().unwrap(),
+                sub_stream: None,
+            }),
+            json!({
+                "id": "r1",
+                "name": "r1",
+                "enable": false,
+                "source": "rtsp",
+                "sourcertsp": { "protocol": "tcp", "mainStream": "rtsp://x" },
+                "alwaysRecord": false,
+                "videoLength": 0.0,
+            }),
+        );
+        manager.monitor_set(config).await.unwrap().unwrap();
+
+        // Existing monitor restarts cleanly.
+        manager.monitor_restart(m_id("r1")).await.unwrap().unwrap();
+
+        stop_manager(token, tracker).await;
+    }
+
+    struct OrderCheckHooks {
+        eventdb: EventDb,
+        monitor_id: MonitorId,
+        hook_called: std::sync::atomic::AtomicBool,
+        persisted_before_hook: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl common::monitor::MonitorHooks for OrderCheckHooks {
+        async fn on_monitor_start(&self, _: CancellationToken, _: common::monitor::ArcMonitor) {}
+        fn on_thumb_save(&self, _: &MonitorConfig, frame: sentryshot_util::Frame) -> sentryshot_util::Frame {
+            frame
+        }
+        async fn on_event(&self, event: Event, _: MonitorConfig) {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.hook_called.store(true, SeqCst);
+            // Ordering contract: the event must already be durable in
+            // eventdb when hooks fire.
+            let persisted = self
+                .eventdb
+                .query(
+                    self.monitor_id.clone(),
+                    eventdb::EventQuery {
+                        start: UnixNano::new(0),
+                        end: UnixNano::new(i64::MAX),
+                        limit: std::num::NonZeroUsize::new(10).unwrap(),
+                    },
+                )
+                .await
+                .unwrap_or_default()
+                .unwrap_or_default()
+                .contains(&event);
+            self.persisted_before_hook.store(persisted, SeqCst);
+        }
+        fn migrate_monitor(&self, _: &mut serde_json::Value) -> Result<(), DynError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trigger_ordering() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let eventdb = new_test_eventdb(temp_dir.path());
+        let hooks: Arc<OrderCheckHooks> = Arc::new(OrderCheckHooks {
+            eventdb: eventdb.clone(),
+            monitor_id: m_id("t1"),
+            hook_called: std::sync::atomic::AtomicBool::new(false),
+            persisted_before_hook: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let (main_tx, _main_rx) = mpsc::channel(1);
+        let (sub_tx, _sub_rx) = mpsc::channel(1);
+
+        let monitor = Monitor {
+            token: CancellationToken::new(),
+            tracker: TaskTracker::new(),
+            id: m_id("t1"),
+            eventdb,
+            hooks: hooks.clone(),
+            config: MonitorConfig::new(
+                Config {
+                    id: m_id("t1"),
+                    name: name("t1"),
+                    enable: false,
+                    source: SelectedSource::Rtsp,
+                    always_record: false,
+                    video_length: 0.0,
+                    ptz: PtzConfig::default(),
+                    audio: common::monitor::AudioConfig::default(),
+                },
+                SourceConfig::Rtsp(SourceRtspConfig {
+                    protocol: Protocol::Tcp,
+                    main_stream: "rtsp://x".parse().unwrap(),
+                    sub_stream: None,
+                }),
+                json!({}),
+            ),
+            source_main_tx: main_tx,
+            source_sub_tx: sub_tx,
+            send_event_tx: event_tx,
+        };
+
+        let event = Event {
+            time: UnixNano::now(),
+            duration: Duration::from_secs(1),
+            detections: Vec::new(),
+            source: None,
+        };
+        monitor
+            .trigger(Duration::from_secs(1), event.clone())
+            .await
+            .unwrap();
+
+        // Ordering: eventdb write -> hooks -> send_event_tx.
+        assert!(hooks.hook_called.load(SeqCst), "on_event must run");
+        assert!(
+            hooks.persisted_before_hook.load(SeqCst),
+            "event must be durable in eventdb before hooks fire"
+        );
+        assert!(
+            event_rx.try_recv().is_ok(),
+            "event must reach send_event_tx after hooks"
+        );
     }
 
     struct DummyStreamer;

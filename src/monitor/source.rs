@@ -16,7 +16,7 @@ use common::{
 use futures_lite::StreamExt;
 use retina::{
     client::{InitialTimestampPolicy, Stream},
-    codec::{ParametersRef, VideoFrame, VideoParameters},
+    codec::{ParametersRef, VideoParameters},
 };
 use sentryshot_convert::Frame;
 use sentryshot_ffmpeg_h264::{Packet, PaddedBytes, ReceiveFrameError, SendPacketError};
@@ -403,7 +403,9 @@ impl SourceRtsp {
                         Ok(retina::codec::CodecItem::VideoFrame(frame)) => {
                             if let Some(stream_started) = &mut stream_started {
                                 let data = parse_frame(
-                                    frame,
+                                    frame.timestamp(),
+                                    frame.is_random_access_point(),
+                                    frame.into_data(),
                                     stream_started.start_time,
                                     stream_started.first_sample_pts,
                                 )?;
@@ -435,7 +437,13 @@ impl SourceRtsp {
                                 if let Some(ParametersRef::Video(params)) = stream.parameters() {
                                     let start_time = UnixNano::now();
                                     let first_sample_pts = UnixH264::new(frame.timestamp().pts());
-                                    let first_sample = parse_frame(frame, start_time, first_sample_pts)?;
+                                    let first_sample = parse_frame(
+                                        frame.timestamp(),
+                                        frame.is_random_access_point(),
+                                        frame.into_data(),
+                                        start_time,
+                                        first_sample_pts,
+                                    )?;
                                     let result = self.streamer.new_muxer(
                                         token.clone(),
                                         self.monitor_id.clone(),
@@ -495,12 +503,13 @@ enum ParseFrameError {
 
 #[allow(clippy::similar_names)]
 fn parse_frame(
-    frame: VideoFrame,
+    timestamp: retina::VideoTimestamp,
+    is_random_access_point: bool,
+    data: Vec<u8>,
     start_time: UnixNano,
     first_sample_time: UnixH264,
 ) -> Result<H264Data, ParseFrameError> {
     use ParseFrameError::*;
-    let timestamp = frame.timestamp();
 
     let pts = timestamp.pts();
     let dts = timestamp.dts();
@@ -515,8 +524,8 @@ fn parse_frame(
     Ok(H264Data {
         pts,
         dts_offset,
-        random_access_present: frame.is_random_access_point(),
-        avcc: Arc::new(PaddedBytes::new(frame.into_data())),
+        random_access_present: is_random_access_point,
+        avcc: Arc::new(PaddedBytes::new(data)),
     })
 }
 
@@ -819,6 +828,144 @@ mod tests {
             Some(0),
             pick(&[("video", "h265"), ("audio", "mpeg4-generic")])
         );
+    }
+
+    #[test]
+    fn remove_creds_from_url_strips() {
+        let url = Url::parse("rtsp://user:p%40ss@192.168.1.1/stream").unwrap();
+        let stripped = remove_creds_from_url(url).unwrap();
+        assert_eq!("", stripped.username());
+        assert_eq!(None, stripped.password());
+        assert_eq!("rtsp://192.168.1.1/stream", stripped.as_str());
+    }
+
+    #[test]
+    fn remove_creds_from_url_passthrough() {
+        let url = Url::parse("rtsp://192.168.1.1/stream").unwrap();
+        let stripped = remove_creds_from_url(url.clone()).unwrap();
+        assert_eq!(url, stripped);
+    }
+
+    fn video_ts(pts: i64, dts: Option<i64>) -> retina::VideoTimestamp {
+        retina::VideoTimestamp::new(
+            pts,
+            dts,
+            std::num::NonZeroU32::new(90_000).unwrap(),
+            0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn parse_frame_rebases_to_start_time() {
+        let start_time = UnixNano::new(1_000_000_000);
+        let first = UnixH264::new(90_000);
+
+        let d = parse_frame(
+            video_ts(180_000, Some(170_000)),
+            true,
+            b"data".to_vec(),
+            start_time,
+            first,
+        )
+        .unwrap();
+
+        // 1 second elapsed in 90kHz ticks, rebased onto start_time.
+        let want = UnixH264::new(90_000)
+            .checked_add(UnixH264::from(start_time))
+            .unwrap();
+        assert_eq!(want, d.pts);
+        assert_eq!(DtsOffset::new(10_000), d.dts_offset);
+        assert!(d.random_access_present);
+        assert_eq!(b"data".as_slice(), &**d.avcc);
+    }
+
+    #[test]
+    fn parse_frame_pts_underflow_error() {
+        // i64 underflow on pts - first_sample_time, not mere negativity.
+        let d = parse_frame(
+            video_ts(i64::MIN, None),
+            false,
+            Vec::new(),
+            UnixNano::new(0),
+            UnixH264::new(1),
+        );
+        assert!(matches!(d, Err(ParseFrameError::SubFirstSample)));
+    }
+
+    #[test]
+    fn parse_frame_huge_dts_offset_saturates_zero() {
+        // pts - dts beyond i32 collapses to a zero offset rather than wrapping.
+        let d = parse_frame(
+            video_ts(i64::from(i32::MAX) + 10, Some(0)),
+            false,
+            Vec::new(),
+            UnixNano::new(0),
+            UnixH264::new(0),
+        )
+        .unwrap();
+        assert_eq!(DtsOffset::new(0), d.dts_offset);
+    }
+
+    #[test]
+    fn check_clock_drift_within_bounds() {
+        check_clock_drift(UnixH264::now()).unwrap();
+    }
+
+    #[test]
+    fn check_clock_drift_ahead() {
+        let ahead = UnixH264::now()
+            .checked_add(UnixH264::new(31 * H264_SECOND))
+            .unwrap();
+        assert!(matches!(
+            check_clock_drift(ahead),
+            Err(SourceRtspRunError::CameraClockAhead(..))
+        ));
+    }
+
+    #[test]
+    fn check_clock_drift_behind() {
+        let behind = UnixH264::now()
+            .checked_sub(UnixH264::new(31 * H264_SECOND))
+            .unwrap();
+        assert!(matches!(
+            check_clock_drift(behind),
+            Err(SourceRtspRunError::CameraClockBehind(..))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn new_decoder_exits_on_lagged_feed() {
+        use crate::decoder::VideoDecoder;
+        use sentryshot_ffmpeg_h264::H264DecoderBuilder;
+
+        let (feed_tx, feed_rx) = broadcast::channel(1);
+        // Overflow the receiver before the task runs: deterministic Lagged.
+        let frame = || H264Data {
+            pts: UnixH264::new(0),
+            dts_offset: DtsOffset::new(0),
+            random_access_present: false,
+            avcc: Arc::new(PaddedBytes::new(Vec::new())),
+        };
+        feed_tx.send(frame()).unwrap();
+        feed_tx.send(frame()).unwrap();
+
+        let decoder =
+            VideoDecoder::H264(H264DecoderBuilder::new().annex_b().unwrap());
+        let mut decoded = new_decoder(
+            Handle::current(),
+            common::DummyLogger::new(),
+            feed_rx,
+            decoder,
+            None,
+        );
+
+        assert!(matches!(
+            decoded.recv().await,
+            Some(Err(DecoderError::DroppedFrames))
+        ));
+        // Task exited: sender dropped, channel closed.
+        assert!(decoded.recv().await.is_none());
     }
 
     #[test]
