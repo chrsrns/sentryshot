@@ -392,11 +392,17 @@ async function newStream(parentSignal, $video, debugOverlay, monitorId, subStrea
 
 			// Prune.
 			if (end > 0 && end - sourceBuffer.buffered.start(0) > 15) {
+				const waitForRemove = new Promise((resolve) => {
+					sourceBuffer.addEventListener("updateend", resolve, { once: true });
+				});
 				sourceBuffer.remove(0, end - 10);
+				await waitForRemove;
 
-				const start = sourceBuffer.buffered.start(0);
-				if (start > $video.currentTime) {
-					$video.currentTime = start;
+				if (sourceBuffer.buffered.length > 0) {
+					const start = sourceBuffer.buffered.start(0);
+					if (start > $video.currentTime) {
+						$video.currentTime = start;
+					}
 				}
 			}
 		}

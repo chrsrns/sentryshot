@@ -24,15 +24,13 @@ describe("feed", () => {
 		};
 		const isTypeSupported = jest.fn(() => false);
 		// @ts-ignore
-		window.MediaSource = class {
-			static isTypeSupported(mime) {
-				return isTypeSupported(mime);
-			}
-		};
+		function FakeMediaSource() {}
+		FakeMediaSource.isTypeSupported = (mime) => isTypeSupported(mime);
+		window.MediaSource = FakeMediaSource;
 		const consoleError = jest.spyOn(console, "error").mockImplementation(() => {});
 
 		const feed = newSlowPollStream({ id: "a", name: "m" }, true, []);
-		await new Promise((resolve) => setTimeout(resolve, 10));
+		await new Promise((resolve) => { setTimeout(resolve, 10); });
 		feed.destroy();
 
 		// The fatal path surfaces the error via console.error; a returned
@@ -50,11 +48,11 @@ describe("feed", () => {
 			'video/mp4; codecs="hvc1.1.6.L93.B0"',
 		);
 		// Only the start-session fetch; play was never reached.
-		expect(fetches.filter((u) => u.includes("start-session")).length).toBe(1);
-		expect(fetches.filter((u) => u.includes("/play")).length).toBe(0);
+		expect(fetches.filter((u) => u.includes("start-session"))).toHaveLength(1);
+		expect(fetches.filter((u) => u.includes("/play"))).toHaveLength(0);
 		// The fatal gate surfaces an on-tile hint naming the codec family.
 		const hint = feed.elem.querySelector(".js-media-unsupported");
-		expect(hint?.textContent).toContain("hvc1");
+		expect(hint && hint.textContent).toContain("hvc1");
 	});
 
 	test("play error status is not appended and restarts the session", async () => {
@@ -80,27 +78,23 @@ describe("feed", () => {
 		};
 		const appendBuffer = jest.fn();
 		// @ts-ignore
-		window.MediaSource = class {
-			static isTypeSupported() {
-				return true;
-			}
-			addEventListener(type, fn) {
-				if (type === "sourceopen") queueMicrotask(fn);
-			}
-			addSourceBuffer() {
-				return {
-					buffered: { length: 0 },
-					addEventListener() {},
-					appendBuffer,
-					remove() {},
-				};
-			}
+		function FakeMediaSource() {}
+		FakeMediaSource.isTypeSupported = () => true;
+		FakeMediaSource.prototype.addEventListener = (type, fn) => {
+			if (type === "sourceopen") queueMicrotask(fn);
 		};
+		FakeMediaSource.prototype.addSourceBuffer = () => ({
+			buffered: { length: 0 },
+			addEventListener() {},
+			appendBuffer,
+			remove() {},
+		});
+		window.MediaSource = FakeMediaSource;
 		// @ts-ignore
 		URL.createObjectURL = () => "blob:x";
 
 		const feed = newSlowPollStream({ id: "a", name: "m" }, true, []);
-		await new Promise((resolve) => setTimeout(resolve, 30));
+		await new Promise((resolve) => { setTimeout(resolve, 30); });
 		feed.destroy();
 		// @ts-ignore
 		delete window.MediaSource;
@@ -109,6 +103,88 @@ describe("feed", () => {
 
 		expect(appendBuffer).not.toHaveBeenCalled();
 		expect(fetches.filter((u) => u.includes("/play")).length).toBeGreaterThan(0);
+	});
+
+	test("prune keeps the playhead inside the buffered range", async () => {
+		global.fetch = (url) => {
+			if (String(url).includes("start-session")) {
+				return Promise.resolve({
+					status: 200,
+					json: () =>
+						Promise.resolve({
+							startTimeNs: "0",
+							codecs: "avc1.42E01E",
+						}),
+				});
+			}
+			return Promise.resolve({
+				status: 200,
+				arrayBuffer: () =>
+					new Promise((resolve) => {
+						setTimeout(() => resolve(new ArrayBuffer(4)), 0);
+					}),
+			});
+		};
+		// SourceBuffer with real MSE semantics: append/remove mutate the
+		// buffered ranges asynchronously, on the updateend event.
+		let ranges = [[0, 0]];
+		const listeners = [];
+		const fire = () =>
+			queueMicrotask(() => {
+				for (const f of listeners.splice(0)) f();
+			});
+		const sourceBuffer = {
+			get buffered() {
+				return {
+					length: ranges.length,
+					start: (i) => ranges[i][0],
+					end: (i) => ranges[i][1],
+				};
+			},
+			addEventListener(type, fn) {
+				if (type === "updateend") listeners.push(fn);
+			},
+			appendBuffer() {
+				const [start, end] = ranges.at(-1);
+				ranges = [[start, end + 8]];
+				fire();
+			},
+			remove(_start, end) {
+				const bufferEnd = ranges.at(-1)[1];
+				// The range mutates when the remove completes (updateend),
+				// not when remove() is called.
+				queueMicrotask(() => {
+					ranges = [[end, bufferEnd]];
+				});
+				fire();
+			},
+		};
+		// @ts-ignore
+		function FakeMediaSource() {}
+		FakeMediaSource.isTypeSupported = () => true;
+		FakeMediaSource.prototype.addEventListener = (type, fn) => {
+			if (type === "sourceopen") queueMicrotask(fn);
+		};
+		FakeMediaSource.prototype.addSourceBuffer = () => sourceBuffer;
+		window.MediaSource = FakeMediaSource;
+		// @ts-ignore
+		URL.createObjectURL = () => "blob:x";
+
+		const feed = newSlowPollStream({ id: "a", name: "m" }, true, []);
+		const $video = feed.elem.querySelector("video");
+		// Playhead lags behind a long catch-up backlog.
+		$video.currentTime = 3;
+		await new Promise((resolve) => { setTimeout(resolve, 100); });
+		feed.destroy();
+		// @ts-ignore
+		delete window.MediaSource;
+		// @ts-ignore
+		delete URL.createObjectURL;
+
+		// Buffer exceeded 15s so the front was pruned; the playhead must
+		// have been moved into the remaining range, not left in the hole.
+		expect(ranges[0][0]).toBeGreaterThan(0);
+		expect($video.currentTime).toBeGreaterThanOrEqual(ranges[0][0]);
 	});
 
 	test("supported codec passes the gate", async () => {
@@ -133,7 +209,7 @@ describe("feed", () => {
 		URL.createObjectURL = () => "blob:x";
 
 		const feed = newSlowPollStream({ id: "a", name: "m" }, true, []);
-		await new Promise((resolve) => setTimeout(resolve, 10));
+		await new Promise((resolve) => { setTimeout(resolve, 10); });
 		feed.destroy();
 		// @ts-ignore
 		delete window.MediaSource;
@@ -207,7 +283,7 @@ describe("feed", () => {
 			[],
 		);
 		const badge = feed.elem.querySelector(".player-overlay-codec");
-		expect(badge?.textContent).toBe("avc1");
+		expect(badge && badge.textContent).toBe("avc1");
 		feed.destroy();
 	});
 
@@ -225,7 +301,7 @@ describe("feed", () => {
 			[],
 		);
 		const badge = feed.elem.querySelector(".player-overlay-codec");
-		expect(badge?.textContent).toBe("hvc1");
+		expect(badge && badge.textContent).toBe("hvc1");
 		feed.destroy();
 	});
 
@@ -237,9 +313,8 @@ describe("feed", () => {
 			true,
 			[],
 		);
-		expect(feed.elem.querySelector(".player-overlay-codec")?.textContent).toBe(
-			"avc1",
-		);
+		const badge3 = feed.elem.querySelector(".player-overlay-codec");
+		expect(badge3 && badge3.textContent).toBe("avc1");
 		feed.destroy();
 
 		// No codec at all: no badge.
