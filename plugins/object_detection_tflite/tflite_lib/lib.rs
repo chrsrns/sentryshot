@@ -86,6 +86,24 @@ pub struct TfliteDetector {
     format: Format,
 }
 
+// Frees the CDetector unless disarmed. Every error path in `new` after
+// `c_detector_allocate` returns through this guard.
+struct CDetectorGuard(*mut CDetector);
+
+impl CDetectorGuard {
+    fn disarm(self) -> *mut CDetector {
+        let inner = self.0;
+        std::mem::forget(self);
+        inner
+    }
+}
+
+impl Drop for CDetectorGuard {
+    fn drop(&mut self) {
+        unsafe { c_detector_free(self.0) }
+    }
+}
+
 impl Drop for TfliteDetector {
     fn drop(&mut self) {
         unsafe { c_detector_free(self.inner) }
@@ -112,6 +130,7 @@ impl TfliteDetector {
         if c_detector.is_null() {
             return Err(DetectorNull);
         }
+        let c_detector = CDetectorGuard(c_detector);
 
         let res = match edgetpu {
             Some(device) => {
@@ -121,7 +140,7 @@ impl TfliteDetector {
                 let path = CString::new(device.path.clone())?;
                 unsafe {
                     c_detector_load_model(
-                        c_detector,
+                        c_detector.0,
                         model_path.as_ptr(),
                         path.as_ptr(),
                         device.typ.as_uint(),
@@ -129,7 +148,7 @@ impl TfliteDetector {
                 }
             }
             None => unsafe {
-                c_detector_load_model(c_detector, model_path.as_ptr(), std::ptr::null(), 0)
+                c_detector_load_model(c_detector.0, model_path.as_ptr(), std::ptr::null(), 0)
             },
         };
         if res != 0 {
@@ -141,11 +160,11 @@ impl TfliteDetector {
             });
         }
 
-        let input_tensor_count = unsafe { c_detector_input_tensor_count(c_detector) };
+        let input_tensor_count = unsafe { c_detector_input_tensor_count(c_detector.0) };
         let input_tensor_count = u8::try_from(input_tensor_count)
             .map_err(|_| InvalidInputTensorCount(input_tensor_count))?;
 
-        let output_tensor_count = unsafe { c_detector_output_tensor_count(c_detector) };
+        let output_tensor_count = unsafe { c_detector_output_tensor_count(c_detector.0) };
         let output_tensor_count = u8::try_from(output_tensor_count)
             .map_err(|_| InvalidInputTensorCount(output_tensor_count))?;
 
@@ -161,11 +180,11 @@ impl TfliteDetector {
         };
 
         let input_shapes = format_list(
-            (0..input_tensor_count).map(|i| unsafe { InputTensor::new(c_detector, i).shape() }),
+            (0..input_tensor_count).map(|i| unsafe { InputTensor::new(c_detector.0, i).shape() }),
         );
 
         let output_shape = format_list((0..output_tensor_count).map(|i| {
-            let tensor = unsafe { c_detector_output_tensor(c_detector, i.into()) };
+            let tensor = unsafe { c_detector_output_tensor(c_detector.0, i.into()) };
             assert!(!tensor.is_null());
             unsafe { TensorType::from_tensor(tensor) }
         }));
@@ -180,17 +199,17 @@ impl TfliteDetector {
         let format = unsafe {
             match model_format {
                 ModelFormat::OdAPi => Format::OdAPi(OdApi {
-                    input_tensor: InputTensor::new(c_detector, 0),
+                    input_tensor: InputTensor::new(c_detector.0, 0),
                     output_tensors: [
-                        OutputTensor::new(c_detector, 0),
-                        OutputTensor::new(c_detector, 1),
-                        OutputTensor::new(c_detector, 2),
-                        OutputTensor::new(c_detector, 3),
+                        OutputTensor::new(c_detector.0, 0),
+                        OutputTensor::new(c_detector.0, 1),
+                        OutputTensor::new(c_detector.0, 2),
+                        OutputTensor::new(c_detector.0, 3),
                     ],
                 }),
                 ModelFormat::Nolo => Format::Nolo({
-                    let input_tensor = InputTensor::new(c_detector, 0);
-                    let output_tensor = OutputTensor::new(c_detector, 0);
+                    let input_tensor = InputTensor::new(c_detector.0, 0);
+                    let output_tensor = OutputTensor::new(c_detector.0, 0);
                     let output_dims = output_tensor.get_dims()?;
                     Nolo {
                         input_quantization_params: input_tensor.quantization_params(),
@@ -204,7 +223,7 @@ impl TfliteDetector {
         };
 
         Ok(Self {
-            inner: c_detector,
+            inner: c_detector.disarm(),
             format,
         })
     }
