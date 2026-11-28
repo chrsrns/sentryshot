@@ -359,7 +359,7 @@ const inputRules = {
 	/** @type InputRule */
 	noSpaces: [/\s/, "cannot contain spaces"],
 	/** @type InputRule */
-	notEmpty: [/^s*$/, "cannot be empty"],
+	notEmpty: [/^\s*$/, "cannot be empty"],
 	/** @type InputRule */
 	englishOnly: [/[^\dA-Za-z]/, "english charaters only"],
 	/** @type InputRule */

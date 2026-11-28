@@ -344,7 +344,12 @@ describe("inputRules", () => {
 		/** @type {[string, boolean][]} */
 		const cases = [
 			["", false],
+			[" ", false],
+			["  \t\n ", false],
 			["a", true],
+			["s", true],
+			["ss", true],
+			["  a  ", true],
 		];
 		expect(testRule(cases, inputRules.notEmpty)).toBeTruthy();
 	});
