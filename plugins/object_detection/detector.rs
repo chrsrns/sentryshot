@@ -194,6 +194,23 @@ async fn parse_detector_configs(
     let mut detectors = HashMap::new();
     let mut detector_configs = HashMap::new();
 
+    // Reject duplicate enabled names upfront — before any model/label
+    // fetch or backend load is wasted on a config that will fail anyway.
+    let mut seen = std::collections::HashSet::new();
+    for (enable, name) in configs
+        .tflite
+        .iter()
+        .map(|c| (c.enable, &c.name))
+        .chain(configs.edgetpu.iter().map(|c| (c.enable, &c.name)))
+    {
+        if !enable {
+            continue;
+        }
+        if !seen.insert(name) {
+            return Err(Duplicate(name.clone()));
+        }
+    }
+
     for cpu in configs.tflite {
         if !cpu.enable {
             logger.log(
@@ -470,4 +487,54 @@ threads = 1
             parse_raw_detector_configs("").unwrap()
         );
     }
+    // Two enabled detectors sharing a name fail fast, before any fetch or
+    // backend load.
+    #[tokio::test]
+    async fn test_detector_manager_duplicate_name() {
+        let fetcher = StubFetcher::new(HashMap::new());
+
+        let temp_dir = tempdir().unwrap();
+        let config_dir = temp_dir.path();
+        std::fs::write(
+            config_dir.join("object_detection.toml"),
+            "
+    [[detector_tflite]]
+    enable = true
+    name = \"test\"
+    width = 340
+    height = 340
+    model = \"file:///4\"
+    sha256sum = \"5555555555555555555555555555555555555555555555555555555555555555\"
+    label_map = \"file:///6\"
+    threads = 1
+
+    [[detector_tflite]]
+    enable = true
+    name = \"test\"
+    width = 340
+    height = 340
+    model = \"file:///4\"
+    sha256sum = \"5555555555555555555555555555555555555555555555555555555555555555\"
+    label_map = \"file:///6\"
+    threads = 1
+            ",
+        )
+        .unwrap();
+
+        let result = DetectorManager::new(
+            Handle::current(),
+            TaskTracker::new().token(),
+            DummyLogger::new(),
+            Box::new(fetcher),
+            config_dir,
+            temp_dir.path().to_path_buf(),
+        )
+        .await;
+
+        match result {
+            Err(DetectorManagerError::Duplicate(_)) => {}
+            _ => panic!("expected duplicate error"),
+        }
+    }
+
 }

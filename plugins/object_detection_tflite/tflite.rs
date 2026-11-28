@@ -296,3 +296,76 @@ fn get_log_level() -> u8 {
         0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::Label;
+    use pretty_assertions::assert_eq;
+    use std::collections::HashMap;
+
+    fn tflite_det(
+        score: f32,
+        class: u16,
+        top: f32,
+        left: f32,
+        bottom: f32,
+        right: f32,
+    ) -> tflite_lib::Detection {
+        tflite_lib::Detection {
+            score,
+            class,
+            top,
+            left,
+            bottom,
+            right,
+        }
+    }
+
+    #[test]
+    fn test_parse_rect() {
+        // Values are scaled to micro-units (1_000_000 = 100%).
+        let rect = parse_rect(0.1, 0.2, 0.5, 0.6).unwrap();
+        assert_eq!(200_000, rect.x);
+        assert_eq!(100_000, rect.y);
+        assert_eq!(400_000, rect.width.get());
+        assert_eq!(400_000, rect.height.get());
+    }
+
+    #[test]
+    fn test_parse_rect_inverted() {
+        assert!(parse_rect(0.6, 0.2, 0.5, 0.6).is_none()); // top > bottom
+        assert!(parse_rect(0.1, 0.7, 0.5, 0.6).is_none()); // left > right
+    }
+
+    #[test]
+    fn test_parse_rect_degenerate() {
+        assert!(parse_rect(0.1, 0.2, 0.1, 0.6).is_none()); // zero height
+        assert!(parse_rect(0.1, 0.2, 0.5, 0.2).is_none()); // zero width
+    }
+
+    #[test]
+    fn test_parse_detections() {
+        let label_map: LabelMap = HashMap::from([
+            (1, Label::try_from("person".to_owned()).unwrap()),
+        ]);
+
+        let got = parse_detections(
+            &label_map,
+            vec![
+                tflite_det(0.9, 1, 0.1, 0.2, 0.5, 0.6),
+                // Unknown class gets a synthesized label.
+                tflite_det(0.5, 7, 0.0, 0.0, 0.1, 0.1),
+                // Degenerate rect is dropped.
+                tflite_det(0.5, 1, 0.5, 0.5, 0.5, 0.5),
+            ],
+        );
+
+        assert_eq!(2, got.len());
+        assert_eq!("person", got[0].label.to_string());
+        assert_eq!(90.0, got[0].score);
+        assert!(got[0].region.rectangle.is_some());
+        assert_eq!("unknown7", got[1].label.to_string());
+        assert_eq!(50.0, got[1].score);
+    }
+}

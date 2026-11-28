@@ -1163,4 +1163,181 @@ mod tests {
         });
         assert_eq!(want, config);
     }
+
+    // Both keys present is ambiguous and must fail, not silently pick one.
+    #[test]
+    fn test_migrate_monitor_both_keys() {
+        let mut config = json!({
+            "tflite": true,
+            "objectDetection": false,
+        });
+        assert!(migrate_monitor(&mut config).is_err());
+    }
+
+    #[test]
+    fn test_migrate_monitor_noop() {
+        // Non-object config: untouched.
+        let mut config = json!("x");
+        migrate_monitor(&mut config).unwrap();
+        assert_eq!(json!("x"), config);
+
+        // No "tflite" key: untouched.
+        let mut config = json!({"objectDetection": true});
+        migrate_monitor(&mut config).unwrap();
+        assert_eq!(json!({"objectDetection": true}), config);
+    }
+
+    // --- enable/disable handlers ---
+
+    use common::monitor::{
+        IMonitorManager, MonitorConfig, MonitorConfigs, MonitorDeleteError, MonitorInfo,
+        MonitorRestartError, MonitorSetAndRestartError, MonitorSetError,
+    };
+
+    struct StubManager {
+        config: Option<MonitorConfig>,
+        // 0: cancelled (None), 1: ok, 2: set error.
+        result: u8,
+    }
+
+    #[async_trait]
+    impl IMonitorManager for StubManager {
+        async fn monitor_restart(
+            &self,
+            _id: MonitorId,
+        ) -> Option<Result<(), MonitorRestartError>> {
+            unimplemented!()
+        }
+        async fn monitor_set(
+            &self,
+            _config: MonitorConfig,
+        ) -> Option<Result<bool, MonitorSetError>> {
+            unimplemented!()
+        }
+        async fn monitor_set_and_restart(
+            &self,
+            _config: MonitorConfig,
+        ) -> Option<Result<bool, MonitorSetAndRestartError>> {
+            match self.result {
+                1 => Some(Ok(false)),
+                2 => Some(Err(MonitorSetAndRestartError::Set(
+                    MonitorSetError::InvalidPtzAddr,
+                ))),
+                _ => None,
+            }
+        }
+        async fn monitor_delete(
+            &self,
+            _id: MonitorId,
+        ) -> Option<Result<(), MonitorDeleteError>> {
+            unimplemented!()
+        }
+        async fn monitors_info(&self) -> Option<HashMap<MonitorId, MonitorInfo>> {
+            unimplemented!()
+        }
+        async fn monitor_config(&self, _id: MonitorId) -> Option<Option<MonitorConfig>> {
+            Some(self.config.clone())
+        }
+        async fn monitor_configs(&self) -> Option<MonitorConfigs> {
+            unimplemented!()
+        }
+        async fn monitor_unmark_audio(
+            &self,
+            _id: MonitorId,
+            _names: Vec<String>,
+        ) -> Option<Result<(), MonitorSetError>> {
+            unimplemented!()
+        }
+    }
+
+    fn od_config(enable: serde_json::Value) -> MonitorConfig {
+        serde_json::from_value(json!({
+            "id": "123",
+            "name": "test",
+            "enable": true,
+            "alwaysRecord": false,
+            "videoLength": 0,
+            "source": "rtsp",
+            "sourcertsp": { "protocol": "tcp", "mainStream": "rtsp://x" },
+            "objectDetection": {
+                "enable": enable,
+                "thresholds": {},
+                "crop": { "size": 100, "x": 0, "y": 0 },
+                "mask": { "enable": false, "area": [] },
+                "detectorName": "test",
+                "feedRate": 0,
+                "duration": 0,
+                "useSubStream": true,
+            },
+        }))
+        .unwrap()
+    }
+
+    fn handler_state(config: Option<MonitorConfig>, result: u8) -> HandlerState {
+        HandlerState {
+            logger: common::DummyLogger::new(),
+            monitor_manager: Arc::new(StubManager { config, result }),
+        }
+    }
+
+    fn monitor_id() -> MonitorId {
+        MonitorId::try_from("test".to_owned()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_enable_handler() {
+        // Monitor not found.
+        let state = handler_state(None, 0);
+        let resp = enable_handler(State(state), Path(monitor_id())).await;
+        assert_eq!(StatusCode::NOT_FOUND, resp.status());
+    }
+
+    #[tokio::test]
+    async fn test_enable_handler_no_enable_field() {
+        // No bool "enable" in objectDetection -> 500.
+        let config = od_config_missing_enable();
+        let state = handler_state(Some(config), 0);
+        let resp = enable_handler(State(state), Path(monitor_id())).await;
+        assert_eq!(StatusCode::INTERNAL_SERVER_ERROR, resp.status());
+    }
+
+    fn od_config_missing_enable() -> MonitorConfig {
+        serde_json::from_value(json!({
+            "id": "123",
+            "name": "test",
+            "enable": true,
+            "alwaysRecord": false,
+            "videoLength": 0,
+            "source": "rtsp",
+            "sourcertsp": { "protocol": "tcp", "mainStream": "rtsp://x" },
+            "objectDetection": {},
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_enable_handler_ok() {
+        let config = od_config(json!(false));
+        let state = handler_state(Some(config), 1);
+        let resp = enable_handler(State(state), Path(monitor_id())).await;
+        assert_eq!(StatusCode::OK, resp.status());
+    }
+
+    #[tokio::test]
+    async fn test_enable_handler_set_error() {
+        let config = od_config(json!(false));
+        let state = handler_state(Some(config), 2);
+        let resp = enable_handler(State(state), Path(monitor_id())).await;
+        assert_eq!(StatusCode::INTERNAL_SERVER_ERROR, resp.status());
+    }
+
+    #[tokio::test]
+    async fn test_disable_handler_already_disabled() {
+        // set_enable returns None: the old config is reused and the
+        // handler still succeeds.
+        let config = od_config_missing_enable();
+        let state = handler_state(Some(config), 1);
+        let resp = disable_handler(State(state), Path(monitor_id())).await;
+        assert_eq!(StatusCode::OK, resp.status());
+    }
 }
