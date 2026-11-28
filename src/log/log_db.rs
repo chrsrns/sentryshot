@@ -1518,6 +1518,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_save_logs_lagged() {
+        let temp_dir = tempdir().unwrap();
+        let (db, token) = new_test_db(temp_dir.path());
+        let db = Arc::new(db);
+
+        let (tx, rx) = broadcast::channel(1);
+        // Overflow the receiver before save_logs runs: recv hits Lagged,
+        // drops entry 1, and must keep going.
+        tx.send(new_test_entry(1)).unwrap();
+        tx.send(new_test_entry(2)).unwrap();
+
+        let handle = tokio::spawn({
+            let db = db.clone();
+            let token = token.clone();
+            async move { db.save_logs(token, rx).await }
+        });
+
+        for _ in 0..10_000 {
+            if !db.query(empty_query()).await.unwrap().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let entries = db.query(empty_query()).await.unwrap();
+        assert_eq!(vec![new_test_entry(2)], entries);
+
+        // Sender dropped -> feed Closed -> save_logs returns.
+        drop(tx);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_log_db_cache_db_dedup_boundary() {
+        // With a real cache, saved entries live in both cache and the
+        // chunk files. The strict `entry.time < q.time` boundary must
+        // dedup them.
+        let temp_dir = tempdir().unwrap();
+        let (db, _token) = new_test_db2(temp_dir.path(), 10);
+
+        db.save_log(new_test_entry(1)).await.unwrap();
+        db.save_log(new_test_entry(2)).await.unwrap();
+        db.save_log(new_test_entry(3)).await.unwrap();
+
+        // Every entry returned exactly once.
+        let entries = db.query(empty_query()).await.unwrap();
+        assert_eq!(
+            vec![new_test_entry(3), new_test_entry(2), new_test_entry(1)],
+            entries
+        );
+
+        // q.time equal to an entry's time excludes it (strict <).
+        let entries = db
+            .query(LogQuery {
+                time: UnixMicro::new(3),
+                ..empty_query()
+            })
+            .await
+            .unwrap();
+        assert_eq!(vec![new_test_entry(2), new_test_entry(1)], entries);
+    }
+
+    #[tokio::test]
     async fn test_log_db_write_and_read() {
         let msg1 = new_test_entry(1);
         let msg2 = new_test_entry(2);

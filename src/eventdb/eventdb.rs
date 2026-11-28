@@ -282,6 +282,64 @@ mod tests {
         tracker.wait().await;
     }
 
+    #[tokio::test]
+    async fn test_prune_vs_open_encoder() {
+        // Characterizes the prune/open-encoder race: pruning deletes
+        // chunk files the Database's ChunkEncoder still holds open, and
+        // subsequent writes land in unlinked files — silently lost.
+        let temp_dir = tempdir().unwrap();
+        let token = CancellationToken::new();
+        let tracker = TaskTracker::new();
+        let eventdb = EventDb::new(
+            token.clone(),
+            tracker.token(),
+            DummyLogger::new(),
+            temp_dir.path().to_path_buf(),
+        );
+        tracker.close();
+
+        // First write opens an encoder, creating the chunk files.
+        eventdb.write_test("db1", test_event(2 * DAY)).await;
+        assert_eq!(
+            vec!["db1/00001.data", "db1/00001.payload"],
+            list_files(temp_dir.path())
+        );
+
+        // Prune deletes them while the encoder still holds open fds.
+        eventdb.prune(UnixNano::new(3 * DAY)).await.unwrap();
+        assert_eq!(vec!["db1"], list_files(temp_dir.path()));
+
+        // Same-chunk write reuses the encoder: buffered entries land in
+        // deleted files. The write reports success either way.
+        eventdb.write_test("db1", test_event(2 * DAY + 1)).await;
+
+        token.cancel();
+        drop(eventdb);
+        tracker.wait().await;
+
+        // A fresh EventDb finds nothing recoverable on disk.
+        let token2 = CancellationToken::new();
+        let eventdb2 = EventDb::new(
+            token2.clone(),
+            TaskTracker::new().token(),
+            DummyLogger::new(),
+            temp_dir.path().to_path_buf(),
+        );
+        let got = eventdb2
+            .query(
+                "db1".to_owned().try_into().unwrap(),
+                EventQuery {
+                    start: UnixNano::new(0),
+                    end: UnixNano::new(i64::MAX),
+                    limit: std::num::NonZeroUsize::new(10).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(got.unwrap_or_default().is_empty());
+        token2.cancel();
+    }
+
     fn list_files(path: &Path) -> Vec<String> {
         let mut list = Vec::new();
 
