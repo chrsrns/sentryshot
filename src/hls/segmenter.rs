@@ -194,7 +194,7 @@ impl Segmenter {
                 let next_segment = Segment::new(
                     self.segment_id_counter.next_id(),
                     self.muxer_id,
-                    sample_dts,
+                    next_dts,
                     self.muxer_start_time,
                     self.segment_max_size,
                     self.playlist.clone(),
@@ -412,10 +412,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn segment_switch_start_dts_characterization() {
-        // B38: the new segment is anchored on the previous sample's dts,
-        // not the incoming IDR's dts. This test characterizes that
-        // reported start_time/duration are off by one frame interval.
+    async fn segment_switch_start_dts() {
+        // The new segment is anchored on the incoming IDR's dts.
         let playlist = test_playlist();
         let mut s = Segmenter::new(
             DurationH264::new(90_000),
@@ -435,9 +433,10 @@ mod tests {
         s.write_h264(frame(200_000, true)).await.unwrap();
 
         assert!(s.first_segment_finalized);
-        // Actual behavior (B38): start_dts = last frame of old segment.
-        // Correct value would be 200_000 (the incoming IDR's dts).
-        assert_eq!(UnixH264::new(90_000), s.current_segment.as_ref().unwrap().start_dts());
+        assert_eq!(
+            UnixH264::new(200_000),
+            s.current_segment.as_ref().unwrap().start_dts()
+        );
         assert_eq!(1, playlist.debug_state().await.num_segments);
     }
 
