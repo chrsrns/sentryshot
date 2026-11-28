@@ -101,6 +101,7 @@ impl Muxer {
                 start_time,
                 first_request: true,
                 next_frame_id: start_frame_id,
+                parked: false,
             })),
         ));
         Ready(StartSessionResponseReady {
@@ -121,26 +122,26 @@ impl Muxer {
             _ = req.res_tx.send(SessionNotExist);
             return;
         };
-        let Ok(mut session) = session.try_lock() else {
+        let Ok(mut session_guard) = session.try_lock() else {
             _ = req.res_tx.send(SessionAlreadyLocked);
             return;
         };
 
         let last_frame = state.frames.back().expect("frames not empty");
-        if session.next_frame_id <= last_frame.id {
-            let next_frame_index = frame_position(&state.frames, session.next_frame_id);
+        if session_guard.next_frame_id <= last_frame.id {
+            let next_frame_index = frame_position(&state.frames, session_guard.next_frame_id);
             let Some(next_frame_index) = next_frame_index else {
                 _ = req.res_tx.send(FramesExpired);
                 return;
             };
 
             let mut buf = Vec::new();
-            if session.first_request {
+            if session_guard.first_request {
                 buf.extend(&state.init_content);
             }
 
             for frame in state.frames.iter().skip(next_frame_index) {
-                match frame.muxed(session.start_time) {
+                match frame.muxed(session_guard.start_time) {
                     Ok(muxed) => buf.extend(muxed),
                     Err(e) => {
                         _ = req.res_tx.send(Ready(Err(e)));
@@ -149,25 +150,37 @@ impl Muxer {
                 };
             }
 
-            session.first_request = false;
-            session.next_frame_id = last_frame.id + 1;
+            session_guard.first_request = false;
+            session_guard.next_frame_id = last_frame.id + 1;
             // State lock must be released at this point.
             drop(state2);
             _ = req.res_tx.send(Ready(Ok(buf)));
             return;
         }
 
+        if session_guard.parked {
+            _ = req.res_tx.send(SessionAlreadyLocked);
+            return;
+        }
+        session_guard.parked = true;
+
         let (tx, rx) = oneshot::channel();
         state.frames_on_hold.push(tx);
 
-        // State lock must be released at this point.
+        // Both locks must be released while parked: holding the session lock
+        // across the wait would keep `write_frame`'s retention floor from
+        // reading this session's `next_frame_id` for as long as the stream
+        // stalls.
         drop(state2);
+        drop(session_guard);
         let Ok(new_frame) = rx.await else {
             _ = req.res_tx.send(MuxerCancelled);
             return;
         };
-        session.next_frame_id = new_frame.id + 1;
-        let response = Ready(new_frame.muxed(session.start_time));
+        let mut session_guard = session.lock().await;
+        session_guard.parked = false;
+        session_guard.next_frame_id = new_frame.id + 1;
+        let response = Ready(new_frame.muxed(session_guard.start_time));
         _ = req.res_tx.send(response);
     }
 
@@ -452,6 +465,11 @@ struct Session {
     start_time: UnixH264,
     first_request: bool,
     next_frame_id: u64,
+    /// A play request is parked on `frames_on_hold` for this session.
+    /// Releasing the Mutex while parked lets `write_frame`'s retention
+    /// floor still read `next_frame_id`; the flag keeps concurrent plays
+    /// out (`SessionAlreadyLocked`) without holding the lock.
+    parked: bool,
 }
 
 struct Frame {
