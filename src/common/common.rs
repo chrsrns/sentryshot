@@ -105,8 +105,8 @@ impl<'de> Deserialize<'de> for NonZeroGb {
         struct Temp(f32);
 
         let temp = Temp::deserialize(deserializer)?;
-        if temp.0 == 0.0 {
-            return Err(serde::de::Error::custom("cannot be zero"));
+        if !(temp.0.is_finite() && temp.0 > 0.0) {
+            return Err(serde::de::Error::custom("must be a positive finite value"));
         }
         #[allow(
             clippy::cast_sign_loss,
@@ -951,6 +951,81 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_monitor_id() {
+        MonitorId::try_from("abc".to_owned()).unwrap();
+        MonitorId::try_from("123".to_owned()).unwrap();
+        MonitorId::try_from("a".repeat(24)).unwrap();
+
+        assert_eq!(
+            MonitorId::try_from(String::new()).unwrap_err(),
+            ParseMonitorIdError::Empty
+        );
+        assert!(matches!(
+            MonitorId::try_from("a-b".to_owned()).unwrap_err(),
+            ParseMonitorIdError::InvalidChars(..)
+        ));
+        assert!(matches!(
+            MonitorId::try_from("a b".to_owned()).unwrap_err(),
+            ParseMonitorIdError::InvalidChars(..)
+        ));
+        assert!(matches!(
+            MonitorId::try_from("a_b".to_owned()).unwrap_err(),
+            ParseMonitorIdError::InvalidChars(..)
+        ));
+        assert_eq!(
+            MonitorId::try_from("a".repeat(25)).unwrap_err(),
+            ParseMonitorIdError::TooLong
+        );
+    }
+
+    #[test]
+    fn test_parse_log_source() {
+        LogSource::try_from("abc".to_owned()).unwrap();
+        LogSource::try_from("123".to_owned()).unwrap();
+        LogSource::try_from("a".repeat(24)).unwrap();
+
+        assert!(matches!(
+            LogSource::try_from(String::new()).unwrap_err(),
+            ParseLogSourceError::Empty
+        ));
+        assert!(matches!(
+            LogSource::try_from("a-b".to_owned()).unwrap_err(),
+            ParseLogSourceError::InvalidChars(..)
+        ));
+        assert!(matches!(
+            LogSource::try_from("a".repeat(25)).unwrap_err(),
+            ParseLogSourceError::TooLong
+        ));
+
+        // `&'static str` variant follows the same rules.
+        LogSource::try_from("abc").unwrap();
+        assert!(matches!(
+            LogSource::try_from("").unwrap_err(),
+            ParseLogSourceError::Empty
+        ));
+        assert!(matches!(
+            LogSource::try_from("a-b").unwrap_err(),
+            ParseLogSourceError::InvalidChars(..)
+        ));
+    }
+
+    #[test]
+    fn test_non_zero_gb_deserialize() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            v: NonZeroGb,
+        }
+        let de = |s: &str| toml::from_str::<Wrapper>(&format!("v = {s}")).map(|w| w.v);
+
+        assert_eq!(*de("1.0").unwrap(), ByteSize(1000 * MB));
+        assert!(de("0.0").is_err());
+        assert!(de("-1.0").is_err());
+        assert!(de("nan").is_err());
+        assert!(de("inf").is_err());
+        assert!(de("-inf").is_err());
+    }
+
+    #[test]
     fn test_parse_log_message() {
         LogMessage::try_from("abc".to_owned()).unwrap();
         LogMessage::try_from("123".to_owned()).unwrap();
@@ -981,9 +1056,14 @@ mod tests {
         Username::try_from("123".to_owned()).unwrap();
         Username::try_from("a-a".to_owned()).unwrap();
         Username::try_from("a_a".to_owned()).unwrap();
+        Username::try_from("a".repeat(64)).unwrap();
 
         Username::try_from(String::new()).unwrap_err();
         Username::try_from("A".to_owned()).unwrap_err();
         Username::try_from("a a".to_owned()).unwrap_err();
+        assert_eq!(
+            Username::try_from("a".repeat(65)).unwrap_err(),
+            ParseUsernameError::TooLong
+        );
     }
 }
