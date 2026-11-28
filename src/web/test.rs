@@ -120,7 +120,7 @@ async fn test_serve_mp4_range(r: &str, code: StatusCode, ranges: Vec<WantRange>)
 // If-Modified-Since >= last_modified -> 304 without body metadata.
 #[tokio::test]
 async fn test_serve_mp4_if_modified_since_not_modified() {
-    let file = vec![0u8; 10];
+    let file = vec![0_u8; 10];
     let last_modified = UNIX_EPOCH;
 
     let mut headers = HeaderMap::new();
@@ -147,7 +147,7 @@ async fn test_serve_mp4_if_modified_since_not_modified() {
 // If-Modified-Since < last_modified -> 200 with body.
 #[tokio::test]
 async fn test_serve_mp4_if_modified_since_modified() {
-    let file = vec![0u8; 10];
+    let file = vec![0_u8; 10];
     let last_modified = UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
 
     let mut headers = HeaderMap::new();
@@ -175,7 +175,7 @@ async fn test_serve_mp4_if_modified_since_modified() {
 // If-Modified-Since on a non-GET/HEAD request is ignored.
 #[tokio::test]
 async fn test_serve_mp4_if_modified_since_ignored_on_post() {
-    let file = vec![0u8; 10];
+    let file = vec![0_u8; 10];
     let last_modified = UNIX_EPOCH;
 
     let mut headers = HeaderMap::new();
@@ -203,7 +203,7 @@ async fn test_serve_mp4_if_modified_since_ignored_on_post() {
 // If-Unmodified-Since < last_modified -> 412.
 #[tokio::test]
 async fn test_serve_mp4_if_unmodified_since_failed() {
-    let file = vec![0u8; 10];
+    let file = vec![0_u8; 10];
     let last_modified = UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
 
     let mut headers = HeaderMap::new();
@@ -227,7 +227,7 @@ async fn test_serve_mp4_if_unmodified_since_failed() {
 // If-Unmodified-Since >= last_modified -> precondition passes.
 #[tokio::test]
 async fn test_serve_mp4_if_unmodified_since_passes() {
-    let file = vec![0u8; 10];
+    let file = vec![0_u8; 10];
     let last_modified = UNIX_EPOCH;
 
     let mut headers = HeaderMap::new();
@@ -255,7 +255,7 @@ async fn test_serve_mp4_if_unmodified_since_passes() {
 // Multi-range requests are refused with 416.
 #[tokio::test]
 async fn test_serve_mp4_multi_range_refused() {
-    let file = vec![0u8; 10];
+    let file = vec![0_u8; 10];
 
     let mut headers = HeaderMap::new();
     headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-2,5-7"));
@@ -268,7 +268,7 @@ async fn test_serve_mp4_multi_range_refused() {
 // Range past end of file -> 416 with `bytes */size` Content-Range.
 #[tokio::test]
 async fn test_serve_mp4_range_no_overlap() {
-    let file = vec![0u8; 10];
+    let file = vec![0_u8; 10];
 
     let mut headers = HeaderMap::new();
     headers.insert(header::RANGE, HeaderValue::from_static("bytes=100-200"));

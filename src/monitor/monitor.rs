@@ -871,6 +871,7 @@ fn union_audio_marks(old: &MonitorConfig, config: &mut MonitorConfig) {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
     use common::{
         ArcStreamerMuxer, DummyLogger, DummyStorage, DynError, H264Data, MonitorName,
@@ -1250,7 +1251,7 @@ mod tests {
         manager
             .monitor_set(serde_json::from_value(base()).unwrap())
             .await
-            .unwrap();
+            .unwrap().unwrap();
         let got = manager.monitor_config(m_id("cam")).await.unwrap().unwrap();
         assert_eq!(&["getPresets", "home"], got.config().ptz.unsupported());
 
@@ -1260,7 +1261,7 @@ mod tests {
         manager
             .monitor_set(serde_json::from_value(changed).unwrap())
             .await
-            .unwrap();
+            .unwrap().unwrap();
         let got = manager.monitor_config(m_id("cam")).await.unwrap().unwrap();
         assert!(got.config().ptz.unsupported().is_empty());
 
@@ -1270,14 +1271,14 @@ mod tests {
         manager
             .monitor_set(serde_json::from_value(marks).unwrap())
             .await
-            .unwrap();
+            .unwrap().unwrap();
         let mut addr = base();
         addr["sourcertsp"]["mainStream"] = json!("rtsp://x2");
         addr["ptz"]["onvifAddr"] = json!("http://other:8899/onvif/device_service");
         manager
             .monitor_set(serde_json::from_value(addr).unwrap())
             .await
-            .unwrap();
+            .unwrap().unwrap();
         let got = manager.monitor_config(m_id("cam")).await.unwrap().unwrap();
         assert!(got.config().ptz.unsupported().is_empty());
 
@@ -1303,7 +1304,7 @@ mod tests {
         manager
             .monitor_set(serde_json::from_value(base()).unwrap())
             .await
-            .unwrap();
+            .unwrap().unwrap();
 
         // Stale form payload: loaded before `home` faulted mid-session.
         // Same endpoint → stored marks merge with the stale incoming set.
@@ -1312,7 +1313,7 @@ mod tests {
         manager
             .monitor_set(serde_json::from_value(stale).unwrap())
             .await
-            .unwrap();
+            .unwrap().unwrap();
         let got = manager.monitor_config(m_id("cam")).await.unwrap().unwrap();
         assert_eq!(&["getPresets", "home"], got.config().ptz.unsupported());
 
@@ -1322,7 +1323,7 @@ mod tests {
         manager
             .monitor_set(serde_json::from_value(bare).unwrap())
             .await
-            .unwrap();
+            .unwrap().unwrap();
         let got = manager.monitor_config(m_id("cam")).await.unwrap().unwrap();
         assert_eq!(&["getPresets", "home"], got.config().ptz.unsupported());
 
@@ -1348,7 +1349,7 @@ mod tests {
         manager
             .monitor_set(serde_json::from_value(base()).unwrap())
             .await
-            .unwrap();
+            .unwrap().unwrap();
 
         // Empty incoming set + endpoint change → union restores the mark
         // into the config first, then the endpoint-diff clears it.
@@ -1358,7 +1359,7 @@ mod tests {
         manager
             .monitor_set(serde_json::from_value(changed).unwrap())
             .await
-            .unwrap();
+            .unwrap().unwrap();
         let got = manager.monitor_config(m_id("cam")).await.unwrap().unwrap();
         assert!(got.config().ptz.unsupported().is_empty());
 
@@ -1381,7 +1382,7 @@ mod tests {
         manager
             .monitor_set(serde_json::from_value(base()).unwrap())
             .await
-            .unwrap();
+            .unwrap().unwrap();
 
         // Third-party PUT with no `audio` object at all — stored
         // marks still survive the union.
@@ -1390,7 +1391,7 @@ mod tests {
         manager
             .monitor_set(serde_json::from_value(bare).unwrap())
             .await
-            .unwrap();
+            .unwrap().unwrap();
         let got = manager.monitor_config(m_id("cam")).await.unwrap().unwrap();
         assert_eq!(&["talk", "listen"], got.config().audio.unsupported());
 
@@ -1400,7 +1401,7 @@ mod tests {
         manager
             .monitor_set(serde_json::from_value(changed).unwrap())
             .await
-            .unwrap();
+            .unwrap().unwrap();
         let got = manager.monitor_config(m_id("cam")).await.unwrap().unwrap();
         assert!(got.config().audio.unsupported().is_empty());
 
@@ -1682,11 +1683,12 @@ mod tests {
         manager
             .monitor_set(serde_json::from_value(base()).unwrap())
             .await
-            .unwrap();
+            .unwrap().unwrap();
         let id = m_id("cam");
         manager
             .monitor_unmark_audio(id.clone(), vec!["talk".to_owned()])
             .await
+            .unwrap()
             .unwrap();
         let got = manager.monitor_config(id.clone()).await.unwrap().unwrap();
         assert_eq!(got.config().audio.unsupported(), &["listen", "ptz"]);
@@ -1697,11 +1699,13 @@ mod tests {
         manager
             .monitor_unmark_audio(id.clone(), vec!["talk".to_owned()])
             .await
+            .unwrap()
             .unwrap();
         // Unknown monitor = no-op.
         manager
             .monitor_unmark_audio(m_id("ghost"), vec!["talk".to_owned()])
             .await
+            .unwrap()
             .unwrap();
         stop_manager(token, tracker).await;
     }

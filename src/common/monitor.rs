@@ -769,12 +769,12 @@ mod tests {
         let a = parse(serde_json::json!(
             {"v380DeviceId": "46078507", "v380User": "bob"}
         ));
-        assert_eq!(Some(46078507), a.v380_device_id());
+        assert_eq!(Some(46_078_507), a.v380_device_id());
         assert_eq!(Some("bob"), a.v380_user());
         // A JSON number is lenient-parsed too.
         assert_eq!(
-            Some(46078507),
-            parse(serde_json::json!({"v380DeviceId": 46078507})).v380_device_id()
+            Some(46_078_507),
+            parse(serde_json::json!({"v380DeviceId": 46_078_507})).v380_device_id()
         );
         // Malformed ⇒ unset, never a deser failure.
         assert_eq!(

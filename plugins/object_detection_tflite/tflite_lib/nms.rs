@@ -61,7 +61,7 @@ mod tests {
     fn test_nms_single() {
         let out = non_max_suppression(vec![det(0.9, 0.1, 0.1, 0.5, 0.5)], 0.5);
         assert_eq!(1, out.len());
-        assert_eq!(0.9, out[0].score);
+        assert!((out[0].score - 0.9).abs() < 1e-6);
     }
 
     // Two overlapping boxes: only the higher score survives.
@@ -75,7 +75,7 @@ mod tests {
             0.6,
         );
         assert_eq!(1, out.len());
-        assert_eq!(0.9, out[0].score);
+        assert!((out[0].score - 0.9).abs() < 1e-6);
     }
 
     // Disjoint boxes are both kept.
@@ -93,6 +93,7 @@ mod tests {
 
     // The O(n^2) escape hatch stops processing.
     #[test]
+    #[allow(clippy::cast_precision_loss, clippy::as_conversions)]
     fn test_nms_iteration_cap() {
         // All disjoint -> every retain pass scans everything left.
         let detections = (0..200)

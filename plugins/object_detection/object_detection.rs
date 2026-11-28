@@ -1250,7 +1250,7 @@ mod tests {
         }
     }
 
-    fn od_config(enable: serde_json::Value) -> MonitorConfig {
+    fn od_config(enable: &serde_json::Value) -> MonitorConfig {
         serde_json::from_value(json!({
             "id": "123",
             "name": "test",
@@ -1317,7 +1317,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_enable_handler_ok() {
-        let config = od_config(json!(false));
+        let config = od_config(&json!(false));
         let state = handler_state(Some(config), 1);
         let resp = enable_handler(State(state), Path(monitor_id())).await;
         assert_eq!(StatusCode::OK, resp.status());
@@ -1325,7 +1325,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_enable_handler_set_error() {
-        let config = od_config(json!(false));
+        let config = od_config(&json!(false));
         let state = handler_state(Some(config), 2);
         let resp = enable_handler(State(state), Path(monitor_id())).await;
         assert_eq!(StatusCode::INTERNAL_SERVER_ERROR, resp.status());

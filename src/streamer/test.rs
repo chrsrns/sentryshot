@@ -497,7 +497,7 @@ async fn test_play_session_with_gop_larger_than_frame_cache() {
     // GOP=300 > FRAME_CACHE_SIZE=256: frames 0..299 then the next IDR at 300
     // completes the gop; the session anchor (gop's first frame) must be
     // retained or every fresh session reports FramesExpired.
-    for i in 1..300u64 {
+    for i in 1..300_u64 {
         writer
             .write_h264(H264Data {
                 pts: UnixH264::new(i.try_into().unwrap()),
@@ -560,7 +560,7 @@ async fn test_play_frames_expired() {
 
     // Complete gop0 {f0}; the session anchors on f0 (frame id 1).
     writer.write_h264(frame(1, true)).await.unwrap();
-    streamer
+    _ = streamer
         .start_session(m_id("test"), false, 7)
         .await
         .unwrap();
@@ -598,13 +598,13 @@ async fn test_play_session_already_locked() {
         .unwrap();
 
     writer.write_h264(frame(1, true)).await.unwrap();
-    streamer
+    _ = streamer
         .start_session(m_id("test"), false, 7)
         .await
         .unwrap();
 
     // Consume the cached frame so the next play parks on a new one.
-    streamer.play(m_id("test"), false, 7).await.unwrap();
+    _ = streamer.play(m_id("test"), false, 7).await.unwrap();
 
     let streamer2 = streamer.clone();
     let parked = tokio::spawn(async move { streamer2.play(m_id("test"), false, 7).await });

@@ -351,7 +351,7 @@ mod tests {
         assert!(parse(config.raw()).is_some());
     }
 
-    fn monitor_config(object_detection: serde_json::Value) -> MonitorConfig {
+    fn monitor_config(object_detection: &serde_json::Value) -> MonitorConfig {
         serde_json::from_value(json!({
             "id": "123",
             "name": "test",
@@ -369,9 +369,9 @@ mod tests {
     // no bool "enable" field inside it.
     #[test]
     fn test_set_enable_none_branches() {
-        assert!(set_enable(&monitor_config(json!({})), true).is_none());
-        assert!(set_enable(&monitor_config(json!("x")), true).is_none());
-        assert!(set_enable(&monitor_config(json!({"enable": "x"})), true).is_none());
-        assert!(set_enable(&monitor_config(json!({"enable": 1})), true).is_none());
+        assert!(set_enable(&monitor_config(&json!({})), true).is_none());
+        assert!(set_enable(&monitor_config(&json!("x")), true).is_none());
+        assert!(set_enable(&monitor_config(&json!({"enable": "x"})), true).is_none());
+        assert!(set_enable(&monitor_config(&json!({"enable": 1})), true).is_none());
     }
 }

@@ -583,10 +583,11 @@ mod ptz {
 
         // Persisted into stored config — and a second call reads the
         // mark without re-probing the camera.
-        let saved = manager.saved.lock().unwrap();
-        assert_eq!(1, saved.len());
-        assert_eq!(&["getPresets"], saved[0].config().ptz.unsupported());
-        drop(saved);
+        {
+            let saved = manager.saved.lock().unwrap();
+            assert_eq!(1, saved.len());
+            assert_eq!(&["getPresets"], saved[0].config().ptz.unsupported());
+        }
         let resp = ptz_handler(State(state), query(), Json(cmd("capabilities"))).await;
         assert_eq!(StatusCode::OK, resp.status());
         assert_eq!(vec!["getPresets"], *calls.lock().unwrap());
@@ -635,10 +636,11 @@ mod ptz {
         let resp = ptz_handler(st, query(), Json(cmd("home"))).await;
         assert_eq!(StatusCode::BAD_GATEWAY, resp.status());
         assert_eq!(vec!["home"], *calls.lock().unwrap());
-        let saved = manager.saved.lock().unwrap();
-        assert_eq!(1, saved.len());
-        assert_eq!(&["home"], saved[0].config().ptz.unsupported());
-        drop(saved);
+        {
+            let saved = manager.saved.lock().unwrap();
+            assert_eq!(1, saved.len());
+            assert_eq!(&["home"], saved[0].config().ptz.unsupported());
+        }
 
         // Second call — persisted mark short-circuits, ⊥ camera call.
         let resp = ptz_handler(State(state), query(), Json(cmd("home"))).await;
@@ -754,19 +756,21 @@ mod audio_tests {
         .unwrap()
     }
 
+    type PersistedMarks = Arc<Mutex<Vec<(MonitorId, Vec<String>)>>>;
+    type SavedConfigs = Arc<Mutex<Vec<MonitorConfig>>>;
+
     /// The stub session never actually opens — attach paths that
     /// reach `open` would hang, so route tests only exercise the
     /// pre-attach surface (token mint + statuses).
-    fn service() -> (
-        Arc<audio::AudioService>,
-        Arc<Mutex<Vec<(MonitorId, Vec<String>)>>>,
-    ) {
-        let persisted = Arc::new(Mutex::new(Vec::<(MonitorId, Vec<String>)>::new()));
+    fn service() -> (Arc<audio::AudioService>, PersistedMarks) {
+        let persisted: PersistedMarks = Arc::new(Mutex::new(Vec::new()));
         let p = persisted.clone();
         (
             Arc::new(audio::AudioService::new(
                 Arc::new(|url, alt, cfg| {
-                    Arc::new(audio::RtspAudioClient::new(url, alt, cfg)) as audio::ArcAudioClient
+                    let client: audio::ArcAudioClient =
+                        Arc::new(audio::RtspAudioClient::new(url, alt, cfg));
+                    client
                 }),
                 Arc::new(move |id: MonitorId, marks: Vec<String>| {
                     let p = p.clone();
@@ -782,12 +786,8 @@ mod audio_tests {
 
     fn harness(
         config: Option<MonitorConfig>,
-    ) -> (
-        State<Arc<AudioRouteState>>,
-        Query<MonitorIdQuery>,
-        Arc<Mutex<Vec<MonitorConfig>>>,
-    ) {
-        let saved = Arc::new(Mutex::new(Vec::new()));
+    ) -> (State<Arc<AudioRouteState>>, Query<MonitorIdQuery>, SavedConfigs) {
+        let saved: SavedConfigs = Arc::new(Mutex::new(Vec::new()));
         let (service, _) = service();
         (
             State(Arc::new(AudioRouteState {

@@ -299,6 +299,7 @@ fn get_log_level() -> u8 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
     use common::Label;
     use pretty_assertions::assert_eq;
@@ -363,9 +364,9 @@ mod tests {
 
         assert_eq!(2, got.len());
         assert_eq!("person", got[0].label.to_string());
-        assert_eq!(90.0, got[0].score);
+        assert!((got[0].score - 90.0).abs() < f32::EPSILON);
         assert!(got[0].region.rectangle.is_some());
         assert_eq!("unknown7", got[1].label.to_string());
-        assert_eq!(50.0, got[1].score);
+        assert!((got[1].score - 50.0).abs() < f32::EPSILON);
     }
 }

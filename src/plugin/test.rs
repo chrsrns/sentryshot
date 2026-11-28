@@ -34,28 +34,28 @@ impl Authenticator for StubAuth {
     }
 }
 
-fn admin_user() -> Option<AuthenticatedUser> {
-    Some(AuthenticatedUser {
+fn admin_user() -> AuthenticatedUser {
+    AuthenticatedUser {
         is_admin: true,
         stored_token: "x".to_owned(),
         token_valid: true,
-    })
+    }
 }
 
-fn admin_bad_token() -> Option<AuthenticatedUser> {
-    Some(AuthenticatedUser {
+fn admin_bad_token() -> AuthenticatedUser {
+    AuthenticatedUser {
         is_admin: true,
         stored_token: "x".to_owned(),
         token_valid: false,
-    })
+    }
 }
 
-fn regular_user() -> Option<AuthenticatedUser> {
-    Some(AuthenticatedUser {
+fn regular_user() -> AuthenticatedUser {
+    AuthenticatedUser {
         is_admin: false,
         stored_token: "x".to_owned(),
         token_valid: true,
-    })
+    }
 }
 
 async fn status(router: axum::Router) -> (StatusCode, axum::body::Bytes) {
@@ -97,16 +97,16 @@ async fn test_route_admin_chain() {
     assert_eq!(StatusCode::UNAUTHORIZED, s);
 
     // 2. Authenticated but not admin.
-    let (s, _b) = status(router(regular_user())).await;
+    let (s, _b) = status(router(Some(regular_user()))).await;
     assert_eq!(StatusCode::UNAUTHORIZED, s);
 
     // 3. Admin with invalid CSRF token.
-    let (s, b) = status(router(admin_bad_token())).await;
+    let (s, b) = status(router(Some(admin_bad_token()))).await;
     assert_eq!(StatusCode::UNAUTHORIZED, s);
     assert_eq!("Invalid CSRF-token", b);
 
     // 4. Admin with valid token passes.
-    let (s, b) = status(router(admin_user())).await;
+    let (s, b) = status(router(Some(admin_user()))).await;
     assert_eq!(StatusCode::OK, s);
     assert_eq!("ok", b);
 }
@@ -114,7 +114,7 @@ async fn test_route_admin_chain() {
 // The CSRF middleware applies to GET requests too.
 #[tokio::test]
 async fn test_route_admin_csrf_on_get() {
-    let router = new_router(admin_bad_token())
+    let router = new_router(Some(admin_bad_token()))
         .route_admin("/x", get(ok_handler))
         .inner();
     let (s, _) = status(router).await;
@@ -123,7 +123,7 @@ async fn test_route_admin_csrf_on_get() {
 
 #[tokio::test]
 async fn test_route_admin_no_csrf() {
-    let router = new_router(admin_bad_token())
+    let router = new_router(Some(admin_bad_token()))
         .route_admin_no_csrf("/x", get(ok_handler))
         .inner();
     let (s, _) = status(router).await;
