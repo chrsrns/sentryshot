@@ -313,13 +313,13 @@ impl RecDb {
                     }
                 };
                 let path = file.path();
-                let Some(file_name) = path.file_name() else {
+                let Some(file_stem) = path.file_stem() else {
                     continue;
                 };
-                let Some(file_name) = file_name.to_str() else {
+                let Some(file_stem) = file_stem.to_str() else {
                     continue;
                 };
-                if file_name.starts_with(rec_id.as_str()) {
+                if file_stem == rec_id.as_str() {
                     let file_size = path.metadata().map(|m| m.len()).unwrap_or(0);
                     if let Err(e) = std::fs::remove_file(path) {
                         err = Some(DeleteRecordingError::Delete(e));
@@ -798,6 +798,44 @@ mod tests {
         assert!(err.is_none());
         assert_eq!(
             vec!["2000-01-01_02-02-02_x1.mp4".to_owned()],
+            list_directory(&rec_dir)
+        );
+    }
+
+    // Recordings whose ids share a prefix: `_m1` must not delete `_m1b`.
+    #[tokio::test]
+    async fn test_delete_recording_prefix_collision() {
+        let recordings_dir = TempDir::new().unwrap();
+        let rec_dir = recordings_dir
+            .path()
+            .join("2000")
+            .join("01")
+            .join("01")
+            .join("m1");
+        let rec_id = "2000-01-01_02-02-02_m1";
+        let rec_id_b = "2000-01-01_02-02-02_m1b";
+        let files = vec![
+            rec_id.to_owned() + ".meta",
+            rec_id.to_owned() + ".mdat",
+            rec_id.to_owned() + ".json",
+            rec_id_b.to_owned() + ".meta",
+            rec_id_b.to_owned() + ".mdat",
+        ];
+        std::fs::create_dir_all(&rec_dir).unwrap();
+        create_files(&rec_dir, &files);
+
+        let rec_db = new_test_recdb(recordings_dir.path()).await;
+        assert_eq!(rec_db.count_recordings().await, 2);
+        let (_, err) = rec_db
+            .delete_recording(rec_id.to_owned().try_into().unwrap())
+            .await;
+        assert!(err.is_none());
+        // Sibling recording survives untouched.
+        assert_eq!(
+            vec![
+                rec_id_b.to_owned() + ".mdat",
+                rec_id_b.to_owned() + ".meta",
+            ],
             list_directory(&rec_dir)
         );
     }
