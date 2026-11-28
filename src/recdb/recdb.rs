@@ -636,6 +636,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_recording_file_by_ext() {
+        let temp_dir = TempDir::new().unwrap();
+        let recordings_dir = std::fs::canonicalize(temp_dir.path()).unwrap();
+        let rec_db = new_test_recdb(&recordings_dir).await;
+
+        let rec_id = RecordingId::try_from("2000-01-01_01-01-01_x".to_owned()).unwrap();
+        let rec_dir = recordings_dir
+            .join("2000")
+            .join("01")
+            .join("01")
+            .join("x");
+        std::fs::create_dir_all(&rec_dir).unwrap();
+
+        // Missing file -> None.
+        assert!(
+            rec_db
+                .recording_file_by_ext(&rec_id, "meta")
+                .await
+                .is_none()
+        );
+
+        // Real file -> Some(canonical path).
+        std::fs::write(rec_dir.join("2000-01-01_01-01-01_x.meta"), b"m").unwrap();
+        assert_eq!(
+            Some(rec_dir.join("2000-01-01_01-01-01_x.meta")),
+            rec_db.recording_file_by_ext(&rec_id, "meta").await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recording_file_by_ext_symlink_escape() {
+        let temp_dir = TempDir::new().unwrap();
+        let recordings_dir = std::fs::canonicalize(temp_dir.path()).unwrap();
+        let rec_db = new_test_recdb(&recordings_dir).await;
+
+        let rec_id = RecordingId::try_from("2000-01-01_01-01-01_x".to_owned()).unwrap();
+        let rec_dir = recordings_dir
+            .join("2000")
+            .join("01")
+            .join("01")
+            .join("x");
+        std::fs::create_dir_all(&rec_dir).unwrap();
+
+        // Target lives outside the recordings tree.
+        let outside = TempDir::new().unwrap();
+        let outside_file = outside.path().join("evil.json");
+        std::fs::write(&outside_file, b"{}").unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                &outside_file,
+                rec_dir.join("2000-01-01_01-01-01_x.json"),
+            )
+            .unwrap();
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(
+                &outside_file,
+                rec_dir.join("2000-01-01_01-01-01_x.json"),
+            )
+            .unwrap();
+        }
+
+        // Canonicalized path escapes recordings_dir -> None.
+        assert!(
+            rec_db
+                .recording_file_by_ext(&rec_id, "json")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn test_new_recording() {
         let temp_dir = TempDir::new().unwrap();
 
