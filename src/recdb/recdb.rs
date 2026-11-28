@@ -407,12 +407,14 @@ impl RecDb {
         }
         let max_usage = self.storage.max_usage().0;
         let target_storage_usage = (max_usage * 98) / 100; // 98% of max.
-        let bytes_to_delete = ByteSize(
-            usage
-                .used
-                .checked_sub(target_storage_usage)
-                .expect("storage usage must be greater than target usage"),
-        );
+        let Some(bytes_to_delete) = usage.used.checked_sub(target_storage_usage) else {
+            self.logger.log2(
+                LogLevel::Error,
+                "storage usage below target while above the prune threshold, skipping prune",
+            );
+            return (None, None);
+        };
+        let bytes_to_delete = ByteSize(bytes_to_delete);
         self.logger.log2(
             LogLevel::Info,
             &format!("deleting {bytes_to_delete} of recordings"),
@@ -903,6 +905,74 @@ mod tests {
         assert!(recdb.prune().await.1.is_none());
 
         assert_eq!(after, list_empty_files(temp_dir.path()));
+    }
+
+    struct StubStorage {
+        used: u64,
+        percent: f32,
+        max: ByteSize,
+        partial_err: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl common::Storage for StubStorage {
+        async fn usage(
+            &self,
+            _: Duration,
+        ) -> (
+            Result<common::StorageUsage, StorageUsageError>,
+            Option<common::UsageBytesError>,
+        ) {
+            let err = self
+                .partial_err
+                .then(|| common::UsageBytesError::DirEntry(std::io::Error::other("x")));
+            (
+                Ok(common::StorageUsage {
+                    used: self.used,
+                    percent: self.percent,
+                }),
+                err,
+            )
+        }
+        async fn usage_cached(&self) -> Option<(common::StorageUsage, Duration)> {
+            None
+        }
+        fn max_usage(&self) -> ByteSize {
+            self.max
+        }
+    }
+
+    async fn prune_with_stub(used: u64, percent: f32, max: ByteSize) -> (TempDir, RecDb) {
+        let temp_dir = TempDir::new().unwrap();
+        let recordings_dir = temp_dir.path().join("recordings");
+        std::fs::create_dir_all(&recordings_dir).unwrap();
+        let storage = Arc::new(StubStorage {
+            used,
+            percent,
+            max,
+            partial_err: false,
+        });
+        let recdb = RecDb::new(DummyLogger::new(), recordings_dir, storage).await;
+        (temp_dir, recdb)
+    }
+
+    // percent == 99 with used below the 98% target: inconsistent inputs
+    // must not panic.
+    #[tokio::test]
+    async fn test_prune_usage_below_target() {
+        let (_t, recdb) = prune_with_stub(50, 99.0, ByteSize(100)).await;
+        let (oldest, err) = recdb.prune().await;
+        assert!(oldest.is_none());
+        assert!(err.is_none());
+    }
+
+    // max_usage == 0: target usage is 0, nothing to delete.
+    #[tokio::test]
+    async fn test_prune_zero_max_usage() {
+        let (_t, recdb) = prune_with_stub(0, f32::INFINITY, ByteSize(0)).await;
+        let (oldest, err) = recdb.prune().await;
+        assert!(oldest.is_none());
+        assert!(err.is_none());
     }
 
     fn write_empty_files(base: &Path, paths: &[&str]) {
